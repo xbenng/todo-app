@@ -1225,8 +1225,15 @@ startPolling();
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        TODO_FILE = sys.argv[1]
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Simple Todo App")
+    parser.add_argument("todo_file", nargs="?", default="todos.md", help="Path to the todo markdown file")
+    parser.add_argument("--host", default="127.0.0.1", help="Host to bind to (use 0.0.0.0 for network access)")
+    parser.add_argument("--port", type=int, default=5111, help="Port to listen on")
+    args = parser.parse_args()
+
+    TODO_FILE = args.todo_file
 
     # Create file if it doesn't exist
     if not os.path.exists(TODO_FILE):
@@ -1234,5 +1241,5 @@ if __name__ == "__main__":
         print(f"Created new todo file: {TODO_FILE}")
 
     print(f"Serving todo UI for: {os.path.abspath(TODO_FILE)}")
-    print(f"Open http://localhost:5111 in your browser")
-    app.run(host="127.0.0.1", port=5111, debug=True)
+    print(f"Open http://{args.host}:{args.port} in your browser")
+    app.run(host=args.host, port=args.port, debug=True)
