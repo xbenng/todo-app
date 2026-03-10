@@ -551,11 +551,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .todo-item.dragging { opacity: 0.4; }
   .todo-item.drag-over-top { border-top: 3px solid var(--accent); margin-top: -3px; }
   .todo-item.drag-over-bottom { border-bottom: 3px solid var(--accent); margin-bottom: 5px; }
-  .drag-handle {
-    cursor: grab; opacity: 0.3; font-size: 1rem; line-height: 1; padding: 2px 2px 2px 0;
-    flex-shrink: 0; align-self: center; user-select: none;
-  }
-  .drag-handle:hover { opacity: 0.7; }
   .section-header-row.drag-over-section { background: rgba(37,99,235,0.08); }
 
   .todo-checkbox { margin-top: 3px; width: 18px; height: 18px; cursor: pointer; accent-color: var(--accent); flex-shrink: 0; }
@@ -888,7 +883,6 @@ function renderTodo(t) {
 
   const draggable = t.status !== 'completed' ? 'draggable="true"' : '';
   return `<div class="todo-item ${statusClass}" data-todo-id="${t.id}" ${draggable} onclick="selectTodo('${t.id}')" oncontextmenu="showCtxMenu(event,'${t.id}')" style="cursor:pointer;">
-    ${t.status !== 'completed' ? '<span class="drag-handle" title="Drag to reorder">&#8942;&#8942;</span>' : ''}
     <input type="checkbox" class="todo-checkbox" ${checked} onchange="toggleComplete('${t.id}', this.checked)" onclick="event.stopPropagation()">
     <div class="todo-body" ondblclick="startEdit('${t.id}')">
       <div class="todo-title">${esc(t.title)}</div>
