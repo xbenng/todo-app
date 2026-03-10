@@ -492,123 +492,172 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <title>Todo List</title>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
   :root {
-    --bg: #f5f5f5; --card: #fff; --border: #ddd; --text: #222;
-    --muted: #666; --accent: #2563eb; --accent-hover: #1d4ed8;
-    --completed-bg: #f0fdf4; --completed-border: #86efac; --completed-text: #166534;
-    --danger: #dc2626; --danger-hover: #b91c1c;
-    --radius: 8px; --shadow: 0 1px 3px rgba(0,0,0,0.08);
+    --bg: #f8f9fb; --card: #fff; --border: #e2e5ea; --text: #1a1d23;
+    --muted: #6b7280; --subtle: #9ca3af;
+    --accent: #4f6ef7; --accent-hover: #3b5de7; --accent-light: rgba(79,110,247,0.08);
+    --completed-bg: #f0faf4; --completed-border: #6ee7a0; --completed-text: #166534;
+    --danger: #ef4444; --danger-hover: #dc2626;
+    --radius: 10px; --radius-lg: 14px;
+    --shadow: 0 1px 3px rgba(0,0,0,0.04), 0 1px 2px rgba(0,0,0,0.06);
+    --shadow-md: 0 4px 12px rgba(0,0,0,0.06), 0 1px 3px rgba(0,0,0,0.08);
+    --shadow-lg: 0 10px 30px rgba(0,0,0,0.08), 0 2px 8px rgba(0,0,0,0.06);
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
   body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    background: var(--bg); color: var(--text); line-height: 1.5;
-    max-width: 700px; margin: 0 auto; padding: 24px 16px;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.6;
+    max-width: 720px; margin: 0 auto; padding: 24px 20px;
+    -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
   }
-  h1 { font-size: 1.5rem; margin-bottom: 20px; display: none; /* moved to sidebar */ }
-  h2 { font-size: 1.1rem; color: var(--muted); margin: 24px 0 12px; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
+  h1 { display: none; }
+  h2 {
+    font-size: 0.7rem; color: var(--subtle); margin: 28px 0 12px;
+    text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600;
+  }
 
   /* Add form */
   .add-form {
-    background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
-    padding: 16px; margin-bottom: 8px; box-shadow: var(--shadow);
-    display: none;
+    background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-lg);
+    padding: 18px; margin-bottom: 10px; box-shadow: var(--shadow-md);
+    display: none; transition: box-shadow 0.2s;
   }
   .add-form.visible { display: block; }
-  .add-form.kb-selected { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .add-form.kb-selected { box-shadow: 0 0 0 2px var(--accent), var(--shadow-md); }
   .add-toggle {
-    position: fixed; top: 16px; left: 16px; z-index: 900;
-    display: flex; flex-direction: column; align-items: flex-start; gap: 6px;
+    position: fixed; top: 20px; left: 20px; z-index: 900;
+    display: flex; flex-direction: column; align-items: flex-start; gap: 8px;
   }
-  .add-toggle h1 { display: block; font-size: 1.8rem; margin: 0; }
-  .add-toggle .btn-row { display: flex; align-items: center; gap: 8px; }
-  .add-toggle .btn { font-size: 0.9rem; padding: 8px 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.15); }
+  .add-toggle h1 {
+    display: block; font-size: 1.6rem; margin: 0; font-weight: 700;
+    letter-spacing: -0.02em; color: var(--text);
+  }
+  .add-toggle .btn-row { display: flex; align-items: center; gap: 10px; }
+  .add-toggle .btn { font-size: 0.85rem; padding: 9px 22px; box-shadow: var(--shadow-lg); }
   .add-form input, .add-form textarea, .add-form select {
-    width: 100%; padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px;
-    font-size: 0.9rem; font-family: inherit; margin-bottom: 8px; background: #fafafa;
+    width: 100%; padding: 10px 14px; border: 1px solid var(--border); border-radius: 8px;
+    font-size: 0.9rem; font-family: inherit; margin-bottom: 10px;
+    background: var(--bg); transition: border-color 0.15s, box-shadow 0.15s; color: var(--text);
   }
-  .add-form textarea { resize: vertical; min-height: 50px; }
+  .add-form input:focus, .add-form textarea:focus, .add-form select:focus {
+    outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-light);
+  }
+  .add-form textarea { resize: vertical; min-height: 56px; }
   .add-form .row { display: flex; gap: 8px; align-items: center; }
   .add-form .row select { width: auto; margin-bottom: 0; }
   .btn {
-    padding: 8px 16px; border: none; border-radius: 6px; font-size: 0.85rem;
-    font-weight: 600; cursor: pointer; transition: background 0.15s;
+    padding: 9px 18px; border: none; border-radius: 8px; font-size: 0.85rem;
+    font-weight: 600; cursor: pointer; transition: all 0.15s; letter-spacing: -0.01em;
   }
   .btn-primary { background: var(--accent); color: #fff; }
-  .btn-primary:hover { background: var(--accent-hover); }
+  .btn-primary:hover { background: var(--accent-hover); transform: translateY(-1px); box-shadow: var(--shadow-md); }
+  .btn-primary:active { transform: translateY(0); }
   .btn-danger { background: transparent; color: var(--danger); border: 1px solid var(--danger); padding: 4px 10px; font-size: 0.75rem; }
   .btn-danger:hover { background: var(--danger); color: #fff; }
-  .btn-sm { padding: 4px 10px; font-size: 0.75rem; }
+  .btn-sm { padding: 5px 12px; font-size: 0.75rem; }
 
   /* Todo items */
   .todo-item {
     background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
-    padding: 12px 16px; margin-bottom: 8px; box-shadow: var(--shadow);
-    display: flex; align-items: flex-start; gap: 12px; transition: opacity 0.2s;
-    border-left: 4px solid var(--border);
+    padding: 14px 18px; margin-bottom: 6px; box-shadow: var(--shadow);
+    display: flex; align-items: flex-start; gap: 12px;
+    transition: all 0.2s ease;
+    border-left: 3px solid transparent;
   }
-  .todo-item.status-completed { border-left-color: var(--completed-border); background: var(--completed-bg); opacity: 0.7; }
-  .todo-item.dragging { opacity: 0.4; }
-  .todo-item.drag-over-top { border-top: 3px solid var(--accent); margin-top: -3px; }
-  .todo-item.drag-over-bottom { border-bottom: 3px solid var(--accent); margin-bottom: 5px; }
-  .section-header-row.drag-over-section { background: rgba(37,99,235,0.08); }
+  .todo-item:hover { box-shadow: var(--shadow-md); transform: translateY(-1px); }
+  .todo-item.status-completed {
+    border-left-color: var(--completed-border); background: var(--completed-bg);
+    opacity: 0.6;
+  }
+  .todo-item.status-completed:hover { opacity: 0.8; }
+  .todo-item.dragging { opacity: 0.35; transform: scale(0.98); }
+  .todo-item.drag-over-top { box-shadow: inset 0 3px 0 var(--accent); }
+  .todo-item.drag-over-bottom { box-shadow: inset 0 -3px 0 var(--accent); }
+  .section-header-row.drag-over-section { background: var(--accent-light); }
 
-  .todo-checkbox { margin-top: 3px; width: 18px; height: 18px; cursor: pointer; accent-color: var(--accent); flex-shrink: 0; }
+  .todo-checkbox {
+    margin-top: 2px; width: 18px; height: 18px; cursor: pointer;
+    accent-color: var(--accent); flex-shrink: 0;
+    border-radius: 4px;
+  }
   .todo-body { flex: 1; min-width: 0; }
-  .todo-title { font-weight: 600; font-size: 0.95rem; word-break: break-word; }
-  .todo-desc { color: var(--muted); font-size: 0.85rem; margin-top: 4px; word-break: break-word; }
+  .todo-title { font-weight: 600; font-size: 0.92rem; word-break: break-word; letter-spacing: -0.01em; }
+  .todo-desc { color: var(--muted); font-size: 0.82rem; margin-top: 4px; word-break: break-word; line-height: 1.5; }
   .todo-desc p { margin: 0 0 0.4em; }
   .todo-desc p:last-child { margin-bottom: 0; }
   .todo-desc ul, .todo-desc ol { margin: 0.2em 0 0.4em 1.2em; padding: 0; }
   .todo-desc li { margin: 0.1em 0; }
-  .todo-desc code { background: rgba(0,0,0,0.06); padding: 1px 4px; border-radius: 3px; font-size: 0.85em; }
-  .todo-desc pre { background: rgba(0,0,0,0.04); padding: 8px; border-radius: 4px; overflow-x: auto; margin: 0.3em 0; }
+  .todo-desc code { background: rgba(0,0,0,0.05); padding: 2px 5px; border-radius: 4px; font-size: 0.83em; }
+  .todo-desc pre { background: rgba(0,0,0,0.03); padding: 10px; border-radius: 6px; overflow-x: auto; margin: 0.3em 0; }
   .todo-desc pre code { background: none; padding: 0; }
-  .todo-desc a { color: var(--accent); }
+  .todo-desc a { color: var(--accent); text-decoration: none; }
+  .todo-desc a:hover { text-decoration: underline; }
   .todo-desc h1, .todo-desc h2, .todo-desc h3 { font-size: 0.9em; margin: 0.4em 0 0.2em; }
-  .todo-desc blockquote { border-left: 3px solid var(--border); margin: 0.3em 0; padding-left: 8px; color: var(--muted); }
+  .todo-desc blockquote { border-left: 3px solid var(--border); margin: 0.3em 0; padding-left: 10px; color: var(--muted); }
   .todo-meta { display: flex; align-items: center; gap: 8px; margin-top: 6px; flex-wrap: wrap; }
   .priority-badge {
-    font-size: 0.65rem; font-weight: 700; text-transform: uppercase; padding: 1px 6px;
-    border-radius: 10px; letter-spacing: 0.04em; flex-shrink: 0; align-self: flex-start; margin-top: 3px;
+    font-size: 0.6rem; font-weight: 700; text-transform: uppercase; padding: 2px 7px;
+    border-radius: 12px; letter-spacing: 0.04em; flex-shrink: 0; align-self: flex-start; margin-top: 3px;
   }
-  .priority-high { background: #fef2f2; color: #991b1b; border: 1px solid #fca5a5; }
-  .priority-medium { background: #fffbeb; color: #92400e; border: 1px solid #fcd34d; }
-  .priority-low { background: #f0fdf4; color: #166534; border: 1px solid #86efac; }
+  .priority-high { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; }
+  .priority-medium { background: #fffbeb; color: #a16207; border: 1px solid #fde68a; }
+  .priority-low { background: #f0fdf4; color: #15803d; border: 1px solid #bbf7d0; }
 
   .section-header-row {
     display: flex; align-items: center; gap: 8px;
-    margin: 18px 0 8px; padding: 6px 0 4px; border-bottom: 1px solid var(--border);
+    margin: 22px 0 10px; padding: 8px 0 6px;
+    border-bottom: 2px solid var(--border);
     position: sticky; top: 0; z-index: 100; background: var(--bg);
   }
-  .section-header-row h3 { font-size: 0.95rem; color: var(--text); font-weight: 600; margin: 0; }
+  .section-header-row h3 {
+    font-size: 0.82rem; color: var(--text); font-weight: 700; margin: 0;
+    letter-spacing: -0.01em;
+  }
   .section-count {
-    font-size: 0.75rem; color: var(--muted); font-weight: 400;
-    background: rgba(0,0,0,0.05); padding: 0 6px; border-radius: 10px;
+    font-size: 0.68rem; color: var(--subtle); font-weight: 500;
+    background: rgba(0,0,0,0.04); padding: 1px 8px; border-radius: 12px;
   }
   .collapse-btn {
-    font-size: 0.7rem; padding: 1px 6px; border-radius: 4px;
-    border: 1px solid var(--border); background: #fafafa; color: var(--muted);
-    cursor: pointer; transition: transform 0.15s, background 0.15s; line-height: 1;
+    font-size: 0.6rem; padding: 2px 6px; border-radius: 5px;
+    border: 1px solid transparent; background: transparent; color: var(--subtle);
+    cursor: pointer; transition: all 0.2s ease; line-height: 1;
   }
-  .collapse-btn:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .collapse-btn:hover { background: var(--accent-light); color: var(--accent); }
   .collapse-btn.collapsed { transform: rotate(-90deg); }
   .sort-priority-btn {
-    font-size: 0.7rem; padding: 2px 8px; border-radius: 10px;
-    border: 1px solid var(--border); background: #fafafa; color: var(--muted);
-    cursor: pointer; white-space: nowrap; transition: background 0.15s; margin-left: auto;
+    font-size: 0.65rem; padding: 3px 10px; border-radius: 12px;
+    border: 1px solid var(--border); background: var(--card); color: var(--subtle);
+    cursor: pointer; white-space: nowrap; transition: all 0.15s; margin-left: auto;
+    font-weight: 500;
   }
   .sort-priority-btn:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
 
-  .todo-actions { display: flex; gap: 4px; flex-shrink: 0; align-items: flex-start; }
+  .todo-actions {
+    display: flex; gap: 2px; flex-shrink: 0; align-items: flex-start;
+    opacity: 0; transition: opacity 0.15s;
+  }
+  .todo-item:hover .todo-actions { opacity: 1; }
   .todo-actions select { font-size: 0.75rem; padding: 2px 6px; border-radius: 4px; border: 1px solid var(--border); background: #fafafa; }
 
-  .empty-state { text-align: center; color: var(--muted); padding: 40px 0; font-size: 0.95rem; }
+  .empty-state { text-align: center; color: var(--subtle); padding: 48px 0; font-size: 0.95rem; }
 
   /* Edit mode */
-  .edit-title { font-size: 0.95rem; font-weight: 600; width: 100%; padding: 4px 8px; border: 1px solid var(--accent); border-radius: 4px; margin-bottom: 4px; }
-  .edit-desc { font-size: 0.85rem; width: 100%; padding: 4px 8px; border: 1px solid var(--accent); border-radius: 4px; resize: vertical; min-height: 40px; font-family: inherit; }
-  .edit-actions { display: flex; gap: 4px; margin-top: 6px; }
+  .edit-title {
+    font-size: 0.92rem; font-weight: 600; width: 100%; padding: 8px 12px;
+    border: 1px solid var(--border); border-radius: 8px; margin-bottom: 6px;
+    background: var(--bg); transition: border-color 0.15s, box-shadow 0.15s;
+  }
+  .edit-title:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-light); }
+  .edit-desc {
+    font-size: 0.82rem; width: 100%; padding: 8px 12px;
+    border: 1px solid var(--border); border-radius: 8px; resize: vertical;
+    min-height: 44px; font-family: inherit;
+    background: var(--bg); transition: border-color 0.15s, box-shadow 0.15s;
+  }
+  .edit-desc:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-light); }
+  .edit-actions { display: flex; gap: 6px; margin-top: 8px; }
 
   /* Section headers */
   .section-header {
@@ -618,35 +667,53 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
 
   /* Keyboard-selected item */
-  .todo-item.kb-selected { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .todo-item.kb-selected {
+    box-shadow: 0 0 0 2px var(--accent), var(--shadow);
+    border-left-color: var(--accent);
+  }
 
   /* Context menu */
   .ctx-menu {
     display: none; position: fixed; z-index: 1000;
-    background: var(--card); border: 1px solid var(--border); border-radius: 8px;
-    box-shadow: 0 8px 24px rgba(0,0,0,0.18); min-width: 180px;
-    padding: 4px 0; font-size: 0.85rem;
+    background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+    box-shadow: var(--shadow-lg); min-width: 190px;
+    padding: 5px 0; font-size: 0.84rem;
+    backdrop-filter: blur(10px);
   }
   .ctx-menu.visible { display: block; }
   .ctx-menu-item {
-    padding: 7px 14px; cursor: pointer; display: flex; align-items: center; gap: 8px;
+    padding: 8px 14px; cursor: pointer; display: flex; align-items: center; gap: 8px;
     color: var(--text); user-select: none; position: relative;
+    border-radius: 6px; margin: 1px 4px; transition: background 0.1s;
   }
   .ctx-menu-item:hover { background: var(--accent); color: #fff; }
   .ctx-menu-item.has-submenu::after {
-    content: '\25B6'; font-size: 0.65rem; margin-left: auto; opacity: 0.6;
+    content: '\25B6'; font-size: 0.6rem; margin-left: auto; opacity: 0.5;
   }
   .ctx-menu-item:hover.has-submenu::after { opacity: 1; }
-  .ctx-menu-sep { border-top: 1px solid var(--border); margin: 3px 0; }
+  .ctx-menu-sep { border-top: 1px solid var(--border); margin: 4px 8px; }
   .ctx-submenu {
-    display: none; position: absolute; left: 100%; top: -4px;
-    background: var(--card); border: 1px solid var(--border); border-radius: 8px;
-    box-shadow: 0 8px 24px rgba(0,0,0,0.18); min-width: 160px;
-    padding: 4px 0;
+    display: none; position: absolute; left: 100%; top: -5px;
+    background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+    box-shadow: var(--shadow-lg); min-width: 160px;
+    padding: 5px 0; backdrop-filter: blur(10px);
   }
   .ctx-menu-item:hover > .ctx-submenu { display: block; }
-  .ctx-submenu .ctx-menu-item { padding: 6px 14px; font-size: 0.83rem; }
+  .ctx-submenu .ctx-menu-item { padding: 7px 14px; font-size: 0.82rem; }
   .ctx-submenu .ctx-menu-item.active-section { font-weight: 700; opacity: 0.5; pointer-events: none; }
+
+  /* Kbd styling */
+  kbd {
+    padding: 2px 6px; border: 1px solid var(--border); border-radius: 4px;
+    background: var(--card); font-size: 0.75rem; font-family: inherit;
+    box-shadow: 0 1px 1px rgba(0,0,0,0.06);
+  }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--subtle); }
 </style>
 </head>
 <body>
@@ -655,7 +722,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <h1>&#9744; To Do List</h1>
   <div class="btn-row">
     <button class="btn btn-primary" id="add-toggle-btn" onclick="showAddForm()">+ New Todo</button>
-    <span style="color:var(--muted);font-size:0.8rem">or press <kbd style="padding:1px 5px;border:1px solid var(--border);border-radius:3px;background:#fff;font-size:0.8rem">n</kbd></span>
+    <span style="color:var(--subtle);font-size:0.78rem">or press <kbd>n</kbd></span>
   </div>
 </div>
 
@@ -890,8 +957,8 @@ function renderTodo(t) {
     </div>
     ${priorityBadge}
     <div class="todo-actions">
-      ${t.status !== 'completed' ? `<button class="btn btn-sm" onclick="event.stopPropagation();bringToTop('${t.id}')" style="border:none;background:transparent;font-size:1rem;padding:2px 4px;cursor:pointer;opacity:0.4;line-height:1" title="Bring to top of section" onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='0.4'">&#x2912;</button>` : ''}
-      <button onclick="event.stopPropagation();deleteTodo('${t.id}')" style="border:none;background:transparent;font-size:0.85rem;padding:2px 6px;cursor:pointer;opacity:0.35;line-height:1;color:var(--muted);font-weight:600" title="Delete" onmouseover="this.style.opacity='1';this.style.color='var(--danger)'" onmouseout="this.style.opacity='0.35';this.style.color='var(--muted)'">&#10005;</button>
+      ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();bringToTop('${t.id}')" style="border:none;background:transparent;font-size:1rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Bring to top" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#x2912;</button>` : ''}
+      <button onclick="event.stopPropagation();deleteTodo('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 6px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Delete" onmouseover="this.style.color='var(--danger)'" onmouseout="this.style.color='var(--subtle)'">&#10005;</button>
     </div>
   </div>`;
 }
@@ -1485,16 +1552,52 @@ document.addEventListener('drop', async e => {
   dragId = null;
 });
 
+let _scrollAnim = null;
+let _scrollTarget = null; // the element we're scrolling toward
 function scrollIntoViewCentered(el) {
-  const rect = el.getBoundingClientRect();
   const viewH = window.innerHeight;
-  const pad = viewH * 0.3; // top ~30% of viewport as target zone
-  // If element is above the padded top zone or below the bottom zone, scroll
-  if (rect.top < pad || rect.bottom > viewH - pad) {
-    const elCenter = rect.top + rect.height / 2;
-    const targetY = viewH * 0.4; // aim for 40% from top
-    window.scrollBy({top: elCenter - targetY, behavior: 'smooth'});
+  const pad = viewH * 0.3;
+  const rect = el.getBoundingClientRect();
+  if (rect.top >= pad && rect.bottom <= viewH - pad) {
+    // Already in comfortable zone — cancel any animation and stop
+    if (_scrollAnim) { cancelAnimationFrame(_scrollAnim); _scrollAnim = null; }
+    _scrollTarget = null;
+    return;
   }
+
+  // If already animating toward this element, let it continue
+  if (_scrollAnim && _scrollTarget === el) return;
+
+  // Cancel previous animation
+  if (_scrollAnim) cancelAnimationFrame(_scrollAnim);
+  _scrollTarget = el;
+
+  const duration = 180;
+  const t0 = performance.now();
+
+  function step(now) {
+    const elapsed = now - t0;
+    const progress = Math.min(elapsed / duration, 1);
+    // Ease out cubic — fast start, gentle stop
+    const eased = 1 - Math.pow(1 - progress, 3);
+
+    // Recalculate target position every frame (tracks element through DOM changes)
+    const r = _scrollTarget.getBoundingClientRect();
+    const elCenter = r.top + r.height / 2;
+    const targetY = window.innerHeight * 0.4;
+    const remaining = elCenter - targetY;
+
+    // Lerp: move a fraction of the remaining distance based on eased progress
+    window.scrollBy(0, remaining * Math.min(eased * 0.5 + 0.15, 1));
+
+    if (progress < 1 && Math.abs(remaining) > 1) {
+      _scrollAnim = requestAnimationFrame(step);
+    } else {
+      _scrollAnim = null;
+      _scrollTarget = null;
+    }
+  }
+  _scrollAnim = requestAnimationFrame(step);
 }
 
 function applySelection() {
