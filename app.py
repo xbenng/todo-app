@@ -225,7 +225,16 @@ def add_todo():
     if not new_todo["title"]:
         return jsonify({"error": "Title is required"}), 400
 
-    todos.append(new_todo)
+    before_id = data.get("before_id")
+    if before_id:
+        idx = next((i for i, t in enumerate(active) if t["id"] == before_id), None)
+        if idx is not None:
+            active.insert(idx, new_todo)
+        else:
+            active.append(new_todo)
+        todos = active + completed
+    else:
+        todos.append(new_todo)
     _write_todo_file(TODO_FILE, todos)
     return jsonify(new_todo), 201
 
@@ -419,6 +428,46 @@ def sort_by_priority():
     return jsonify({"ok": True})
 
 
+@app.route("/api/todos/drop", methods=["POST"])
+def drop_todo():
+    """Move a todo to a specific position: before another item, or to the end of a section."""
+    data = request.json
+    todo_id = data.get("id")
+    before_id = data.get("before_id")  # insert before this item (None = end of section)
+    target_section = data.get("section")  # required if before_id is None
+
+    if not todo_id:
+        return jsonify({"error": "id required"}), 400
+
+    active = _parse_todo_file(TODO_FILE)
+    completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+
+    idx = next((i for i, t in enumerate(active) if t["id"] == todo_id), None)
+    if idx is None:
+        return jsonify({"error": "Not found or not an active item"}), 404
+    item = active.pop(idx)
+
+    if before_id:
+        target_idx = next((i for i, t in enumerate(active) if t["id"] == before_id), None)
+        if target_idx is not None:
+            item["section"] = active[target_idx].get("section", "")
+            active.insert(target_idx, item)
+        else:
+            active.append(item)
+    elif target_section is not None:
+        item["section"] = target_section
+        last_in_section = -1
+        for i, t in enumerate(active):
+            if t.get("section", "") == target_section:
+                last_in_section = i
+        active.insert(last_in_section + 1, item)
+    else:
+        active.append(item)
+
+    _write_todo_file(TODO_FILE, active + completed)
+    return jsonify({"ok": True})
+
+
 @app.route("/api/todos/mtime", methods=["GET"])
 def get_mtime():
     """Return the max modification time across both files for change detection."""
@@ -456,28 +505,31 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: var(--bg); color: var(--text); line-height: 1.5;
     max-width: 700px; margin: 0 auto; padding: 24px 16px;
   }
-  h1 { font-size: 1.5rem; margin-bottom: 20px; }
+  h1 { font-size: 1.5rem; margin-bottom: 20px; display: none; /* moved to sidebar */ }
   h2 { font-size: 1.1rem; color: var(--muted); margin: 24px 0 12px; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
 
   /* Add form */
   .add-form {
     background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
-    padding: 16px; margin-bottom: 24px; box-shadow: var(--shadow);
+    padding: 16px; margin-bottom: 8px; box-shadow: var(--shadow);
     display: none;
   }
   .add-form.visible { display: block; }
   .add-form.kb-selected { outline: 2px solid var(--accent); outline-offset: -2px; }
   .add-toggle {
-    display: flex; align-items: center; gap: 8px; margin-bottom: 16px;
+    position: fixed; top: 16px; left: 16px; z-index: 900;
+    display: flex; flex-direction: column; align-items: flex-start; gap: 6px;
   }
-  .add-toggle .btn { font-size: 0.9rem; padding: 8px 20px; }
+  .add-toggle h1 { display: block; font-size: 1.8rem; margin: 0; }
+  .add-toggle .btn-row { display: flex; align-items: center; gap: 8px; }
+  .add-toggle .btn { font-size: 0.9rem; padding: 8px 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.15); }
   .add-form input, .add-form textarea, .add-form select {
     width: 100%; padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px;
     font-size: 0.9rem; font-family: inherit; margin-bottom: 8px; background: #fafafa;
   }
   .add-form textarea { resize: vertical; min-height: 50px; }
   .add-form .row { display: flex; gap: 8px; align-items: center; }
-  .add-form select { width: auto; margin-bottom: 0; }
+  .add-form .row select { width: auto; margin-bottom: 0; }
   .btn {
     padding: 8px 16px; border: none; border-radius: 6px; font-size: 0.85rem;
     font-weight: 600; cursor: pointer; transition: background 0.15s;
@@ -496,6 +548,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
     border-left: 4px solid var(--border);
   }
   .todo-item.status-completed { border-left-color: var(--completed-border); background: var(--completed-bg); opacity: 0.7; }
+  .todo-item.dragging { opacity: 0.4; }
+  .todo-item.drag-over-top { border-top: 3px solid var(--accent); margin-top: -3px; }
+  .todo-item.drag-over-bottom { border-bottom: 3px solid var(--accent); margin-bottom: 5px; }
+  .drag-handle {
+    cursor: grab; opacity: 0.3; font-size: 1rem; line-height: 1; padding: 2px 2px 2px 0;
+    flex-shrink: 0; align-self: center; user-select: none;
+  }
+  .drag-handle:hover { opacity: 0.7; }
+  .section-header-row.drag-over-section { background: rgba(37,99,235,0.08); }
 
   .todo-checkbox { margin-top: 3px; width: 18px; height: 18px; cursor: pointer; accent-color: var(--accent); flex-shrink: 0; }
   .todo-body { flex: 1; min-width: 0; }
@@ -522,13 +583,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   .section-header-row {
     display: flex; align-items: center; gap: 8px;
-    margin: 18px 0 8px; padding-bottom: 4px; border-bottom: 1px solid var(--border);
+    margin: 18px 0 8px; padding: 6px 0 4px; border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 100; background: var(--bg);
   }
   .section-header-row h3 { font-size: 0.95rem; color: var(--text); font-weight: 600; margin: 0; }
+  .section-count {
+    font-size: 0.75rem; color: var(--muted); font-weight: 400;
+    background: rgba(0,0,0,0.05); padding: 0 6px; border-radius: 10px;
+  }
+  .collapse-btn {
+    font-size: 0.7rem; padding: 1px 6px; border-radius: 4px;
+    border: 1px solid var(--border); background: #fafafa; color: var(--muted);
+    cursor: pointer; transition: transform 0.15s, background 0.15s; line-height: 1;
+  }
+  .collapse-btn:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .collapse-btn.collapsed { transform: rotate(-90deg); }
   .sort-priority-btn {
     font-size: 0.7rem; padding: 2px 8px; border-radius: 10px;
     border: 1px solid var(--border); background: #fafafa; color: var(--muted);
-    cursor: pointer; white-space: nowrap; transition: background 0.15s;
+    cursor: pointer; white-space: nowrap; transition: background 0.15s; margin-left: auto;
   }
   .sort-priority-btn:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
 
@@ -583,18 +656,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </head>
 <body>
 
-<h1>&#9744; Todo List</h1>
-
 <div class="add-toggle">
-  <button class="btn btn-primary" id="add-toggle-btn" onclick="showAddForm()">+ New Todo</button>
-  <span style="color:var(--muted);font-size:0.8rem">or press <kbd style="padding:1px 5px;border:1px solid var(--border);border-radius:3px;background:#fff;font-size:0.8rem">n</kbd></span>
+  <h1>&#9744; To Do List</h1>
+  <div class="btn-row">
+    <button class="btn btn-primary" id="add-toggle-btn" onclick="showAddForm()">+ New Todo</button>
+    <span style="color:var(--muted);font-size:0.8rem">or press <kbd style="padding:1px 5px;border:1px solid var(--border);border-radius:3px;background:#fff;font-size:0.8rem">n</kbd></span>
+  </div>
 </div>
 
 <div class="add-form" id="add-form">
   <input type="text" id="new-title" placeholder="What needs to be done?">
   <textarea id="new-desc" placeholder="Description (optional)"></textarea>
-  <input type="text" id="new-section" placeholder="Section (optional)" list="section-suggestions" style="font-size:0.85rem;">
-  <datalist id="section-suggestions"></datalist>
+  <select id="new-section" style="font-size:0.85rem; width:100%; margin-bottom:8px;">
+    <option value="">No section</option>
+  </select>
+  <input type="text" id="new-section-custom" placeholder="New section name" style="font-size:0.85rem; display:none;">
   <div class="row">
     <select id="new-priority">
       <option value="high">High</option>
@@ -619,10 +695,12 @@ let editingId = null;
 let lastMtime = 0;
 let pollTimer = null;
 let selectedIdx = -1; // -1 = nothing, 0 = add-form, 1+ = todo items
+let insertBeforeId = null; // when adding, insert before this todo id
 let ctxTargetId = null; // id of todo targeted by context menu
 let visibleIds = []; // ordered list of todo ids as rendered
 let sectionsOrder = []; // ordered list of section names as rendered
 let addFormVisible = false;
+const collapsedSections = new Set(); // collapsed section names
 const SEL_ADD = 0; // index for the add-form position
 
 async function loadTodos() {
@@ -666,14 +744,25 @@ function render() {
   const activeEl = document.getElementById('active-section');
   const completedEl = document.getElementById('completed-section');
 
+  // Rescue add-form before innerHTML overwrites it (it may be inside activeEl)
+  const form = document.getElementById('add-form');
+  const formWasVisible = addFormVisible;
+  const formTitle = form.querySelector('#new-title')?.value || '';
+  const formDesc = form.querySelector('#new-desc')?.value || '';
+  const formPriority = form.querySelector('#new-priority')?.value || 'medium';
+  const formSection = form.querySelector('#new-section')?.value || '';
+  const formSectionCustom = form.querySelector('#new-section-custom')?.value || '';
+  const defaultParent = document.querySelector('.add-toggle');
+  if (defaultParent) defaultParent.after(form);
+
   if (active.length === 0 && completed.length === 0) {
     activeEl.innerHTML = '<div class="empty-state">No todos yet. Press <strong>n</strong> to add one!</div>';
     completedEl.innerHTML = '';
+    // Restore form state if it was visible
+    if (formWasVisible) _restoreInlineForm(form, formTitle, formDesc, formPriority, formSection, formSectionCustom);
     applySelection();
     return;
   }
-
-  visibleIds = [...active, ...completed].map(t => t.id);
 
   // Group active by section preserving order of first appearance
   sectionsOrder = [];
@@ -684,28 +773,86 @@ function render() {
   });
 
   let activeHtml = '';
+  const visibleActive = []; // track which active items are visible (not collapsed)
   sectionsOrder.forEach(section => {
-    if (section) {
-      activeHtml += `<div class="section-header-row"><h3>${esc(section)}</h3><button class="sort-priority-btn" onclick="sortByPriority('${esc(section).replace(/'/g, "\\\'")}')" title="Sort by priority (high first)">&#9650; Priority</button></div>`;
-    }
     const items = active.filter(t => (t.section || '') === section);
-    activeHtml += items.map(t => renderTodo(t)).join('');
+    const isCollapsed = collapsedSections.has(section);
+    const escSection = esc(section).replace(/'/g, "\\'");
+    if (section) {
+      activeHtml += `<div class="section-header-row">`
+        + `<button class="collapse-btn${isCollapsed ? ' collapsed' : ''}" onclick="toggleSectionCollapse('${escSection}')" title="${isCollapsed ? 'Expand' : 'Collapse'}">&#9660;</button>`
+        + `<h3>${esc(section)}</h3>`
+        + `<span class="section-count">${items.length}</span>`
+        + `<button class="sort-priority-btn" onclick="sortByPriority('${escSection}')" title="Sort by priority (high first)">&#9650; Priority</button>`
+        + `</div>`;
+    }
+    if (!isCollapsed) {
+      activeHtml += items.map(t => renderTodo(t)).join('');
+      visibleActive.push(...items);
+    }
   });
+
+  // visibleIds only includes non-collapsed active items + completed
+  visibleIds = [...visibleActive, ...completed].map(t => t.id);
 
   activeEl.innerHTML = active.length
     ? '<h2>Active (' + active.length + ')</h2>' + activeHtml
     : '<h2>Active</h2><div class="empty-state">All done! &#127881;</div>';
 
-  completedEl.innerHTML = completed.length
-    ? '<h2>Completed (' + completed.length + ')</h2>' + completed.map(t => renderTodo(t)).join('')
-    : '';
+  const isCompletedCollapsed = collapsedSections.has('__completed__');
+  if (completed.length) {
+    completedEl.innerHTML = `<div class="section-header-row">`
+      + `<button class="collapse-btn${isCompletedCollapsed ? ' collapsed' : ''}" onclick="toggleSectionCollapse('__completed__')" title="${isCompletedCollapsed ? 'Expand' : 'Collapse'}">&#9660;</button>`
+      + `<h2 style="margin:0;">Completed (${completed.length})</h2>`
+      + `</div>`
+      + (isCompletedCollapsed ? '' : completed.map(t => renderTodo(t)).join(''));
+    if (isCompletedCollapsed) {
+      visibleIds = visibleActive.map(t => t.id);
+    }
+  } else {
+    completedEl.innerHTML = '';
+  }
 
-  // Update section suggestions datalist
+  // Update section dropdown options
   const allSections = [...new Set(allTodos.map(t => t.section || '').filter(Boolean))];
-  const dl = document.getElementById('section-suggestions');
-  if (dl) dl.innerHTML = allSections.map(s => `<option value="${esc(s)}">`).join('');
+  const secSelect = document.getElementById('new-section');
+  if (secSelect) {
+    const curVal = secSelect.value;
+    secSelect.innerHTML = '<option value="">No section</option>'
+      + allSections.map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join('')
+      + '<option value="__custom__">Other...</option>';
+    // Restore previous selection if still valid
+    if ([...secSelect.options].some(o => o.value === curVal)) secSelect.value = curVal;
+  }
+
+  // Restore inline form if it was visible and we have an insertion target
+  if (formWasVisible) _restoreInlineForm(form, formTitle, formDesc, formPriority, formSection, formSectionCustom);
+
+  // Clamp selectedIdx if items disappeared (e.g. section collapsed)
+  if (selectedIdx > visibleIds.length) selectedIdx = visibleIds.length > 0 ? visibleIds.length : -1;
 
   applySelection();
+}
+
+function _restoreInlineForm(form, title, desc, priority, section, sectionCustom) {
+  if (insertBeforeId) {
+    const targetEl = document.querySelector(`.todo-item[data-todo-id="${insertBeforeId}"]`);
+    if (targetEl) targetEl.parentNode.insertBefore(form, targetEl);
+  }
+  form.classList.add('visible');
+  form.querySelector('#new-title').value = title;
+  form.querySelector('#new-desc').value = desc;
+  form.querySelector('#new-priority').value = priority;
+  // Restore section select — if the value exists in options, set it; otherwise set to custom
+  const secSelect = form.querySelector('#new-section');
+  const customInput = form.querySelector('#new-section-custom');
+  if ([...secSelect.options].some(o => o.value === section)) {
+    secSelect.value = section;
+  } else if (section) {
+    secSelect.value = '__custom__';
+  }
+  customInput.value = sectionCustom;
+  customInput.style.display = secSelect.value === '__custom__' ? '' : 'none';
 }
 
 function renderTodo(t) {
@@ -717,7 +864,12 @@ function renderTodo(t) {
       <div class="todo-body">
         <input class="edit-title" id="edit-title-${t.id}" value="${esc(t.title)}">
         <textarea class="edit-desc" id="edit-desc-${t.id}">${esc(t.description)}</textarea>
-        <input class="edit-title" id="edit-section-${t.id}" value="${esc(t.section || '')}" placeholder="Section" list="section-suggestions" style="font-size:0.85rem; font-weight:400; margin-bottom:4px;">
+        <select id="edit-section-${t.id}" style="font-size:0.85rem; font-weight:400; margin-bottom:4px; width:100%; padding:4px 8px; border:1px solid var(--border); border-radius:4px;">
+          <option value="">No section</option>
+          ${allSectionsForEdit().map(s => `<option value="${esc(s)}" ${(t.section||'')===s?'selected':''}>${esc(s)}</option>`).join('')}
+          <option value="__custom__">Other...</option>
+        </select>
+        <input class="edit-title" id="edit-section-custom-${t.id}" placeholder="New section name" style="font-size:0.85rem; font-weight:400; margin-bottom:4px; display:none;">
         <div class="edit-actions">
           <select id="edit-priority-${t.id}">
             ${['high','medium','low'].map(p =>
@@ -734,7 +886,9 @@ function renderTodo(t) {
   const desc = t.description ? `<div class="todo-desc">${renderMd(t.description)}</div>` : '';
   const priorityBadge = `<span class="priority-badge priority-${t.priority || 'medium'}">${t.priority || 'medium'}</span>`;
 
-  return `<div class="todo-item ${statusClass}" data-todo-id="${t.id}" onclick="selectTodo('${t.id}')" oncontextmenu="showCtxMenu(event,'${t.id}')" style="cursor:pointer;">
+  const draggable = t.status !== 'completed' ? 'draggable="true"' : '';
+  return `<div class="todo-item ${statusClass}" data-todo-id="${t.id}" ${draggable} onclick="selectTodo('${t.id}')" oncontextmenu="showCtxMenu(event,'${t.id}')" style="cursor:pointer;">
+    ${t.status !== 'completed' ? '<span class="drag-handle" title="Drag to reorder">&#8942;&#8942;</span>' : ''}
     <input type="checkbox" class="todo-checkbox" ${checked} onchange="toggleComplete('${t.id}', this.checked)" onclick="event.stopPropagation()">
     <div class="todo-body" ondblclick="startEdit('${t.id}')">
       <div class="todo-title">${esc(t.title)}</div>
@@ -886,21 +1040,93 @@ document.addEventListener('keydown', e => {
   }
 });
 
+function toggleSectionCollapse(section) {
+  if (collapsedSections.has(section)) collapsedSections.delete(section);
+  else collapsedSections.add(section);
+  render();
+}
+
+function getSectionOfSelected() {
+  if (selectedIdx < 1 || selectedIdx > visibleIds.length) return null;
+  const id = visibleIds[selectedIdx - 1];
+  const todo = allTodos.find(t => t.id === id);
+  if (!todo) return null;
+  return todo.status === 'completed' ? '__completed__' : (todo.section || '');
+}
+
+function getNextCollapsedSection() {
+  // Find the nearest collapsed section relative to current selection
+  // Strategy: look at all sections in order and find the first collapsed one
+  // at or after the selected item's position, or the last one before it
+  if (selectedIdx < 1 || selectedIdx > visibleIds.length) {
+    // Nothing selected — just expand the first collapsed section
+    for (const s of sectionsOrder) {
+      if (collapsedSections.has(s)) return s;
+    }
+    if (collapsedSections.has('__completed__')) return '__completed__';
+    return null;
+  }
+  const id = visibleIds[selectedIdx - 1];
+  const todo = allTodos.find(t => t.id === id);
+  if (!todo) return collapsedSections.values().next().value || null;
+  const curSection = todo.status === 'completed' ? '__completed__' : (todo.section || '');
+
+  // Look for a collapsed section immediately following the current section
+  const allSecs = [...sectionsOrder, '__completed__'];
+  const curIdx = allSecs.indexOf(curSection);
+  // Search forward first, then backward
+  for (let i = curIdx + 1; i < allSecs.length; i++) {
+    if (collapsedSections.has(allSecs[i])) return allSecs[i];
+  }
+  for (let i = curIdx - 1; i >= 0; i--) {
+    if (collapsedSections.has(allSecs[i])) return allSecs[i];
+  }
+  return null;
+}
+
+function allSectionsForEdit() {
+  return [...new Set(allTodos.map(t => t.section || '').filter(Boolean))];
+}
+
+function getSelectedSection() {
+  const sel = document.getElementById('new-section');
+  if (sel.value === '__custom__') return document.getElementById('new-section-custom').value.trim();
+  return sel.value;
+}
+
+function onSectionChange() {
+  const sel = document.getElementById('new-section');
+  const customInput = document.getElementById('new-section-custom');
+  if (sel.value === '__custom__') {
+    customInput.style.display = '';
+    customInput.focus();
+  } else {
+    customInput.style.display = 'none';
+    customInput.value = '';
+  }
+}
+document.getElementById('new-section').addEventListener('change', onSectionChange);
+
 async function addTodo() {
   const title = document.getElementById('new-title').value.trim();
   if (!title) return;
   const desc = document.getElementById('new-desc').value.trim();
   const priority = document.getElementById('new-priority').value;
-  const section = document.getElementById('new-section').value.trim();
+  const section = getSelectedSection();
+  const payload = {title, description: desc, priority, section};
+  if (insertBeforeId) payload.before_id = insertBeforeId;
   await fetch(API, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({title, description: desc, priority, section})
+    body: JSON.stringify(payload)
   });
+  insertBeforeId = null;
   document.getElementById('new-title').value = '';
   document.getElementById('new-desc').value = '';
   document.getElementById('new-priority').value = 'medium';
   document.getElementById('new-section').value = '';
+  document.getElementById('new-section-custom').value = '';
+  document.getElementById('new-section-custom').style.display = 'none';
   hideAddForm();
   loadTodos();
 }
@@ -1035,7 +1261,21 @@ function startEdit(id) {
   render();
   document.getElementById('edit-title-' + id)?.focus();
   setTimeout(() => {
-    const editEls = document.querySelectorAll(`#edit-title-${id}, #edit-desc-${id}, #edit-priority-${id}, #edit-section-${id}`);
+    const editEls = document.querySelectorAll(`#edit-title-${id}, #edit-desc-${id}, #edit-priority-${id}, #edit-section-${id}, #edit-section-custom-${id}`);
+    // Section dropdown: show/hide custom input
+    const secSelect = document.getElementById('edit-section-' + id);
+    const secCustom = document.getElementById('edit-section-custom-' + id);
+    if (secSelect && secCustom) {
+      secSelect.addEventListener('change', () => {
+        if (secSelect.value === '__custom__') {
+          secCustom.style.display = '';
+          secCustom.focus();
+        } else {
+          secCustom.style.display = 'none';
+          secCustom.value = '';
+        }
+      });
+    }
     // Keydown: Cmd+Enter to save, Escape to cancel
     editEls.forEach(el => {
       el.addEventListener('keydown', e => {
@@ -1067,7 +1307,10 @@ async function saveEdit(id) {
   const title = document.getElementById('edit-title-' + id).value.trim();
   const desc = document.getElementById('edit-desc-' + id).value.trim();
   const priority = document.getElementById('edit-priority-' + id).value;
-  const section = document.getElementById('edit-section-' + id).value.trim();
+  const secSelect = document.getElementById('edit-section-' + id);
+  const section = secSelect.value === '__custom__'
+    ? document.getElementById('edit-section-custom-' + id).value.trim()
+    : secSelect.value;
   if (!title) return;
   await fetch(API + '/' + id, {
     method: 'PUT',
@@ -1087,6 +1330,22 @@ function showAddForm() {
   addFormVisible = true;
   const form = document.getElementById('add-form');
   form.classList.add('visible');
+  // If a todo is selected, pre-fill section, set insertion point, and move form inline
+  if (selectedIdx >= 1 && selectedIdx <= visibleIds.length) {
+    const selId = visibleIds[selectedIdx - 1];
+    const selTodo = allTodos.find(t => t.id === selId);
+    if (selTodo && selTodo.status !== 'completed') {
+      document.getElementById('new-section').value = selTodo.section || '';
+      insertBeforeId = selId;
+      // Move form to appear right before the selected item
+      const targetEl = document.querySelector(`.todo-item[data-todo-id="${selId}"]`);
+      if (targetEl) targetEl.parentNode.insertBefore(form, targetEl);
+    } else {
+      insertBeforeId = null;
+    }
+  } else {
+    insertBeforeId = null;
+  }
   selectedIdx = SEL_ADD;
   applySelection();
   document.getElementById('new-title').focus();
@@ -1094,18 +1353,156 @@ function showAddForm() {
 
 function hideAddForm() {
   addFormVisible = false;
+  insertBeforeId = null;
   const form = document.getElementById('add-form');
   form.classList.remove('visible');
+  // Move form back to its default position (after the add-toggle)
+  const defaultParent = document.querySelector('.add-toggle');
+  if (defaultParent) defaultParent.after(form);
   document.getElementById('new-title').value = '';
   document.getElementById('new-desc').value = '';
   document.getElementById('new-priority').value = 'medium';
   document.getElementById('new-section').value = '';
+  document.getElementById('new-section-custom').value = '';
+  document.getElementById('new-section-custom').style.display = 'none';
   // Move selection to first todo if any
   selectedIdx = visibleIds.length > 0 ? 1 : -1;
   applySelection();
 }
 
 // selectedIdx: -1=nothing, 0=add-form, 1..N=todo items (1-indexed into visibleIds)
+// ---------------------------------------------------------------------------
+// Drag and drop
+// ---------------------------------------------------------------------------
+let dragId = null;
+
+document.addEventListener('dragstart', e => {
+  const item = e.target.closest('.todo-item[draggable]');
+  if (!item) return;
+  dragId = item.dataset.todoId;
+  item.classList.add('dragging');
+  e.dataTransfer.effectAllowed = 'move';
+  e.dataTransfer.setData('text/plain', dragId);
+});
+
+document.addEventListener('dragend', e => {
+  dragId = null;
+  document.querySelectorAll('.dragging').forEach(el => el.classList.remove('dragging'));
+  document.querySelectorAll('.drag-over-top,.drag-over-bottom').forEach(el => {
+    el.classList.remove('drag-over-top', 'drag-over-bottom');
+  });
+  document.querySelectorAll('.drag-over-section').forEach(el => el.classList.remove('drag-over-section'));
+});
+
+document.addEventListener('dragover', e => {
+  if (!dragId) return;
+  const item = e.target.closest('.todo-item[data-todo-id]');
+  const sectionHeader = e.target.closest('.section-header-row');
+
+  if (item && item.dataset.todoId !== dragId) {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    // Clear other indicators
+    document.querySelectorAll('.drag-over-top,.drag-over-bottom').forEach(el => {
+      if (el !== item) el.classList.remove('drag-over-top', 'drag-over-bottom');
+    });
+    document.querySelectorAll('.drag-over-section').forEach(el => el.classList.remove('drag-over-section'));
+    // Determine top/bottom half
+    const rect = item.getBoundingClientRect();
+    const midY = rect.top + rect.height / 2;
+    if (e.clientY < midY) {
+      item.classList.add('drag-over-top');
+      item.classList.remove('drag-over-bottom');
+    } else {
+      item.classList.add('drag-over-bottom');
+      item.classList.remove('drag-over-top');
+    }
+  } else if (sectionHeader) {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    document.querySelectorAll('.drag-over-top,.drag-over-bottom').forEach(el => {
+      el.classList.remove('drag-over-top', 'drag-over-bottom');
+    });
+    document.querySelectorAll('.drag-over-section').forEach(el => {
+      if (el !== sectionHeader) el.classList.remove('drag-over-section');
+    });
+    sectionHeader.classList.add('drag-over-section');
+  }
+});
+
+document.addEventListener('dragleave', e => {
+  const item = e.target.closest('.todo-item');
+  if (item) item.classList.remove('drag-over-top', 'drag-over-bottom');
+  const sectionHeader = e.target.closest('.section-header-row');
+  if (sectionHeader) sectionHeader.classList.remove('drag-over-section');
+});
+
+document.addEventListener('drop', async e => {
+  if (!dragId) return;
+  e.preventDefault();
+  const item = e.target.closest('.todo-item[data-todo-id]');
+  const sectionHeader = e.target.closest('.section-header-row');
+
+  let payload = {id: dragId};
+
+  if (item && item.dataset.todoId !== dragId) {
+    const targetId = item.dataset.todoId;
+    const rect = item.getBoundingClientRect();
+    const midY = rect.top + rect.height / 2;
+    if (e.clientY < midY) {
+      // Drop above: insert before target
+      payload.before_id = targetId;
+    } else {
+      // Drop below: find the next sibling todo and insert before it
+      const nextItem = item.nextElementSibling?.closest?.('.todo-item[data-todo-id]')
+        || item.nextElementSibling;
+      if (nextItem && nextItem.classList.contains('todo-item') && nextItem.dataset.todoId) {
+        payload.before_id = nextItem.dataset.todoId;
+      } else {
+        // End of section — figure out which section the target belongs to
+        const targetTodo = allTodos.find(t => t.id === targetId);
+        payload.section = targetTodo ? (targetTodo.section || '') : '';
+      }
+    }
+  } else if (sectionHeader) {
+    // Dropped on a section header — move to end of that section
+    const h3 = sectionHeader.querySelector('h3');
+    payload.section = h3 ? h3.textContent : '';
+  } else {
+    return;
+  }
+
+  // Clean up visual state
+  document.querySelectorAll('.drag-over-top,.drag-over-bottom').forEach(el => {
+    el.classList.remove('drag-over-top', 'drag-over-bottom');
+  });
+  document.querySelectorAll('.drag-over-section').forEach(el => el.classList.remove('drag-over-section'));
+
+  await fetch(API + '/drop', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
+  });
+  await loadTodos();
+  // Select the dropped item
+  const ni = visibleIds.indexOf(dragId);
+  if (ni >= 0) selectedIdx = ni + 1;
+  applySelection();
+  dragId = null;
+});
+
+function scrollIntoViewCentered(el) {
+  const rect = el.getBoundingClientRect();
+  const viewH = window.innerHeight;
+  const pad = viewH * 0.3; // top ~30% of viewport as target zone
+  // If element is above the padded top zone or below the bottom zone, scroll
+  if (rect.top < pad || rect.bottom > viewH - pad) {
+    const elCenter = rect.top + rect.height / 2;
+    const targetY = viewH * 0.4; // aim for 40% from top
+    window.scrollBy({top: elCenter - targetY, behavior: 'smooth'});
+  }
+}
+
 function applySelection() {
   // Clear all highlights
   document.querySelectorAll('.todo-item.kb-selected').forEach(el => el.classList.remove('kb-selected'));
@@ -1114,13 +1511,13 @@ function applySelection() {
 
   if (selectedIdx === SEL_ADD && addFormVisible) {
     form.classList.add('kb-selected');
-    form.scrollIntoView({block: 'nearest', behavior: 'smooth'});
+    scrollIntoViewCentered(form);
   } else if (selectedIdx >= 1 && selectedIdx <= visibleIds.length) {
     const todoIdx = selectedIdx - 1;
     const el = document.querySelector(`.todo-item[data-todo-id="${visibleIds[todoIdx]}"]`);
     if (el) {
       el.classList.add('kb-selected');
-      el.scrollIntoView({block: 'nearest', behavior: 'smooth'});
+      scrollIntoViewCentered(el);
     }
   }
 }
@@ -1201,6 +1598,30 @@ document.addEventListener('keydown', e => {
     if (selectedIdx >= 1 && selectedIdx <= visibleIds.length) {
       e.preventDefault();
       bringToTop(visibleIds[selectedIdx - 1]);
+    }
+  } else if (e.key === 'Backspace' && e.metaKey) {
+    if (selectedIdx >= 1 && selectedIdx <= visibleIds.length) {
+      e.preventDefault();
+      deleteTodo(visibleIds[selectedIdx - 1]);
+    }
+  } else if (e.key === 'ArrowLeft' && !e.metaKey && !e.altKey && !e.shiftKey) {
+    // Collapse section of selected item
+    const sec = getSectionOfSelected();
+    if (sec !== null && sec !== '' && !collapsedSections.has(sec)) {
+      e.preventDefault();
+      collapsedSections.add(sec);
+      render();
+    }
+  } else if (e.key === 'ArrowRight' && !e.metaKey && !e.altKey && !e.shiftKey) {
+    // Expand nearest collapsed section above/at current position
+    if (collapsedSections.size > 0) {
+      e.preventDefault();
+      // Find which collapsed section the selection is adjacent to
+      const sec = getNextCollapsedSection();
+      if (sec) {
+        collapsedSections.delete(sec);
+        render();
+      }
     }
   } else if (e.key === 'n') {
     e.preventDefault();
