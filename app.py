@@ -690,6 +690,50 @@ def ea_update():
         return jsonify({"error": f"tmux error: {exc.stderr.decode().strip()}"}), 500
 
 
+@app.route("/api/ea-update-item", methods=["POST"])
+def ea_update_item():
+    """Run /ea update <item_id> in a tmux window."""
+    data = request.json
+    item_id = (data.get("id") or "").strip()
+    if not item_id:
+        return jsonify({"error": "id required"}), 400
+    tmux_bin = shutil.which("tmux") or "/opt/homebrew/bin/tmux"
+    tmux_session = "0"
+    window_name = f"ea-{item_id}"
+    try:
+        result = subprocess.run(
+            [tmux_bin, "has-session", "-t", tmux_session],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            subprocess.run(
+                [tmux_bin, "new-session", "-d", "-s", tmux_session],
+                check=True,
+                capture_output=True,
+            )
+        subprocess.run(
+            [tmux_bin, "new-window", "-t", f"{tmux_session}:", "-n", window_name],
+            check=True,
+            capture_output=True,
+        )
+        todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
+        subprocess.run(
+            [
+                tmux_bin, "send-keys",
+                "-t", f"{tmux_session}:{window_name}",
+                f"cd {todo_dir} && claude --dangerously-skip-permissions '/ea update {item_id}'",
+                "Enter",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return jsonify({"status": "started", "window": window_name})
+    except FileNotFoundError:
+        return jsonify({"error": "tmux is not installed"}), 500
+    except subprocess.CalledProcessError as exc:
+        return jsonify({"error": f"tmux error: {exc.stderr.decode().strip()}"}), 500
+
+
 @app.route("/api/resume-conv", methods=["POST"])
 def resume_conv():
     """Resume a Claude conversation in tmux."""
@@ -760,7 +804,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
 }
 </script>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+  @font-face {
+    font-family: 'Manrope';
+    src: url('/static/fonts/Manrope-VariableFont_wght.ttf') format('truetype');
+    font-weight: 200 800;
+    font-display: swap;
+  }
   :root {
     --bg: #f8f9fb; --card: #fff; --border: #e2e5ea; --text: #1a1d23;
     --muted: #6b7280; --subtle: #9ca3af;
@@ -775,7 +824,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html { scroll-behavior: smooth; }
   body {
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-family: 'Manrope', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     background: var(--bg); color: var(--text); line-height: 1.6;
     max-width: 828px; margin: 0 auto; padding: 24px 20px;
     -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
@@ -1499,6 +1548,7 @@ function renderTodo(t) {
       <div class="todo-title" style="flex:1;min-width:0" onclick="event.stopPropagation();selectTodo('${t.id}');toggleItemDesc('${t.id}')">${esc(t.title)}</div>
       ${priorityBadge}
       <div class="todo-actions">
+        ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();eaUpdateItem('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Refresh via /ea update" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#8635;</button>` : ''}
         ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();startInTmux('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Start in tmux (s)" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#9654;</button>` : ''}
         ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();bringToTop('${t.id}')" style="border:none;background:transparent;font-size:1rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Bring to top" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#x2912;</button>` : ''}
         <button onclick="event.stopPropagation();deleteTodo('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 6px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Delete" onmouseover="this.style.color='var(--danger)'" onmouseout="this.style.color='var(--subtle)'">&#10005;</button>
@@ -2025,6 +2075,26 @@ async function eaUpdate() {
     }
   } catch (e) {
     showToast('Failed to start EA update', true);
+  }
+}
+
+async function eaUpdateItem(id) {
+  try {
+    const res = await fetch('/api/ea-update-item', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({id})
+    });
+    const data = await res.json();
+    const toast = document.createElement('div');
+    const ok = res.ok;
+    toast.textContent = ok ? `Updating ${id} in tmux` : (data.error || 'Failed');
+    toast.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:' + (ok ? 'var(--text)' : 'var(--danger)') + ';color:var(--card);padding:8px 16px;border-radius:8px;font-size:0.85rem;z-index:2000;box-shadow:var(--shadow-lg);opacity:0;transition:opacity .15s';
+    document.body.appendChild(toast);
+    requestAnimationFrame(() => { toast.style.opacity = '1'; });
+    setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 150); }, 2000);
+  } catch (e) {
+    // silent
   }
 }
 
