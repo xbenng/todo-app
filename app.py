@@ -831,6 +831,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
     box-shadow: 0 0 0 3px var(--accent-light);
   }
   .search-bar input::placeholder { color: var(--subtle); }
+  .filter-badges { display: flex; gap: 6px; margin-bottom: 8px; min-height: 0; flex-wrap: wrap; }
+  .filter-badge {
+    font-size: 0.75rem; padding: 2px 8px; border-radius: 12px;
+    font-weight: 600; line-height: 1.4;
+  }
+  .filter-badge.filter-show {
+    background: var(--badge-color); color: white;
+  }
+  .filter-badge.filter-hide {
+    background: var(--border); color: var(--subtle); text-decoration: line-through;
+  }
   .add-form input, .add-form textarea, .add-form select {
     width: 100%; padding: 10px 14px; border: 1px solid var(--border); border-radius: 8px;
     font-size: 1rem; font-family: inherit; margin-bottom: 10px;
@@ -1099,6 +1110,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <input type="text" id="search-input" placeholder="Search todos... (/)">
   <kbd class="search-clear-hint" id="search-clear-hint">Esc to clear</kbd>
 </div>
+<div class="filter-badges" id="filter-badges"></div>
 
 <div class="add-form" id="add-form">
   <input type="text" id="new-title" placeholder="What needs to be done?">
@@ -1174,12 +1186,13 @@ let pollTimer = null;
 let selectedIdx = -1; // -1 = nothing, 0 = add-form, 1+ = todo items
 let insertBeforeId = null; // when adding, insert before this todo id
 let searchQuery = ''; // fuzzy search filter
-let filterPriority = ''; // empty = no filter, else 'high','medium','low','none'
+let showPriorities = new Set();  // colored: only show these
+let hidePriorities = new Set();  // greyed: hide these
 let ctxTargetId = null; // id of todo targeted by context menu
 let visibleIds = []; // ordered list of todo ids as rendered
 let sectionsOrder = []; // ordered list of section names as rendered
 let addFormVisible = false;
-const collapsedSections = new Set(); // collapsed section names
+const collapsedSections = new Set(['__completed__']); // collapsed section names
 const SEL_ADD = 0; // index for the add-form position
 
 async function loadTodos() {
@@ -1235,16 +1248,40 @@ function render() {
   if (searchBar) searchBar.after(form);
 
   // Apply search and priority filters
-  const searching = searchQuery.trim().length > 0 || filterPriority.length > 0;
+  const searching = searchQuery.trim().length > 0 || showPriorities.size > 0 || hidePriorities.size > 0;
   const searchTokens = searching ? searchQuery.toLowerCase().trim().split(/\s+/) : [];
   const matchesSearch = t => {
     const text = ((t.title || '') + ' ' + (t.description || '') + ' ' + (t.section || '')).toLowerCase();
     return searchTokens.every(tok => text.includes(tok));
   };
   const afterSearch = f => searching ? f.filter(matchesSearch) : f;
-  const afterPriority = f => filterPriority ? f.filter(t => (t.priority || 'medium') === filterPriority) : f;
+  const afterPriority = f => {
+    if (showPriorities.size === 0 && hidePriorities.size === 0) return f;
+    return f.filter(t => {
+      const p = t.priority || 'medium';
+      if (showPriorities.size > 0) return showPriorities.has(p);
+      return !hidePriorities.has(p);
+    });
+  };
   const filteredActive = afterPriority(afterSearch(active));
   const filteredCompleted = afterPriority(afterSearch(completed));
+
+  // Render filter badges
+  const badgesEl = document.getElementById('filter-badges');
+  if (badgesEl) {
+    const priorities = ['high', 'medium', 'low', 'none'];
+    const colors = {high: '#ef4444', medium: '#eab308', low: '#22c55e', none: '#9ca3af'};
+    const labels = {high: '1 High', medium: '2 Med', low: '3 Low', none: '0 None'};
+    let html = '';
+    for (const p of priorities) {
+      if (showPriorities.has(p)) {
+        html += `<span class="filter-badge filter-show" style="--badge-color:${colors[p]}">${labels[p]}</span>`;
+      } else if (hidePriorities.has(p)) {
+        html += `<span class="filter-badge filter-hide">${labels[p]}</span>`;
+      }
+    }
+    badgesEl.innerHTML = html;
+  }
 
   if (filteredActive.length === 0 && filteredCompleted.length === 0) {
     if (searching) {
@@ -2318,11 +2355,20 @@ document.addEventListener('keydown', e => {
   if (sectionPickerOpen) return;
 
   // Ctrl+number: toggle priority filter (works from anywhere)
-  if (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && ['1','2','3','0'].includes(e.key)) {
+  // Option+number: show priority filter; Shift+Option+number: hide priority filter
+  const optCodeMap = {'Digit1': 'high', 'Digit2': 'medium', 'Digit3': 'low', 'Digit0': 'none'};
+  if (e.altKey && !e.metaKey && !e.ctrlKey && optCodeMap[e.code]) {
     e.preventDefault();
-    const pMap = {'1': 'high', '2': 'medium', '3': 'low', '0': 'none'};
-    const p = pMap[e.key];
-    filterPriority = filterPriority === p ? '' : p;
+    const p = optCodeMap[e.code];
+    if (e.shiftKey) {
+      // Hide mode (greyed)
+      showPriorities.delete(p);
+      hidePriorities.has(p) ? hidePriorities.delete(p) : hidePriorities.add(p);
+    } else {
+      // Show mode (colored)
+      hidePriorities.delete(p);
+      showPriorities.has(p) ? showPriorities.delete(p) : showPriorities.add(p);
+    }
     selectedIdx = -1;
     render();
     return;
@@ -2491,9 +2537,10 @@ document.addEventListener('keydown', e => {
   } else if (e.key === 'Escape') {
     e.preventDefault();
     if (addFormVisible) { hideAddForm(); }
-    else if (searchQuery.trim().length > 0 || filterPriority) {
+    else if (searchQuery.trim().length > 0 || showPriorities.size > 0 || hidePriorities.size > 0) {
       searchQuery = '';
-      filterPriority = '';
+      showPriorities.clear();
+      hidePriorities.clear();
       const searchEl = document.getElementById('search-input');
       searchEl.value = '';
       searchEl.classList.remove('has-query');
