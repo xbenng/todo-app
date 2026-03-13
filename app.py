@@ -1896,33 +1896,15 @@ async function startEdit(id) {
         if (e.key === 'Escape') { e.preventDefault(); cancelEdit(); }
       });
     });
-    // Cancel edit when focus leaves all edit fields (including CM)
-    const cmEl = descEl ? descEl.querySelector('.cm-editor') : null;
-    editEls.forEach(el => {
-      el.addEventListener('blur', () => {
-        setTimeout(() => {
-          if (editingId !== id) return;
-          const active = document.activeElement;
-          const stillInEdit = Array.from(editEls).some(e => e === active || e.contains(active));
-          const inCm = cmEl && (cmEl === active || cmEl.contains(active));
-          const clickedBtn = active && active.closest('.edit-actions');
-          if (!stillInEdit && !inCm && !clickedBtn) cancelEdit();
-        }, 100);
-      });
-    });
-    // Also handle blur from CM editor
-    if (cmEl) {
-      cmEl.addEventListener('focusout', () => {
-        setTimeout(() => {
-          if (editingId !== id) return;
-          const active = document.activeElement;
-          const stillInEdit = Array.from(editEls).some(e => e === active || e.contains(active));
-          const inCm = cmEl === active || cmEl.contains(active);
-          const clickedBtn = active && active.closest('.edit-actions');
-          if (!stillInEdit && !inCm && !clickedBtn) cancelEdit();
-        }, 100);
-      });
+    // Cancel edit when clicking outside the todo item card
+    const todoCard = descEl ? descEl.closest('.todo-item') : null;
+    function onDocMousedown(e) {
+      if (editingId !== id) { document.removeEventListener('mousedown', onDocMousedown, true); return; }
+      if (todoCard && todoCard.contains(e.target)) return;
+      e.preventDefault();
+      cancelEdit();
     }
+    document.addEventListener('mousedown', onDocMousedown, true);
   }, 0);
 }
 
