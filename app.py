@@ -618,13 +618,14 @@ def start_in_tmux(todo_id):
             check=True,
             capture_output=True,
         )
+        todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
         subprocess.run(
             [
                 tmux_bin,
                 "send-keys",
                 "-t",
                 f"{tmux_session}:{window_name}",
-                "claude --dangerously-skip-permissions",
+                f"cd {todo_dir} && claude --dangerously-skip-permissions",
                 "Enter",
             ],
             check=True,
@@ -641,6 +642,53 @@ def start_in_tmux(todo_id):
         )
 
         return jsonify({"status": "started", "window": window_name})
+    except FileNotFoundError:
+        return jsonify({"error": "tmux is not installed"}), 500
+    except subprocess.CalledProcessError as exc:
+        return jsonify({"error": f"tmux error: {exc.stderr.decode().strip()}"}), 500
+
+
+@app.route("/api/resume-conv", methods=["POST"])
+def resume_conv():
+    """Resume a Claude conversation in tmux."""
+    data = request.json
+    conv_id = data.get("conversation_id", "").strip()
+    if not conv_id:
+        return jsonify({"error": "No conversation ID provided"}), 400
+
+    window_name = f"conv-{conv_id[:16]}"
+    tmux_bin = shutil.which("tmux") or "/opt/homebrew/bin/tmux"
+    tmux_session = "0"
+    try:
+        result = subprocess.run(
+            [tmux_bin, "has-session", "-t", tmux_session],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            subprocess.run(
+                [tmux_bin, "new-session", "-d", "-s", tmux_session],
+                check=True,
+                capture_output=True,
+            )
+
+        subprocess.run(
+            [tmux_bin, "new-window", "-t", f"{tmux_session}:", "-n", window_name],
+            check=True,
+            capture_output=True,
+        )
+        todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
+        subprocess.run(
+            [
+                tmux_bin, "send-keys",
+                "-t", f"{tmux_session}:{window_name}",
+                f"cd {todo_dir} && claude --dangerously-skip-permissions --resume {conv_id}",
+                "Enter",
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+        return jsonify({"status": "resumed", "window": window_name})
     except FileNotFoundError:
         return jsonify({"error": "tmux is not installed"}), 500
     except subprocess.CalledProcessError as exc:
@@ -794,6 +842,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .todo-desc pre { background: rgba(0,0,0,0.03); padding: 10px; border-radius: 6px; overflow-x: auto; margin: 0.3em 0; }
   .todo-desc pre code { background: none; padding: 0; }
   .todo-desc a { color: var(--accent); text-decoration: none; }
+  .todo-desc a.conv-link { font-family: monospace; font-size: 0.82rem; background: var(--accent-light); padding: 1px 6px; border-radius: 4px; }
   .todo-desc a:hover { text-decoration: underline; }
   .todo-desc h1, .todo-desc h2, .todo-desc h3 { font-size: 0.9em; margin: 0.4em 0 0.2em; }
   .todo-desc blockquote { border-left: 3px solid var(--border); margin: 0.3em 0; padding-left: 10px; color: var(--muted); }
@@ -1266,7 +1315,8 @@ function renderTodo(t) {
     </div>`;
   }
 
-  const desc = t.description ? `<div class="todo-desc">${renderMd(t.description)}</div>` : '';
+  const descHtml = t.description ? renderMd(t.description).replace(/conv:([a-zA-Z0-9_-]+)/g, '<a href="#" class="conv-link" onclick="event.preventDefault();event.stopPropagation();resumeConv(\'$1\')" title="Resume conversation $1">conv:$1</a>') : '';
+  const desc = descHtml ? `<div class="todo-desc">${descHtml}</div>` : '';
   const priorityBadge = `<span class="priority-badge priority-${t.priority || 'medium'}">${t.priority || 'medium'}</span>`;
 
   const draggable = t.status !== 'completed' ? 'draggable="true"' : '';
@@ -1679,6 +1729,32 @@ function showShortcuts() {
 }
 function hideShortcuts() {
   document.getElementById('shortcuts-overlay').classList.remove('visible');
+}
+
+async function resumeConv(convId) {
+  function showToast(msg, isError) {
+    const toast = document.createElement('div');
+    toast.textContent = msg;
+    toast.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:' + (isError ? 'var(--danger)' : 'var(--text)') + ';color:var(--card);padding:8px 16px;border-radius:8px;font-size:0.85rem;z-index:2000;box-shadow:var(--shadow-lg);opacity:0;transition:opacity .15s';
+    document.body.appendChild(toast);
+    requestAnimationFrame(() => { toast.style.opacity = '1'; });
+    setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 150); }, 2000);
+  }
+  try {
+    const res = await fetch('/api/resume-conv', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({conversation_id: convId})
+    });
+    const data = await res.json();
+    if (res.ok) {
+      showToast('Resuming conversation in tmux', false);
+    } else {
+      showToast(data.error || 'Failed to resume', true);
+    }
+  } catch (e) {
+    showToast('Failed to resume conversation', true);
+  }
 }
 
 function fallbackCopy(text) {
