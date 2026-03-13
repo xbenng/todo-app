@@ -838,17 +838,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
     box-shadow: 0 0 0 3px var(--accent-light);
   }
   .search-bar input::placeholder { color: var(--subtle); }
-  .filter-badges { display: flex; gap: 6px; margin-bottom: 8px; min-height: 0; flex-wrap: wrap; }
-  .filter-badge {
-    font-size: 0.75rem; padding: 2px 8px; border-radius: 12px;
-    font-weight: 600; line-height: 1.4;
-  }
-  .filter-badge.filter-show {
-    background: var(--badge-color); color: white;
-  }
-  .filter-badge.filter-hide {
-    background: var(--border); color: var(--subtle); text-decoration: line-through;
-  }
   .sticky-header {
     position: sticky; top: 0; z-index: 102;
     background: var(--bg); padding-top: 10px;
@@ -1119,7 +1108,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   ::-webkit-scrollbar-thumb:hover { background: var(--subtle); }
 </style>
 </head>
-<body>
+<body class="simple-mode">
 
 <div class="fab-new">
   <button class="btn btn-primary" id="add-toggle-btn" onclick="showAddForm()">+ New <span style="opacity:0.6;font-weight:400;font-size:0.8em">(n)</span></button>
@@ -1133,7 +1122,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <input type="text" id="search-input" placeholder="Search todos... (/)">
     <kbd class="search-clear-hint" id="search-clear-hint">Esc to clear</kbd>
   </div>
-  <div class="filter-badges" id="filter-badges"></div>
 </div>
 
 <div class="add-form" id="add-form">
@@ -1217,7 +1205,7 @@ let ctxTargetId = null; // id of todo targeted by context menu
 let visibleIds = []; // ordered list of todo ids as rendered
 let sectionsOrder = []; // ordered list of section names as rendered
 let addFormVisible = false;
-let simpleMode = false; // hide all descriptions
+let simpleMode = true; // hide all descriptions
 const expandedItems = new Set(); // per-item overrides when in simple mode
 const collapsedSections = new Set(['__completed__']); // collapsed section names
 const SEL_ADD = 0; // index for the add-form position
@@ -1294,22 +1282,6 @@ function render() {
   const filteredActive = afterPriority(afterSearch(active));
   const filteredCompleted = afterPriority(afterSearch(completed));
 
-  // Render filter badges
-  const badgesEl = document.getElementById('filter-badges');
-  if (badgesEl) {
-    const priorities = ['high', 'medium', 'low', 'none'];
-    const colors = {high: '#ef4444', medium: '#eab308', low: '#22c55e', none: '#9ca3af'};
-    const labels = {high: '1 High', medium: '2 Med', low: '3 Low', none: '0 None'};
-    let html = '';
-    for (const p of priorities) {
-      if (showPriorities.has(p)) {
-        html += `<span class="filter-badge filter-show" style="--badge-color:${colors[p]}">${labels[p]}</span>`;
-      } else if (hidePriorities.has(p)) {
-        html += `<span class="filter-badge filter-hide">${labels[p]}</span>`;
-      }
-    }
-    badgesEl.innerHTML = html;
-  }
 
   if (filteredActive.length === 0 && filteredCompleted.length === 0) {
     if (searching) {
@@ -1358,13 +1330,18 @@ function render() {
 
   const eaBtn = '<button class="btn btn-sm ea-update-btn" onclick="eaUpdate()" title="Run /ea update in tmux">Update</button>';
   const simpleBtn = `<button class="header-toggle${simpleMode ? ' active' : ''}" onclick="toggleSimpleMode()" title="Toggle simple mode (a)">Simple</button>`;
+  const pColors = {high:'#b91c1c',medium:'#a16207',low:'#15803d',none:'#9ca3af'};
+  const pBg = {high:'#fef2f2',medium:'#fffbeb',low:'#f0fdf4',none:'#f3f4f6'};
+  const pBorder = {high:'#fecaca',medium:'#fde68a',low:'#bbf7d0',none:'#e5e7eb'};
   const filterBtns = ['high','medium','low','none'].map(p => {
     const isShow = showPriorities.has(p);
     const isHide = hidePriorities.has(p);
-    const cls = isShow ? ' active' : (isHide ? ' active' : '');
-    const style = isHide ? ' style="background:var(--border);color:var(--subtle);border-color:var(--border);text-decoration:line-through"' : '';
+    let style;
+    if (isShow) style = `background:${pColors[p]};color:#fff;border-color:${pColors[p]}`;
+    else if (isHide) style = `background:var(--border);color:var(--subtle);border-color:var(--border);text-decoration:line-through`;
+    else style = `background:${pBg[p]};color:${pColors[p]};border-color:${pBorder[p]}`;
     const label = {high:'H',medium:'M',low:'L',none:'0'}[p];
-    return `<button class="header-toggle${cls}"${style} onclick="cycleFilter('${p}')" title="Filter ${p}">${label}</button>`;
+    return `<button class="header-toggle" style="${style}" onclick="cycleFilter('${p}')" title="Filter ${p}">${label}</button>`;
   }).join('');
   const headerBtns = filterBtns + simpleBtn + eaBtn;
   activeEl.innerHTML = filteredActive.length
