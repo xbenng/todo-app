@@ -468,6 +468,84 @@ def drop_todo():
     return jsonify({"ok": True})
 
 
+@app.route("/api/sections/rename", methods=["POST"])
+def rename_section():
+    """Rename a section header across all todos."""
+    data = request.json
+    old_name = (data.get("old_name") or "").strip()
+    new_name = (data.get("new_name") or "").strip()
+    if not old_name or not new_name:
+        return jsonify({"error": "old_name and new_name required"}), 400
+    if old_name == new_name:
+        return jsonify({"ok": True})
+
+    active = _parse_todo_file(TODO_FILE)
+    completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+    todos = active + completed
+    changed = False
+    for t in todos:
+        if t.get("section", "") == old_name:
+            t["section"] = new_name
+            changed = True
+    if not changed:
+        return jsonify({"error": "Section not found"}), 404
+    _write_todo_file(TODO_FILE, todos)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/sections/reorder", methods=["POST"])
+def reorder_section():
+    """Move a section (and all its todos) before another section."""
+    data = request.json
+    section = (data.get("section") or "").strip()
+    before_section = data.get("before_section")  # None = move to end
+
+    if not section:
+        return jsonify({"error": "section required"}), 400
+
+    active = _parse_todo_file(TODO_FILE)
+    completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+
+    # Build current section order
+    sections_order = []
+    seen = set()
+    for t in active:
+        s = t.get("section", "")
+        if s not in seen:
+            sections_order.append(s)
+            seen.add(s)
+
+    if section not in sections_order:
+        return jsonify({"error": "Section not found"}), 404
+
+    # Remove the section from its current position
+    sections_order.remove(section)
+
+    # Insert before the target section, or at the end
+    if before_section is not None:
+        before_section = before_section.strip()
+        if before_section in sections_order:
+            idx = sections_order.index(before_section)
+            sections_order.insert(idx, section)
+        else:
+            sections_order.append(section)
+    else:
+        sections_order.append(section)
+
+    # Rebuild the active list in the new section order
+    section_groups = {}
+    for t in active:
+        s = t.get("section", "")
+        section_groups.setdefault(s, []).append(t)
+
+    rebuilt = []
+    for s in sections_order:
+        rebuilt.extend(section_groups.get(s, []))
+
+    _write_todo_file(TODO_FILE, rebuilt + completed)
+    return jsonify({"ok": True})
+
+
 @app.route("/api/todos/mtime", methods=["GET"])
 def get_mtime():
     """Return the max modification time across both files for change detection."""
@@ -514,7 +592,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   h1 { display: none; }
   h2 {
-    font-size: 0.7rem; color: var(--subtle); margin: 28px 0 12px;
+    font-size: 0.8rem; color: var(--subtle); margin: 28px 0 12px;
     text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600;
   }
 
@@ -538,7 +616,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .add-toggle .btn { font-size: 0.85rem; padding: 9px 22px; box-shadow: var(--shadow-lg); }
   .add-form input, .add-form textarea, .add-form select {
     width: 100%; padding: 10px 14px; border: 1px solid var(--border); border-radius: 8px;
-    font-size: 0.9rem; font-family: inherit; margin-bottom: 10px;
+    font-size: 1rem; font-family: inherit; margin-bottom: 10px;
     background: var(--bg); transition: border-color 0.15s, box-shadow 0.15s; color: var(--text);
   }
   .add-form input:focus, .add-form textarea:focus, .add-form select:focus {
@@ -548,7 +626,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .add-form .row { display: flex; gap: 8px; align-items: center; }
   .add-form .row select { width: auto; margin-bottom: 0; }
   .btn {
-    padding: 9px 18px; border: none; border-radius: 8px; font-size: 0.85rem;
+    padding: 9px 18px; border: none; border-radius: 8px; font-size: 0.9rem;
     font-weight: 600; cursor: pointer; transition: all 0.15s; letter-spacing: -0.01em;
   }
   .btn-primary { background: var(--accent); color: #fff; }
@@ -576,6 +654,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .todo-item.drag-over-top { box-shadow: inset 0 3px 0 var(--accent); }
   .todo-item.drag-over-bottom { box-shadow: inset 0 -3px 0 var(--accent); }
   .section-header-row.drag-over-section { background: var(--accent-light); }
+  .section-header-row.section-dragging { opacity: 0.35; }
+  .section-header-row.section-drag-over-top { box-shadow: inset 0 3px 0 var(--accent); }
+  .section-header-row.section-drag-over-bottom { box-shadow: inset 0 -3px 0 var(--accent); }
+  .section-header-row[draggable="true"] { cursor: grab; }
+  .section-header-row[draggable="true"]:active { cursor: grabbing; }
 
   .todo-checkbox {
     margin-top: 2px; width: 18px; height: 18px; cursor: pointer;
@@ -583,8 +666,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     border-radius: 4px;
   }
   .todo-body { flex: 1; min-width: 0; }
-  .todo-title { font-weight: 600; font-size: 0.92rem; word-break: break-word; letter-spacing: -0.01em; }
-  .todo-desc { color: var(--muted); font-size: 0.82rem; margin-top: 4px; word-break: break-word; line-height: 1.5; }
+  .todo-title { font-weight: 600; font-size: 1.02rem; word-break: break-word; letter-spacing: -0.01em; }
+  .todo-desc { color: var(--muted); font-size: 0.9rem; margin-top: 4px; word-break: break-word; line-height: 1.5; }
   .todo-desc p { margin: 0 0 0.4em; }
   .todo-desc p:last-child { margin-bottom: 0; }
   .todo-desc ul, .todo-desc ol { margin: 0.2em 0 0.4em 1.2em; padding: 0; }
@@ -598,7 +681,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .todo-desc blockquote { border-left: 3px solid var(--border); margin: 0.3em 0; padding-left: 10px; color: var(--muted); }
   .todo-meta { display: flex; align-items: center; gap: 8px; margin-top: 6px; flex-wrap: wrap; }
   .priority-badge {
-    font-size: 0.6rem; font-weight: 700; text-transform: uppercase; padding: 2px 7px;
+    font-size: 0.68rem; font-weight: 700; text-transform: uppercase; padding: 2px 7px;
     border-radius: 12px; letter-spacing: 0.04em; flex-shrink: 0; align-self: flex-start; margin-top: 3px;
   }
   .priority-high { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; }
@@ -612,11 +695,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
     position: sticky; top: 0; z-index: 100; background: var(--bg);
   }
   .section-header-row h3 {
-    font-size: 0.82rem; color: var(--text); font-weight: 700; margin: 0;
-    letter-spacing: -0.01em;
+    font-size: 0.92rem; color: var(--text); font-weight: 700; margin: 0;
+    letter-spacing: -0.01em; cursor: pointer;
+  }
+  .section-header-row h3:hover { color: var(--accent); }
+  .section-rename-input {
+    font-size: 0.92rem; font-weight: 700; border: 1px solid var(--accent);
+    border-radius: 6px; padding: 2px 8px; outline: none; font-family: inherit;
+    box-shadow: 0 0 0 3px var(--accent-light); background: var(--card);
   }
   .section-count {
-    font-size: 0.68rem; color: var(--subtle); font-weight: 500;
+    font-size: 0.75rem; color: var(--subtle); font-weight: 500;
     background: rgba(0,0,0,0.04); padding: 1px 8px; border-radius: 12px;
   }
   .collapse-btn {
@@ -645,13 +734,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   /* Edit mode */
   .edit-title {
-    font-size: 0.92rem; font-weight: 600; width: 100%; padding: 8px 12px;
+    font-size: 1.02rem; font-weight: 600; width: 100%; padding: 8px 12px;
     border: 1px solid var(--border); border-radius: 8px; margin-bottom: 6px;
     background: var(--bg); transition: border-color 0.15s, box-shadow 0.15s;
   }
   .edit-title:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-light); }
   .edit-desc {
-    font-size: 0.82rem; width: 100%; padding: 8px 12px;
+    font-size: 0.9rem; width: 100%; padding: 8px 12px;
     border: 1px solid var(--border); border-radius: 8px; resize: vertical;
     min-height: 44px; font-family: inherit;
     background: var(--bg); transition: border-color 0.15s, box-shadow 0.15s;
@@ -677,7 +766,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     display: none; position: fixed; z-index: 1000;
     background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
     box-shadow: var(--shadow-lg); min-width: 190px;
-    padding: 5px 0; font-size: 0.84rem;
+    padding: 5px 0; font-size: 0.9rem;
     backdrop-filter: blur(10px);
   }
   .ctx-menu.visible { display: block; }
@@ -701,6 +790,31 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .ctx-menu-item:hover > .ctx-submenu { display: block; }
   .ctx-submenu .ctx-menu-item { padding: 7px 14px; font-size: 0.82rem; }
   .ctx-submenu .ctx-menu-item.active-section { font-weight: 700; opacity: 0.5; pointer-events: none; }
+
+  /* Section picker dialog */
+  .section-picker {
+    display: none; position: fixed; z-index: 1100;
+    background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+    box-shadow: var(--shadow-lg); min-width: 200px; max-width: 280px;
+    padding: 6px 0; font-size: 0.9rem;
+    backdrop-filter: blur(10px);
+  }
+  .section-picker.visible { display: block; }
+  .section-picker-item {
+    padding: 7px 14px; cursor: pointer; color: var(--text);
+    border-radius: 6px; margin: 1px 4px; transition: background 0.1s;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .section-picker-item:hover { background: var(--accent-light); }
+  .section-picker-item.sp-selected { background: var(--accent); color: #fff; }
+  .section-picker-item.sp-current { opacity: 0.45; pointer-events: none; }
+  .section-picker-input {
+    width: calc(100% - 12px); margin: 4px 6px 4px; padding: 6px 10px;
+    font-size: 0.88rem; font-family: inherit; border: 1px solid var(--border);
+    border-radius: 6px; outline: none; background: var(--bg); color: var(--text);
+    transition: border-color 0.15s, box-shadow 0.15s;
+  }
+  .section-picker-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-light); }
 
   /* Kbd styling */
   kbd {
@@ -749,6 +863,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
 <!-- Context menu -->
 <div class="ctx-menu" id="ctx-menu"></div>
+<!-- Section picker -->
+<div class="section-picker" id="section-picker"></div>
 
 <script>
 const API = '/api/todos';
@@ -841,9 +957,9 @@ function render() {
     const isCollapsed = collapsedSections.has(section);
     const escSection = esc(section).replace(/'/g, "\\'");
     if (section) {
-      activeHtml += `<div class="section-header-row">`
+      activeHtml += `<div class="section-header-row" data-section="${esc(section)}" draggable="true">`
         + `<button class="collapse-btn${isCollapsed ? ' collapsed' : ''}" onclick="toggleSectionCollapse('${escSection}')" title="${isCollapsed ? 'Expand' : 'Collapse'}">&#9660;</button>`
-        + `<h3>${esc(section)}</h3>`
+        + `<h3 ondblclick="startSectionRename('${escSection}')">${esc(section)}</h3>`
         + `<span class="section-count">${items.length}</span>`
         + `<button class="sort-priority-btn" onclick="sortByPriority('${escSection}')" title="Sort by priority (high first)">&#9650; Priority</button>`
         + `</div>`;
@@ -1054,6 +1170,7 @@ function ctxDelete() {
 
 async function ctxMoveSection(section) {
   const id = ctxTargetId;
+  const prevIdx = selectedIdx;
   hideCtxMenu();
   if (!id) return;
   await fetch(API + '/' + id, {
@@ -1061,7 +1178,10 @@ async function ctxMoveSection(section) {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({section})
   });
-  loadTodos();
+  await loadTodos();
+  selectedIdx = Math.min(prevIdx, visibleIds.length);
+  if (selectedIdx < 1 && visibleIds.length > 0) selectedIdx = 1;
+  applySelection();
 }
 
 function ctxMoveSectionNew() {
@@ -1094,7 +1214,7 @@ async function sortByPriority(section) {
 }
 
 // Close context menu on click outside or Escape
-document.addEventListener('click', () => hideCtxMenu());
+document.addEventListener('click', () => { hideCtxMenu(); if (sectionPickerOpen) hideSectionPicker(); });
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && document.getElementById('ctx-menu').classList.contains('visible')) {
     hideCtxMenu();
@@ -1279,10 +1399,11 @@ async function moveToAdjacentSection(direction) {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({section: newSection})
   });
-  const rememberedId = id;
+  const prevIdx = selectedIdx;
   await loadTodos();
-  const ni = visibleIds.indexOf(rememberedId);
-  if (ni >= 0) selectedIdx = ni + 1;
+  // Stay at the original position (select the next item that took its place)
+  selectedIdx = Math.min(prevIdx, visibleIds.length);
+  if (selectedIdx < 1 && visibleIds.length > 0) selectedIdx = 1;
   applySelection();
 }
 
@@ -1436,11 +1557,33 @@ function hideAddForm() {
 // Drag and drop
 // ---------------------------------------------------------------------------
 let dragId = null;
+let dragSectionName = null; // non-null when dragging a section header
+
+function clearAllDragIndicators() {
+  document.querySelectorAll('.drag-over-top,.drag-over-bottom').forEach(el => {
+    el.classList.remove('drag-over-top', 'drag-over-bottom');
+  });
+  document.querySelectorAll('.drag-over-section,.section-drag-over-top,.section-drag-over-bottom').forEach(el => {
+    el.classList.remove('drag-over-section', 'section-drag-over-top', 'section-drag-over-bottom');
+  });
+}
 
 document.addEventListener('dragstart', e => {
+  // Section header drag
+  const sectionRow = e.target.closest('.section-header-row[draggable]');
+  if (sectionRow && !e.target.closest('.todo-item')) {
+    dragSectionName = sectionRow.dataset.section;
+    dragId = null;
+    sectionRow.classList.add('section-dragging');
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', 'section:' + dragSectionName);
+    return;
+  }
+  // Todo item drag
   const item = e.target.closest('.todo-item[draggable]');
   if (!item) return;
   dragId = item.dataset.todoId;
+  dragSectionName = null;
   item.classList.add('dragging');
   e.dataTransfer.effectAllowed = 'move';
   e.dataTransfer.setData('text/plain', dragId);
@@ -1448,14 +1591,32 @@ document.addEventListener('dragstart', e => {
 
 document.addEventListener('dragend', e => {
   dragId = null;
+  dragSectionName = null;
   document.querySelectorAll('.dragging').forEach(el => el.classList.remove('dragging'));
-  document.querySelectorAll('.drag-over-top,.drag-over-bottom').forEach(el => {
-    el.classList.remove('drag-over-top', 'drag-over-bottom');
-  });
-  document.querySelectorAll('.drag-over-section').forEach(el => el.classList.remove('drag-over-section'));
+  document.querySelectorAll('.section-dragging').forEach(el => el.classList.remove('section-dragging'));
+  clearAllDragIndicators();
 });
 
 document.addEventListener('dragover', e => {
+  // --- Section header being dragged ---
+  if (dragSectionName !== null) {
+    const targetHeader = e.target.closest('.section-header-row[data-section]');
+    if (targetHeader && targetHeader.dataset.section !== dragSectionName) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      clearAllDragIndicators();
+      const rect = targetHeader.getBoundingClientRect();
+      const midY = rect.top + rect.height / 2;
+      if (e.clientY < midY) {
+        targetHeader.classList.add('section-drag-over-top');
+      } else {
+        targetHeader.classList.add('section-drag-over-bottom');
+      }
+    }
+    return;
+  }
+
+  // --- Todo item being dragged ---
   if (!dragId) return;
   const item = e.target.closest('.todo-item[data-todo-id]');
   const sectionHeader = e.target.closest('.section-header-row');
@@ -1463,30 +1624,18 @@ document.addEventListener('dragover', e => {
   if (item && item.dataset.todoId !== dragId) {
     e.preventDefault();
     e.dataTransfer.dropEffect = 'move';
-    // Clear other indicators
-    document.querySelectorAll('.drag-over-top,.drag-over-bottom').forEach(el => {
-      if (el !== item) el.classList.remove('drag-over-top', 'drag-over-bottom');
-    });
-    document.querySelectorAll('.drag-over-section').forEach(el => el.classList.remove('drag-over-section'));
-    // Determine top/bottom half
+    clearAllDragIndicators();
     const rect = item.getBoundingClientRect();
     const midY = rect.top + rect.height / 2;
     if (e.clientY < midY) {
       item.classList.add('drag-over-top');
-      item.classList.remove('drag-over-bottom');
     } else {
       item.classList.add('drag-over-bottom');
-      item.classList.remove('drag-over-top');
     }
   } else if (sectionHeader) {
     e.preventDefault();
     e.dataTransfer.dropEffect = 'move';
-    document.querySelectorAll('.drag-over-top,.drag-over-bottom').forEach(el => {
-      el.classList.remove('drag-over-top', 'drag-over-bottom');
-    });
-    document.querySelectorAll('.drag-over-section').forEach(el => {
-      if (el !== sectionHeader) el.classList.remove('drag-over-section');
-    });
+    clearAllDragIndicators();
     sectionHeader.classList.add('drag-over-section');
   }
 });
@@ -1495,10 +1644,54 @@ document.addEventListener('dragleave', e => {
   const item = e.target.closest('.todo-item');
   if (item) item.classList.remove('drag-over-top', 'drag-over-bottom');
   const sectionHeader = e.target.closest('.section-header-row');
-  if (sectionHeader) sectionHeader.classList.remove('drag-over-section');
+  if (sectionHeader) sectionHeader.classList.remove('drag-over-section', 'section-drag-over-top', 'section-drag-over-bottom');
 });
 
 document.addEventListener('drop', async e => {
+  // --- Section header drop ---
+  if (dragSectionName !== null) {
+    e.preventDefault();
+    clearAllDragIndicators();
+    const targetHeader = e.target.closest('.section-header-row[data-section]');
+    if (!targetHeader || targetHeader.dataset.section === dragSectionName) {
+      dragSectionName = null;
+      return;
+    }
+    const targetSection = targetHeader.dataset.section;
+    const rect = targetHeader.getBoundingClientRect();
+    const midY = rect.top + rect.height / 2;
+
+    // Determine where to place the dragged section
+    let beforeSection;
+    if (e.clientY < midY) {
+      // Drop above target
+      beforeSection = targetSection;
+    } else {
+      // Drop below target — find the section after targetSection
+      const targetIdx = sectionsOrder.indexOf(targetSection);
+      beforeSection = (targetIdx + 1 < sectionsOrder.length) ? sectionsOrder[targetIdx + 1] : null;
+    }
+    // Don't move if it would end up in the same spot
+    const curIdx = sectionsOrder.indexOf(dragSectionName);
+    const beforeIdx = beforeSection !== null ? sectionsOrder.indexOf(beforeSection) : sectionsOrder.length;
+    if (curIdx === beforeIdx || curIdx + 1 === beforeIdx) {
+      dragSectionName = null;
+      return;
+    }
+
+    const payload = {section: dragSectionName};
+    if (beforeSection !== null) payload.before_section = beforeSection;
+    await fetch('/api/sections/reorder', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    dragSectionName = null;
+    await loadTodos();
+    return;
+  }
+
+  // --- Todo item drop ---
   if (!dragId) return;
   e.preventDefault();
   const item = e.target.closest('.todo-item[data-todo-id]');
@@ -1511,33 +1704,25 @@ document.addEventListener('drop', async e => {
     const rect = item.getBoundingClientRect();
     const midY = rect.top + rect.height / 2;
     if (e.clientY < midY) {
-      // Drop above: insert before target
       payload.before_id = targetId;
     } else {
-      // Drop below: find the next sibling todo and insert before it
       const nextItem = item.nextElementSibling?.closest?.('.todo-item[data-todo-id]')
         || item.nextElementSibling;
       if (nextItem && nextItem.classList.contains('todo-item') && nextItem.dataset.todoId) {
         payload.before_id = nextItem.dataset.todoId;
       } else {
-        // End of section — figure out which section the target belongs to
         const targetTodo = allTodos.find(t => t.id === targetId);
         payload.section = targetTodo ? (targetTodo.section || '') : '';
       }
     }
   } else if (sectionHeader) {
-    // Dropped on a section header — move to end of that section
     const h3 = sectionHeader.querySelector('h3');
     payload.section = h3 ? h3.textContent : '';
   } else {
     return;
   }
 
-  // Clean up visual state
-  document.querySelectorAll('.drag-over-top,.drag-over-bottom').forEach(el => {
-    el.classList.remove('drag-over-top', 'drag-over-bottom');
-  });
-  document.querySelectorAll('.drag-over-section').forEach(el => el.classList.remove('drag-over-section'));
+  clearAllDragIndicators();
 
   await fetch(API + '/drop', {
     method: 'POST',
@@ -1545,7 +1730,6 @@ document.addEventListener('drop', async e => {
     body: JSON.stringify(payload)
   });
   await loadTodos();
-  // Select the dropped item
   const ni = visibleIds.indexOf(dragId);
   if (ni >= 0) selectedIdx = ni + 1;
   applySelection();
@@ -1620,6 +1804,9 @@ function applySelection() {
 }
 
 document.addEventListener('keydown', e => {
+  // Section picker is fully handled by its own input's keydown — skip main handler
+  if (sectionPickerOpen) return;
+
   const tag = (e.target.tagName || '').toLowerCase();
 
   // When inside the add-form inputs, handle Escape to close form, Cmd+Enter to add
@@ -1651,6 +1838,9 @@ document.addEventListener('keydown', e => {
   } else if ((e.key === 'ArrowUp' || e.key === 'k' || e.key === 'K') && e.shiftKey && !e.altKey && !e.metaKey) {
     e.preventDefault();
     moveToAdjacentSection('up');
+  } else if (e.key === 'ArrowRight' && e.altKey && !e.metaKey && !e.shiftKey) {
+    e.preventDefault();
+    showSectionPicker();
   } else if ((e.key === 'ArrowDown' || e.key === 'j') && e.altKey) {
     e.preventDefault();
     moveSelected('down');
@@ -1730,6 +1920,269 @@ document.addEventListener('keydown', e => {
   }
 });
 
+// --- Section picker (Opt+Right) ---
+let sectionPickerOpen = false;
+let sectionPickerIdx = 0;
+let spAllItems = [];      // full unfiltered list [{name, label, isCurrent}]
+let spFilteredItems = [];  // after fuzzy filter
+let sectionPickerTodoId = null;
+
+function spFuzzyMatch(query, text) {
+  // Simple fuzzy: every char of query appears in order in text (case-insensitive)
+  const q = query.toLowerCase();
+  const t = text.toLowerCase();
+  let qi = 0;
+  for (let ti = 0; ti < t.length && qi < q.length; ti++) {
+    if (t[ti] === q[qi]) qi++;
+  }
+  return qi === q.length;
+}
+
+function spFuzzyScore(query, text) {
+  // Lower = better. Prioritize: exact prefix > substring > fuzzy
+  const q = query.toLowerCase();
+  const t = text.toLowerCase();
+  if (t.startsWith(q)) return 0;
+  if (t.includes(q)) return 1;
+  return 2;
+}
+
+function showSectionPicker() {
+  if (selectedIdx < 1 || selectedIdx > visibleIds.length) return;
+  const id = visibleIds[selectedIdx - 1];
+  const todo = allTodos.find(t => t.id === id);
+  if (!todo || todo.status === 'completed') return;
+  const curSection = todo.section || '';
+
+  const allSections = [];
+  const seen = new Set();
+  allTodos.forEach(t => {
+    const s = t.section || '';
+    if (s && !seen.has(s)) { allSections.push(s); seen.add(s); }
+  });
+  spAllItems = [{name: '', label: '(No section)', isCurrent: curSection === ''}];
+  allSections.forEach(s => {
+    spAllItems.push({name: s, label: s, isCurrent: s === curSection});
+  });
+
+  sectionPickerTodoId = id;
+  sectionPickerOpen = true;
+  spFilteredItems = spAllItems.filter(x => !x.isCurrent);
+  sectionPickerIdx = 0;
+
+  renderSectionPicker();
+
+  // Position near the selected todo item
+  const el = document.querySelector(`.todo-item[data-todo-id="${id}"]`);
+  const picker = document.getElementById('section-picker');
+  if (el) {
+    const rect = el.getBoundingClientRect();
+    let x = rect.right - 240;
+    let y = rect.top + rect.height + 4;
+    if (x < 8) x = 8;
+    if (y + 220 > window.innerHeight) y = rect.top - picker.offsetHeight - 4;
+    picker.style.left = x + 'px';
+    picker.style.top = y + 'px';
+  }
+
+  // Focus input after render
+  setTimeout(() => {
+    const inp = document.getElementById('sp-input');
+    if (inp) inp.focus();
+  }, 0);
+}
+
+function renderSectionPicker() {
+  const picker = document.getElementById('section-picker');
+  const inputVal = document.getElementById('sp-input')?.value || '';
+
+  let itemsHtml = '';
+  if (spFilteredItems.length === 0 && inputVal.trim()) {
+    itemsHtml = `<div class="section-picker-item sp-selected" onmousedown="spCommitNew()">Create &ldquo;${esc(inputVal.trim())}&rdquo;</div>`;
+  } else {
+    itemsHtml = spFilteredItems.map((item, i) => {
+      const cls = ['section-picker-item'];
+      if (i === sectionPickerIdx) cls.push('sp-selected');
+      return `<div class="${cls.join(' ')}" data-sp-idx="${i}" onmousedown="spCommitIdx(${i})">${esc(item.label)}</div>`;
+    }).join('');
+  }
+
+  picker.innerHTML =
+    `<input type="text" class="section-picker-input" id="sp-input" placeholder="Search or create section..." autocomplete="off" value="${esc(inputVal)}">`
+    + itemsHtml;
+  picker.classList.add('visible');
+
+  // Restore cursor position and set up events
+  const input = document.getElementById('sp-input');
+  input.setSelectionRange(inputVal.length, inputVal.length);
+  input.addEventListener('input', spOnInput);
+  input.addEventListener('keydown', spOnKeydown);
+}
+
+function spOnInput(e) {
+  const query = e.target.value.trim();
+  if (!query) {
+    spFilteredItems = spAllItems.filter(x => !x.isCurrent);
+  } else {
+    spFilteredItems = spAllItems
+      .filter(x => !x.isCurrent && spFuzzyMatch(query, x.label))
+      .sort((a, b) => spFuzzyScore(query, a.label) - spFuzzyScore(query, b.label));
+  }
+  sectionPickerIdx = 0;
+  spUpdateItems();
+}
+
+function spUpdateItems() {
+  // Re-render just the items, not the input (preserves focus/cursor)
+  const picker = document.getElementById('section-picker');
+  const input = document.getElementById('sp-input');
+  const inputVal = input?.value || '';
+
+  // Remove old items (everything after the input)
+  while (picker.lastChild && picker.lastChild !== input) {
+    picker.removeChild(picker.lastChild);
+  }
+
+  if (spFilteredItems.length === 0 && inputVal.trim()) {
+    const div = document.createElement('div');
+    div.className = 'section-picker-item sp-selected';
+    div.innerHTML = `Create &ldquo;${esc(inputVal.trim())}&rdquo;`;
+    div.onmousedown = () => spCommitNew();
+    picker.appendChild(div);
+  } else {
+    spFilteredItems.forEach((item, i) => {
+      const div = document.createElement('div');
+      div.className = 'section-picker-item' + (i === sectionPickerIdx ? ' sp-selected' : '');
+      div.textContent = item.label;
+      div.onmousedown = () => spCommitIdx(i);
+      picker.appendChild(div);
+    });
+  }
+}
+
+function spOnKeydown(e) {
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    if (spFilteredItems.length > 0) {
+      sectionPickerIdx = Math.min(sectionPickerIdx + 1, spFilteredItems.length - 1);
+      spUpdateItems();
+    }
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    if (spFilteredItems.length > 0) {
+      sectionPickerIdx = Math.max(sectionPickerIdx - 1, 0);
+      spUpdateItems();
+    }
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    const inputVal = e.target.value.trim();
+    if (spFilteredItems.length > 0) {
+      spCommitIdx(sectionPickerIdx);
+    } else if (inputVal) {
+      spCommitNew();
+    } else {
+      hideSectionPicker();
+    }
+  } else if (e.key === 'Escape') {
+    e.preventDefault();
+    hideSectionPicker();
+  }
+  e.stopPropagation();
+}
+
+function hideSectionPicker() {
+  sectionPickerOpen = false;
+  sectionPickerTodoId = null;
+  document.getElementById('section-picker').classList.remove('visible');
+}
+
+async function spMoveTo(sectionName) {
+  const id = sectionPickerTodoId;
+  const prevIdx = selectedIdx;
+  hideSectionPicker();
+  if (!id) return;
+
+  await fetch(API + '/drop', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({id, section: sectionName})
+  });
+  await fetch(API + '/move-to-top', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({id})
+  });
+
+  await loadTodos();
+  selectedIdx = Math.min(prevIdx, visibleIds.length);
+  if (selectedIdx < 1 && visibleIds.length > 0) selectedIdx = 1;
+  applySelection();
+}
+
+function spCommitIdx(idx) {
+  const item = spFilteredItems[idx];
+  if (!item) { hideSectionPicker(); return; }
+  spMoveTo(item.name);
+}
+
+function spCommitNew() {
+  const input = document.getElementById('sp-input');
+  const name = input?.value.trim();
+  if (name) spMoveTo(name);
+  else hideSectionPicker();
+}
+
+// --- Section rename ---
+let renamingSection = null;
+
+function startSectionRename(sectionName) {
+  renamingSection = sectionName;
+  const row = document.querySelector(`.section-header-row[data-section="${CSS.escape(sectionName)}"]`);
+  if (!row) return;
+  const h3 = row.querySelector('h3');
+  if (!h3) return;
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'section-rename-input';
+  input.value = sectionName;
+  h3.replaceWith(input);
+  input.focus();
+  input.select();
+
+  function commit() {
+    const newName = input.value.trim();
+    if (newName && newName !== sectionName) {
+      saveSectionRename(sectionName, newName);
+    } else {
+      renamingSection = null;
+      render();
+    }
+  }
+
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); commit(); }
+    if (e.key === 'Escape') { e.preventDefault(); renamingSection = null; render(); }
+  });
+  input.addEventListener('blur', () => {
+    setTimeout(() => { if (renamingSection === sectionName) commit(); }, 100);
+  });
+}
+
+async function saveSectionRename(oldName, newName) {
+  renamingSection = null;
+  await fetch('/api/sections/rename', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({old_name: oldName, new_name: newName})
+  });
+  // Update collapsed sections set if the renamed section was collapsed
+  if (collapsedSections.has(oldName)) {
+    collapsedSections.delete(oldName);
+    collapsedSections.add(newName);
+  }
+  loadTodos();
+}
+
 loadTodos();
 startPolling();
 </script>
@@ -1747,7 +2200,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Simple Todo App")
     parser.add_argument("todo_file", nargs="?", default="todos.md", help="Path to the todo markdown file")
-    parser.add_argument("--host", default="127.0.0.1", help="Host to bind to (use 0.0.0.0 for network access)")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
     parser.add_argument("--port", type=int, default=5111, help="Port to listen on")
     args = parser.parse_args()
 
@@ -1760,4 +2213,4 @@ if __name__ == "__main__":
 
     print(f"Serving todo UI for: {os.path.abspath(TODO_FILE)}")
     print(f"Open http://{args.host}:{args.port} in your browser")
-    app.run(host=args.host, port=args.port, debug=True)
+    app.run(host=args.host, port=args.port, debug=False, use_reloader=True)
