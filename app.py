@@ -804,6 +804,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .header-toggle:hover { border-color: var(--accent); color: var(--accent); }
   .header-toggle.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .header-toggle.partial { background: var(--accent-light); color: var(--accent); border-color: var(--accent); }
   .fab-new {
     position: fixed; bottom: 24px; left: 24px; z-index: 900;
   }
@@ -1329,7 +1330,8 @@ function render() {
   visibleIds = [...visibleActive, ...filteredCompleted].map(t => t.id);
 
   const eaBtn = '<button class="btn btn-sm ea-update-btn" onclick="eaUpdate()" title="Run /ea update in tmux">Update</button>';
-  const simpleBtn = `<button class="header-toggle${simpleMode ? ' active' : ''}" onclick="toggleSimpleMode()" title="Toggle simple mode (a)">Simple</button>`;
+  const simpleCls = simpleMode ? (expandedItems.size > 0 ? ' partial' : ' active') : '';
+  const simpleBtn = `<button class="header-toggle simple-toggle-btn${simpleCls}" onclick="toggleSimpleMode()" title="Toggle simple mode (a)">Simple</button>`;
   const pColors = {high:'#b91c1c',medium:'#a16207',low:'#15803d',none:'#9ca3af'};
   const pBg = {high:'#fef2f2',medium:'#fffbeb',low:'#f0fdf4',none:'#f3f4f6'};
   const pBorder = {high:'#fecaca',medium:'#fde68a',low:'#bbf7d0',none:'#e5e7eb'};
@@ -1609,10 +1611,19 @@ document.addEventListener('keydown', e => {
   }
 });
 
+function updateSimpleBtn() {
+  const btn = document.querySelector('.simple-toggle-btn');
+  if (!btn) return;
+  const hasExpanded = simpleMode && expandedItems.size > 0;
+  btn.classList.toggle('active', simpleMode && !hasExpanded);
+  btn.classList.toggle('partial', hasExpanded);
+}
+
 function toggleSimpleMode() {
   simpleMode = !simpleMode;
   expandedItems.clear();
   document.body.classList.toggle('simple-mode', simpleMode);
+  updateSimpleBtn();
 }
 
 function cycleFilter(p) {
@@ -1638,6 +1649,7 @@ function toggleItemDesc(id) {
     expandedItems.add(id);
     el.classList.add('item-expanded');
   }
+  updateSimpleBtn();
 }
 
 function toggleSectionCollapse(section) {
