@@ -797,6 +797,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .active-header { display: flex; align-items: center; gap: 10px; }
   .active-header h2 { margin: 0; }
   .ea-update-btn { margin-left: auto; border: 1px solid var(--border); font-size: 0.75rem; padding: 5px 10px; }
+  .header-toggle {
+    font-size: 0.7rem; padding: 3px 8px; border-radius: 12px;
+    border: 1px solid var(--border); background: var(--card); color: var(--subtle);
+    cursor: pointer; white-space: nowrap; transition: all 0.15s; font-weight: 500;
+  }
+  .header-toggle:hover { border-color: var(--accent); color: var(--accent); }
+  .header-toggle.active { background: var(--accent); color: #fff; border-color: var(--accent); }
   .fab-new {
     position: fixed; bottom: 24px; left: 24px; z-index: 900;
   }
@@ -1115,7 +1122,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <body>
 
 <div class="fab-new">
-  <button class="btn btn-primary" id="add-toggle-btn" onclick="showAddForm()">+ New Todo <span style="opacity:0.6;font-weight:400;font-size:0.8em">(n)</span></button>
+  <button class="btn btn-primary" id="add-toggle-btn" onclick="showAddForm()">+ New <span style="opacity:0.6;font-weight:400;font-size:0.8em">(n)</span></button>
 </div>
 <div class="fab-help">
   <button class="btn btn-sm" onclick="showShortcuts()" style="border:1px solid var(--border);font-size:0.75rem;padding:5px 10px" title="Keyboard shortcuts (?)">?</button>
@@ -1350,9 +1357,19 @@ function render() {
   visibleIds = [...visibleActive, ...filteredCompleted].map(t => t.id);
 
   const eaBtn = '<button class="btn btn-sm ea-update-btn" onclick="eaUpdate()" title="Run /ea update in tmux">Update</button>';
+  const simpleBtn = `<button class="header-toggle${simpleMode ? ' active' : ''}" onclick="toggleSimpleMode()" title="Toggle simple mode (a)">Simple</button>`;
+  const filterBtns = ['high','medium','low','none'].map(p => {
+    const isShow = showPriorities.has(p);
+    const isHide = hidePriorities.has(p);
+    const cls = isShow ? ' active' : (isHide ? ' active' : '');
+    const style = isHide ? ' style="background:var(--border);color:var(--subtle);border-color:var(--border);text-decoration:line-through"' : '';
+    const label = {high:'H',medium:'M',low:'L',none:'0'}[p];
+    return `<button class="header-toggle${cls}"${style} onclick="cycleFilter('${p}')" title="Filter ${p}">${label}</button>`;
+  }).join('');
+  const headerBtns = filterBtns + simpleBtn + eaBtn;
   activeEl.innerHTML = filteredActive.length
-    ? '<div class="active-header"><h2>Active (' + filteredActive.length + ')</h2>' + eaBtn + '</div>' + activeHtml
-    : '<div class="active-header"><h2>Active</h2>' + eaBtn + '</div><div class="empty-state">All done! &#127881;</div>';
+    ? '<div class="active-header"><h2>Active (' + filteredActive.length + ')</h2>' + headerBtns + '</div>' + activeHtml
+    : '<div class="active-header"><h2>Active</h2>' + headerBtns + '</div><div class="empty-state">All done! &#127881;</div>';
 
   const isCompletedCollapsed = !searching && collapsedSections.has('__completed__');
   if (filteredCompleted.length) {
@@ -1619,6 +1636,19 @@ function toggleSimpleMode() {
   simpleMode = !simpleMode;
   expandedItems.clear();
   document.body.classList.toggle('simple-mode', simpleMode);
+}
+
+function cycleFilter(p) {
+  if (showPriorities.has(p)) {
+    showPriorities.delete(p);
+    hidePriorities.add(p);
+  } else if (hidePriorities.has(p)) {
+    hidePriorities.delete(p);
+  } else {
+    showPriorities.add(p);
+  }
+  selectedIdx = -1;
+  render();
 }
 
 function toggleItemDesc(id) {
