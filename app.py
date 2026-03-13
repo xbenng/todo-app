@@ -910,6 +910,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .todo-body { flex: 1; min-width: 0; }
   .todo-title { font-weight: 600; font-size: 1.02rem; word-break: break-word; letter-spacing: -0.01em; }
   .todo-desc { color: var(--muted); font-size: 0.9rem; margin-top: 6px; word-break: break-word; line-height: 1.5; }
+  body.simple-mode .todo-desc { display: none; }
+  body.simple-mode .todo-item.item-expanded .todo-desc { display: block; }
+  body.simple-mode .todo-meta { display: none; }
+  body.simple-mode .todo-item.item-expanded .todo-meta { display: flex; }
   .todo-desc p { margin: 0 0 0.4em; }
   .todo-desc p:last-child { margin-bottom: 0; }
   .todo-desc ul, .todo-desc ol { margin: 0.2em 0 0.4em 1.2em; padding: 0; }
@@ -1172,6 +1176,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <tr><td><kbd>t</kbd></td><td>Bring to top</td></tr>
       <tr><td><kbd>&#8984;&#9003;</kbd></td><td>Delete</td></tr>
       <tr><td><kbd>&#8984;Z</kbd></td><td>Undo</td></tr>
+      <tr><td><kbd>a</kbd></td><td>Toggle simple mode (hide descriptions)</td></tr>
       <tr><td colspan="2" class="shortcut-section">Priority</td></tr>
       <tr><td><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> <kbd>0</kbd></td><td>Set high / medium / low / none</td></tr>
       <tr><td><kbd>p</kbd></td><td>Sort section by priority</td></tr>
@@ -1205,6 +1210,8 @@ let ctxTargetId = null; // id of todo targeted by context menu
 let visibleIds = []; // ordered list of todo ids as rendered
 let sectionsOrder = []; // ordered list of section names as rendered
 let addFormVisible = false;
+let simpleMode = false; // hide all descriptions
+const expandedItems = new Set(); // per-item overrides when in simple mode
 const collapsedSections = new Set(['__completed__']); // collapsed section names
 const SEL_ADD = 0; // index for the add-form position
 
@@ -1446,9 +1453,10 @@ function renderTodo(t) {
   const priorityBadge = `<span class="priority-badge priority-${t.priority || 'medium'}">${t.priority || 'medium'}</span>`;
 
   const draggable = t.status !== 'completed' ? 'draggable="true"' : '';
-  return `<div class="todo-item ${statusClass}" data-todo-id="${t.id}" ${draggable} onclick="selectTodo('${t.id}')" ondblclick="startEdit('${t.id}')" oncontextmenu="showCtxMenu(event,'${t.id}')" style="cursor:pointer;">
+  const itemExpanded = expandedItems.has(t.id) ? ' item-expanded' : '';
+  return `<div class="todo-item ${statusClass}${itemExpanded}" data-todo-id="${t.id}" ${draggable} onclick="selectTodo('${t.id}')" ondblclick="startEdit('${t.id}')" oncontextmenu="showCtxMenu(event,'${t.id}')" style="cursor:pointer;">
     <div class="todo-header">
-      <div class="todo-title" style="flex:1;min-width:0">${esc(t.title)}</div>
+      <div class="todo-title" style="flex:1;min-width:0" onclick="event.stopPropagation();toggleItemDesc('${t.id}')">${esc(t.title)}</div>
       ${priorityBadge}
       <div class="todo-actions">
         ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();startInTmux('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Start in tmux (s)" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#9654;</button>` : ''}
@@ -1606,6 +1614,24 @@ document.addEventListener('keydown', e => {
     hideCtxMenu();
   }
 });
+
+function toggleSimpleMode() {
+  simpleMode = !simpleMode;
+  expandedItems.clear();
+  document.body.classList.toggle('simple-mode', simpleMode);
+}
+
+function toggleItemDesc(id) {
+  const el = document.querySelector(`.todo-item[data-todo-id="${id}"]`);
+  if (!el) return;
+  if (expandedItems.has(id)) {
+    expandedItems.delete(id);
+    el.classList.remove('item-expanded');
+  } else {
+    expandedItems.add(id);
+    el.classList.add('item-expanded');
+  }
+}
 
 function toggleSectionCollapse(section) {
   if (collapsedSections.has(section)) collapsedSections.delete(section);
@@ -2551,6 +2577,9 @@ document.addEventListener('keydown', e => {
         render();
       }
     }
+  } else if (e.key === 'a') {
+    e.preventDefault();
+    toggleSimpleMode();
   } else if (e.key === '?') {
     e.preventDefault();
     showShortcuts();
