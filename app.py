@@ -14,11 +14,16 @@ import os
 import re
 import json
 import uuid
+import copy
+from collections import deque
 from datetime import datetime
 from flask import Flask, request, jsonify, Response
 
 app = Flask(__name__)
 TODO_FILE = "todos.md"
+
+# Undo stack: each entry is (active_todos_list, completed_todos_list)
+_undo_stack: deque[tuple[list[dict], list[dict]]] = deque(maxlen=30)
 
 
 def _completed_file_path(path: str) -> str:
@@ -191,6 +196,14 @@ def _format_todo(t: dict, checked: bool) -> list[str]:
     return result
 
 
+def _snapshot_and_write(path: str, todos: list[dict]) -> None:
+    """Snapshot current state for undo, then write new state."""
+    old_active = _parse_todo_file(path)
+    old_completed = _parse_todo_file(_completed_file_path(path))
+    _undo_stack.append((copy.deepcopy(old_active), copy.deepcopy(old_completed)))
+    _write_todo_file(path, todos)
+
+
 # ---------------------------------------------------------------------------
 # API routes
 # ---------------------------------------------------------------------------
@@ -235,7 +248,7 @@ def add_todo():
         todos = active + completed
     else:
         todos.append(new_todo)
-    _write_todo_file(TODO_FILE, todos)
+    _snapshot_and_write(TODO_FILE, todos)
     return jsonify(new_todo), 201
 
 
@@ -257,7 +270,7 @@ def update_todo(todo_id):
                 t["priority"] = data["priority"]
             if "section" in data:
                 t["section"] = data["section"].strip()
-            _write_todo_file(TODO_FILE, todos)
+            _snapshot_and_write(TODO_FILE, todos)
             return jsonify(t)
     return jsonify({"error": "Not found"}), 404
 
@@ -270,7 +283,7 @@ def delete_todo(todo_id):
     new_todos = [t for t in todos if t["id"] != todo_id]
     if len(new_todos) == len(todos):
         return jsonify({"error": "Not found"}), 404
-    _write_todo_file(TODO_FILE, new_todos)
+    _snapshot_and_write(TODO_FILE, new_todos)
     return jsonify({"ok": True})
 
 
@@ -355,7 +368,7 @@ def reorder_todo():
                     last_in_new = i
             active.insert(last_in_new + 1, item)
 
-    _write_todo_file(TODO_FILE, active + completed)
+    _snapshot_and_write(TODO_FILE, active + completed)
     return jsonify({"ok": True, "moved": True})
 
 
@@ -386,7 +399,7 @@ def move_to_top():
     active.pop(idx)
     active.insert(first_idx, item)
 
-    _write_todo_file(TODO_FILE, active + completed)
+    _snapshot_and_write(TODO_FILE, active + completed)
     return jsonify({"ok": True, "moved": True})
 
 
@@ -424,7 +437,7 @@ def sort_by_priority():
     if not inserted:
         rebuilt.extend(section_items)
 
-    _write_todo_file(TODO_FILE, rebuilt + completed)
+    _snapshot_and_write(TODO_FILE, rebuilt + completed)
     return jsonify({"ok": True})
 
 
@@ -464,7 +477,7 @@ def drop_todo():
     else:
         active.append(item)
 
-    _write_todo_file(TODO_FILE, active + completed)
+    _snapshot_and_write(TODO_FILE, active + completed)
     return jsonify({"ok": True})
 
 
@@ -489,7 +502,7 @@ def rename_section():
             changed = True
     if not changed:
         return jsonify({"error": "Section not found"}), 404
-    _write_todo_file(TODO_FILE, todos)
+    _snapshot_and_write(TODO_FILE, todos)
     return jsonify({"ok": True})
 
 
@@ -542,7 +555,7 @@ def reorder_section():
     for s in sections_order:
         rebuilt.extend(section_groups.get(s, []))
 
-    _write_todo_file(TODO_FILE, rebuilt + completed)
+    _snapshot_and_write(TODO_FILE, rebuilt + completed)
     return jsonify({"ok": True})
 
 
@@ -556,6 +569,16 @@ def get_mtime():
         except OSError:
             pass
     return jsonify({"mtime": mtime})
+
+
+@app.route("/api/undo", methods=["POST"])
+def undo():
+    """Restore the previous file state from the undo stack."""
+    if not _undo_stack:
+        return jsonify({"error": "Nothing to undo"}), 400
+    old_active, old_completed = _undo_stack.pop()
+    _write_todo_file(TODO_FILE, old_active + old_completed)
+    return jsonify({"ok": True})
 
 
 # ---------------------------------------------------------------------------
@@ -1408,6 +1431,19 @@ async function moveToAdjacentSection(direction) {
   applySelection();
 }
 
+async function performUndo() {
+  const res = await fetch('/api/undo', { method: 'POST' });
+  if (res.ok) {
+    await loadTodos();
+    const toast = document.createElement('div');
+    toast.innerHTML = 'Undone <span style="margin-left:8px;opacity:0.5;font-size:0.75rem">\u2318Z</span>';
+    toast.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--text);color:var(--card);padding:8px 16px;border-radius:8px;font-size:0.85rem;z-index:2000;box-shadow:var(--shadow-lg);opacity:0;transition:opacity .15s';
+    document.body.appendChild(toast);
+    requestAnimationFrame(() => { toast.style.opacity = '1'; });
+    setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 150); }, 1200);
+  }
+}
+
 function copyWorkon(id) {
   const text = '/ea workon ' + id;
   function showToast() {
@@ -1853,6 +1889,13 @@ document.addEventListener('keydown', e => {
   // Ignore when typing in other inputs or editing
   if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
   if (editingId) return;
+
+  // Undo: Cmd+Z / Ctrl+Z
+  if ((e.metaKey || e.ctrlKey) && e.key === 'z' && !e.shiftKey) {
+    e.preventDefault();
+    performUndo();
+    return;
+  }
 
   const maxIdx = visibleIds.length; // 0=add-form, 1..N=todos
   const minIdx = addFormVisible ? SEL_ADD : 1;
