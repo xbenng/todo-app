@@ -842,6 +842,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .filter-badge.filter-hide {
     background: var(--border); color: var(--subtle); text-decoration: line-through;
   }
+  .sticky-header {
+    position: sticky; top: 0; z-index: 102;
+    background: var(--bg); padding-top: 10px;
+  }
+  body.sticky-filter .active-header {
+    position: sticky; top: var(--sticky-offset, 0px); z-index: 101;
+    background: var(--bg); padding: 4px 0;
+  }
+  body.sticky-filter .section-header-row {
+    top: var(--sticky-offset, 0px);
+  }
   .add-form input, .add-form textarea, .add-form select {
     width: 100%; padding: 10px 14px; border: 1px solid var(--border); border-radius: 8px;
     font-size: 1rem; font-family: inherit; margin-bottom: 10px;
@@ -1106,11 +1117,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <button class="btn btn-sm" onclick="showShortcuts()" style="border:1px solid var(--border);font-size:0.75rem;padding:5px 10px" title="Keyboard shortcuts (?)">?</button>
 </div>
 
-<div class="search-bar">
-  <input type="text" id="search-input" placeholder="Search todos... (/)">
-  <kbd class="search-clear-hint" id="search-clear-hint">Esc to clear</kbd>
+<div class="sticky-header">
+  <div class="search-bar">
+    <input type="text" id="search-input" placeholder="Search todos... (/)">
+    <kbd class="search-clear-hint" id="search-clear-hint">Esc to clear</kbd>
+  </div>
+  <div class="filter-badges" id="filter-badges"></div>
 </div>
-<div class="filter-badges" id="filter-badges"></div>
 
 <div class="add-form" id="add-form">
   <input type="text" id="new-title" placeholder="What needs to be done?">
@@ -1249,6 +1262,7 @@ function render() {
 
   // Apply search and priority filters
   const searching = searchQuery.trim().length > 0 || showPriorities.size > 0 || hidePriorities.size > 0;
+  document.body.classList.toggle('sticky-filter', searching);
   const searchTokens = searching ? searchQuery.toLowerCase().trim().split(/\s+/) : [];
   const matchesSearch = t => {
     const text = ((t.title || '') + ' ' + (t.description || '') + ' ' + (t.section || '')).toLowerCase();
@@ -1328,7 +1342,7 @@ function render() {
   // visibleIds only includes non-collapsed active items + completed
   visibleIds = [...visibleActive, ...filteredCompleted].map(t => t.id);
 
-  const eaBtn = '<button class="btn btn-sm ea-update-btn" onclick="eaUpdate()" title="Run /ea update in tmux">&#129302; Update</button>';
+  const eaBtn = '<button class="btn btn-sm ea-update-btn" onclick="eaUpdate()" title="Run /ea update in tmux">Update</button>';
   activeEl.innerHTML = filteredActive.length
     ? '<div class="active-header"><h2>Active (' + filteredActive.length + ')</h2>' + eaBtn + '</div>' + activeHtml
     : '<div class="active-header"><h2>Active</h2>' + eaBtn + '</div><div class="empty-state">All done! &#127881;</div>';
@@ -1364,6 +1378,15 @@ function render() {
 
   // Clamp selectedIdx if items disappeared (e.g. section collapsed)
   if (selectedIdx > visibleIds.length) selectedIdx = visibleIds.length > 0 ? visibleIds.length : -1;
+
+  // Set sticky offset for headers below the sticky search/filter bar
+  const stickyEl = document.querySelector('.sticky-header');
+  if (stickyEl && searching) {
+    const h = stickyEl.offsetHeight;
+    document.documentElement.style.setProperty('--sticky-offset', h + 'px');
+  } else {
+    document.documentElement.style.setProperty('--sticky-offset', '0px');
+  }
 
   applySelection();
 }
