@@ -1802,13 +1802,14 @@ async function moveSelected(direction) {
 function startEdit(id) {
   editingId = id;
   render();
-  document.getElementById('edit-title-' + id)?.focus();
-  // Auto-size description textarea to fit content
+  // Auto-size description textarea to fit content and place cursor at end
   const descEl = document.getElementById('edit-desc-' + id);
   if (descEl) {
     function autoResize() { descEl.style.height = 'auto'; descEl.style.height = descEl.scrollHeight + 'px'; }
     autoResize();
     descEl.addEventListener('input', autoResize);
+    descEl.focus();
+    descEl.setSelectionRange(descEl.value.length, descEl.value.length);
   }
   setTimeout(() => {
     const editEls = document.querySelectorAll(`#edit-title-${id}, #edit-desc-${id}, #edit-priority-${id}, #edit-section-${id}, #edit-section-custom-${id}`);
