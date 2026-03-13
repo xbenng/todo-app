@@ -1112,7 +1112,12 @@ function esc(s) {
 function renderMd(s) {
   if (!s) return '';
   try {
-    return marked.parse(s, {breaks: true});
+    const renderer = new marked.Renderer();
+    renderer.link = function(token) {
+      const t = token.title ? ` title="${token.title}"` : '';
+      return `<a href="${token.href}"${t} target="_blank" rel="noopener noreferrer">${token.text}</a>`;
+    };
+    return marked.parse(s, {breaks: true, renderer});
   } catch(e) {
     return esc(s);
   }
