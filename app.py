@@ -843,11 +843,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     position: sticky; top: 0; z-index: 102;
     background: var(--bg); padding-top: 10px;
   }
-  body.sticky-filter .active-header {
+  .active-header {
     top: var(--sticky-offset, 0px);
   }
-  body.sticky-filter .section-header-row {
-    top: var(--sticky-offset, 0px);
+  .section-header-row {
+    top: var(--section-offset, 0px);
   }
   .add-form input, .add-form textarea, .add-form select {
     width: 100%; padding: 10px 14px; border: 1px solid var(--border); border-radius: 8px;
@@ -941,7 +941,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     display: flex; align-items: center; gap: 8px;
     margin: 22px 0 10px; padding: 8px 0 6px;
     border-bottom: 2px solid var(--border);
-    position: sticky; top: 0; z-index: 100; background: var(--bg);
+    position: sticky; z-index: 100; background: var(--bg);
   }
   .section-header-row h3 {
     font-size: 0.92rem; color: var(--text); font-weight: 700; margin: 0;
@@ -1267,7 +1267,7 @@ function render() {
 
   // Apply search and priority filters
   const searching = searchQuery.trim().length > 0 || showPriorities.size > 0 || hidePriorities.size > 0;
-  document.body.classList.toggle('sticky-filter', searching);
+
   const searchTokens = searching ? searchQuery.toLowerCase().trim().split(/\s+/) : [];
   const matchesSearch = t => {
     const text = ((t.title || '') + ' ' + (t.description || '') + ' ' + (t.section || '')).toLowerCase();
@@ -1384,14 +1384,13 @@ function render() {
   // Clamp selectedIdx if items disappeared (e.g. section collapsed)
   if (selectedIdx > visibleIds.length) selectedIdx = visibleIds.length > 0 ? visibleIds.length : -1;
 
-  // Set sticky offset for headers below the sticky search/filter bar
+  // Set sticky offsets for stacking: search bar → active header → section headers
   const stickyEl = document.querySelector('.sticky-header');
-  if (stickyEl && searching) {
-    const h = stickyEl.offsetHeight;
-    document.documentElement.style.setProperty('--sticky-offset', h + 'px');
-  } else {
-    document.documentElement.style.setProperty('--sticky-offset', '0px');
-  }
+  const activeHeaderEl = document.querySelector('.active-header');
+  const searchH = stickyEl ? stickyEl.offsetHeight : 0;
+  document.documentElement.style.setProperty('--sticky-offset', searchH + 'px');
+  const activeH = activeHeaderEl ? activeHeaderEl.offsetHeight : 0;
+  document.documentElement.style.setProperty('--section-offset', (searchH + activeH) + 'px');
 
   applySelection();
 }
