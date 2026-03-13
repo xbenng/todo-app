@@ -648,6 +648,48 @@ def start_in_tmux(todo_id):
         return jsonify({"error": f"tmux error: {exc.stderr.decode().strip()}"}), 500
 
 
+@app.route("/api/ea-update", methods=["POST"])
+def ea_update():
+    """Run /ea update in a tmux window."""
+    tmux_bin = shutil.which("tmux") or "/opt/homebrew/bin/tmux"
+    tmux_session = "0"
+    window_name = "ea-update"
+    try:
+        result = subprocess.run(
+            [tmux_bin, "has-session", "-t", tmux_session],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            subprocess.run(
+                [tmux_bin, "new-session", "-d", "-s", tmux_session],
+                check=True,
+                capture_output=True,
+            )
+
+        subprocess.run(
+            [tmux_bin, "new-window", "-t", f"{tmux_session}:", "-n", window_name],
+            check=True,
+            capture_output=True,
+        )
+        todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
+        subprocess.run(
+            [
+                tmux_bin, "send-keys",
+                "-t", f"{tmux_session}:{window_name}",
+                f"cd {todo_dir} && claude --dangerously-skip-permissions '/ea update'",
+                "Enter",
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+        return jsonify({"status": "started", "window": window_name})
+    except FileNotFoundError:
+        return jsonify({"error": "tmux is not installed"}), 500
+    except subprocess.CalledProcessError as exc:
+        return jsonify({"error": f"tmux error: {exc.stderr.decode().strip()}"}), 500
+
+
 @app.route("/api/resume-conv", methods=["POST"])
 def resume_conv():
     """Resume a Claude conversation in tmux."""
@@ -735,7 +777,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   body {
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     background: var(--bg); color: var(--text); line-height: 1.6;
-    max-width: 720px; margin: 0 auto; padding: 24px 20px;
+    max-width: 828px; margin: 0 auto; padding: 24px 20px;
     -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
   }
   h1 { display: none; }
@@ -752,16 +794,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .add-form.visible { display: block; }
   .add-form.kb-selected { box-shadow: 0 0 0 2px var(--accent), var(--shadow-md); }
-  .add-toggle {
-    position: fixed; top: 20px; left: 20px; z-index: 900;
-    display: flex; flex-direction: column; align-items: flex-start; gap: 8px;
+  .active-header { display: flex; align-items: center; gap: 10px; }
+  .active-header h2 { margin: 0; }
+  .ea-update-btn { margin-left: auto; border: 1px solid var(--border); font-size: 0.75rem; padding: 5px 10px; }
+  .fab-new {
+    position: fixed; bottom: 24px; left: 24px; z-index: 900;
   }
-  .add-toggle h1 {
-    display: block; font-size: 1.6rem; margin: 0; font-weight: 700;
-    letter-spacing: -0.02em; color: var(--text);
+  .fab-new .btn { font-size: 0.85rem; padding: 9px 22px; box-shadow: var(--shadow-lg); }
+  .fab-help {
+    position: fixed; bottom: 24px; right: 24px; z-index: 900;
   }
-  .add-toggle .btn-row { display: flex; align-items: center; gap: 10px; }
-  .add-toggle .btn { font-size: 0.85rem; padding: 9px 22px; box-shadow: var(--shadow-lg); }
+  .fab-help .btn { box-shadow: var(--shadow-lg); }
   .search-bar {
     margin-bottom: 10px;
     position: relative;
@@ -1045,13 +1088,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </head>
 <body>
 
-<div class="add-toggle">
-  <h1>&#9744; To Do List</h1>
-  <div class="btn-row">
-    <button class="btn btn-primary" id="add-toggle-btn" onclick="showAddForm()">+ New Todo</button>
-    <span style="color:var(--subtle);font-size:0.78rem">or press <kbd>n</kbd></span>
-    <button class="btn btn-sm" onclick="showShortcuts()" style="margin-left:auto;border:1px solid var(--border);font-size:0.75rem;padding:5px 10px" title="Keyboard shortcuts (?)">?</button>
-  </div>
+<div class="fab-new">
+  <button class="btn btn-primary" id="add-toggle-btn" onclick="showAddForm()">+ New Todo <span style="opacity:0.6;font-weight:400;font-size:0.8em">(n)</span></button>
+</div>
+<div class="fab-help">
+  <button class="btn btn-sm" onclick="showShortcuts()" style="border:1px solid var(--border);font-size:0.75rem;padding:5px 10px" title="Keyboard shortcuts (?)">?</button>
 </div>
 
 <div class="search-bar">
@@ -1250,9 +1291,10 @@ function render() {
   // visibleIds only includes non-collapsed active items + completed
   visibleIds = [...visibleActive, ...filteredCompleted].map(t => t.id);
 
+  const eaBtn = '<button class="btn btn-sm ea-update-btn" onclick="eaUpdate()" title="Run /ea update in tmux">&#129302; Update</button>';
   activeEl.innerHTML = filteredActive.length
-    ? '<h2>Active (' + filteredActive.length + ')</h2>' + activeHtml
-    : '<h2>Active</h2><div class="empty-state">All done! &#127881;</div>';
+    ? '<div class="active-header"><h2>Active (' + filteredActive.length + ')</h2>' + eaBtn + '</div>' + activeHtml
+    : '<div class="active-header"><h2>Active</h2>' + eaBtn + '</div><div class="empty-state">All done! &#127881;</div>';
 
   const isCompletedCollapsed = !searching && collapsedSections.has('__completed__');
   if (filteredCompleted.length) {
@@ -1781,6 +1823,28 @@ async function resumeConv(convId) {
   }
 }
 
+async function eaUpdate() {
+  function showToast(msg, isError) {
+    const toast = document.createElement('div');
+    toast.textContent = msg;
+    toast.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:' + (isError ? 'var(--danger)' : 'var(--text)') + ';color:var(--card);padding:8px 16px;border-radius:8px;font-size:0.85rem;z-index:2000;box-shadow:var(--shadow-lg);opacity:0;transition:opacity .15s';
+    document.body.appendChild(toast);
+    requestAnimationFrame(() => { toast.style.opacity = '1'; });
+    setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 150); }, 2000);
+  }
+  try {
+    const res = await fetch('/api/ea-update', { method: 'POST' });
+    const data = await res.json();
+    if (res.ok) {
+      showToast('EA update started in tmux', false);
+    } else {
+      showToast(data.error || 'Failed to start EA update', true);
+    }
+  } catch (e) {
+    showToast('Failed to start EA update', true);
+  }
+}
+
 function fallbackCopy(text) {
   const ta = document.createElement('textarea');
   ta.value = text;
@@ -1853,6 +1917,15 @@ async function startEdit(id) {
       { key: 'Escape', run: () => { cancelEdit(); return true; } },
       { key: 'Alt-ArrowUp', run: moveLineUp },
       { key: 'Alt-ArrowDown', run: moveLineDown },
+      { key: 'Mod-x', run: (view) => {
+        const sel = view.state.selection.main;
+        if (!sel.empty) return false; // default cut if text selected
+        const line = view.state.doc.lineAt(sel.head);
+        const text = view.state.sliceDoc(line.from, Math.min(line.to + 1, view.state.doc.length));
+        navigator.clipboard.writeText(text);
+        view.dispatch({ changes: { from: line.from, to: Math.min(line.to + 1, view.state.doc.length) } });
+        return true;
+      }},
     ]);
     cmEditor = new EditorView({
       doc: t ? t.description : '',
