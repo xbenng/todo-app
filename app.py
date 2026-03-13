@@ -637,6 +637,32 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .add-toggle .btn-row { display: flex; align-items: center; gap: 10px; }
   .add-toggle .btn { font-size: 0.85rem; padding: 9px 22px; box-shadow: var(--shadow-lg); }
+  .search-bar {
+    margin-bottom: 10px;
+    position: relative;
+  }
+  .search-clear-hint {
+    display: none; position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
+    font-size: 0.7rem; color: var(--subtle); background: var(--bg); padding: 2px 6px;
+    border-radius: 4px; border: 1px solid var(--border); pointer-events: none;
+  }
+  .search-bar input.has-query ~ .search-clear-hint { display: block; }
+  .search-bar input {
+    width: 100%; padding: 9px 14px; border: 1px solid var(--border); border-radius: 8px;
+    font-size: 0.9rem; font-family: inherit; background: var(--card); color: var(--text);
+    transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
+  }
+  .search-bar input:focus {
+    outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-light);
+  }
+  .search-bar input.has-query {
+    border-color: var(--accent); background: var(--accent-light);
+    box-shadow: 0 0 0 2px var(--accent-light);
+  }
+  .search-bar input.has-query:focus {
+    box-shadow: 0 0 0 3px var(--accent-light);
+  }
+  .search-bar input::placeholder { color: var(--subtle); }
   .add-form input, .add-form textarea, .add-form select {
     width: 100%; padding: 10px 14px; border: 1px solid var(--border); border-radius: 8px;
     font-size: 1rem; font-family: inherit; margin-bottom: 10px;
@@ -863,6 +889,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<div class="search-bar">
+  <input type="text" id="search-input" placeholder="Search todos... (/)">
+  <kbd class="search-clear-hint" id="search-clear-hint">Esc to clear</kbd>
+</div>
+
 <div class="add-form" id="add-form">
   <input type="text" id="new-title" placeholder="What needs to be done?">
   <textarea id="new-desc" placeholder="Description (optional)"></textarea>
@@ -897,6 +928,7 @@ let lastMtime = 0;
 let pollTimer = null;
 let selectedIdx = -1; // -1 = nothing, 0 = add-form, 1+ = todo items
 let insertBeforeId = null; // when adding, insert before this todo id
+let searchQuery = ''; // fuzzy search filter
 let ctxTargetId = null; // id of todo targeted by context menu
 let visibleIds = []; // ordered list of todo ids as rendered
 let sectionsOrder = []; // ordered list of section names as rendered
@@ -953,12 +985,27 @@ function render() {
   const formPriority = form.querySelector('#new-priority')?.value || 'medium';
   const formSection = form.querySelector('#new-section')?.value || '';
   const formSectionCustom = form.querySelector('#new-section-custom')?.value || '';
-  const defaultParent = document.querySelector('.add-toggle');
-  if (defaultParent) defaultParent.after(form);
+  const searchBar = document.querySelector('.search-bar');
+  if (searchBar) searchBar.after(form);
 
-  if (active.length === 0 && completed.length === 0) {
-    activeEl.innerHTML = '<div class="empty-state">No todos yet. Press <strong>n</strong> to add one!</div>';
+  // Apply search filter — each space-separated word must appear as a substring
+  const searching = searchQuery.trim().length > 0;
+  const searchTokens = searching ? searchQuery.toLowerCase().trim().split(/\s+/) : [];
+  const matchesSearch = t => {
+    const text = ((t.title || '') + ' ' + (t.description || '') + ' ' + (t.section || '')).toLowerCase();
+    return searchTokens.every(tok => text.includes(tok));
+  };
+  const filteredActive = searching ? active.filter(matchesSearch) : active;
+  const filteredCompleted = searching ? completed.filter(matchesSearch) : completed;
+
+  if (filteredActive.length === 0 && filteredCompleted.length === 0) {
+    if (searching) {
+      activeEl.innerHTML = '<div class="empty-state">No matching todos</div>';
+    } else {
+      activeEl.innerHTML = '<div class="empty-state">No todos yet. Press <strong>n</strong> to add one!</div>';
+    }
     completedEl.innerHTML = '';
+    visibleIds = [];
     // Restore form state if it was visible
     if (formWasVisible) _restoreInlineForm(form, formTitle, formDesc, formPriority, formSection, formSectionCustom);
     applySelection();
@@ -968,7 +1015,7 @@ function render() {
   // Group active by section preserving order of first appearance
   sectionsOrder = [];
   const seenSections = new Set();
-  active.forEach(t => {
+  filteredActive.forEach(t => {
     const s = t.section || '';
     if (!seenSections.has(s)) { sectionsOrder.push(s); seenSections.add(s); }
   });
@@ -976,8 +1023,8 @@ function render() {
   let activeHtml = '';
   const visibleActive = []; // track which active items are visible (not collapsed)
   sectionsOrder.forEach(section => {
-    const items = active.filter(t => (t.section || '') === section);
-    const isCollapsed = collapsedSections.has(section);
+    const items = filteredActive.filter(t => (t.section || '') === section);
+    const isCollapsed = !searching && collapsedSections.has(section);
     const escSection = esc(section).replace(/'/g, "\\'");
     if (section) {
       activeHtml += `<div class="section-header-row" data-section="${esc(section)}" draggable="true">`
@@ -994,19 +1041,19 @@ function render() {
   });
 
   // visibleIds only includes non-collapsed active items + completed
-  visibleIds = [...visibleActive, ...completed].map(t => t.id);
+  visibleIds = [...visibleActive, ...filteredCompleted].map(t => t.id);
 
-  activeEl.innerHTML = active.length
-    ? '<h2>Active (' + active.length + ')</h2>' + activeHtml
+  activeEl.innerHTML = filteredActive.length
+    ? '<h2>Active (' + filteredActive.length + ')</h2>' + activeHtml
     : '<h2>Active</h2><div class="empty-state">All done! &#127881;</div>';
 
-  const isCompletedCollapsed = collapsedSections.has('__completed__');
-  if (completed.length) {
+  const isCompletedCollapsed = !searching && collapsedSections.has('__completed__');
+  if (filteredCompleted.length) {
     completedEl.innerHTML = `<div class="section-header-row">`
       + `<button class="collapse-btn${isCompletedCollapsed ? ' collapsed' : ''}" onclick="toggleSectionCollapse('__completed__')" title="${isCompletedCollapsed ? 'Expand' : 'Collapse'}">&#9660;</button>`
-      + `<h2 style="margin:0;">Completed (${completed.length})</h2>`
+      + `<h2 style="margin:0;">Completed (${filteredCompleted.length})</h2>`
       + `</div>`
-      + (isCompletedCollapsed ? '' : completed.map(t => renderTodo(t)).join(''));
+      + (isCompletedCollapsed ? '' : filteredCompleted.map(t => renderTodo(t)).join(''));
     if (isCompletedCollapsed) {
       visibleIds = visibleActive.map(t => t.id);
     }
@@ -1338,6 +1385,10 @@ async function addTodo() {
   document.getElementById('new-section-custom').value = '';
   document.getElementById('new-section-custom').style.display = 'none';
   hideAddForm();
+  searchQuery = '';
+  const searchEl = document.getElementById('search-input');
+  searchEl.value = '';
+  searchEl.classList.remove('has-query');
   loadTodos();
 }
 
@@ -1610,9 +1661,9 @@ function hideAddForm() {
   insertBeforeId = null;
   const form = document.getElementById('add-form');
   form.classList.remove('visible');
-  // Move form back to its default position (after the add-toggle)
-  const defaultParent = document.querySelector('.add-toggle');
-  if (defaultParent) defaultParent.after(form);
+  // Move form back to its default position (after the search bar)
+  const searchBar = document.querySelector('.search-bar');
+  if (searchBar) searchBar.after(form);
   document.getElementById('new-title').value = '';
   document.getElementById('new-desc').value = '';
   document.getElementById('new-priority').value = 'medium';
@@ -1891,6 +1942,34 @@ document.addEventListener('keydown', e => {
     }
   }
 
+  // Search input: handle Escape, ArrowDown/j to navigate into results
+  const inSearchInput = e.target.id === 'search-input';
+  if (inSearchInput) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.target.value = '';
+      searchQuery = '';
+      e.target.classList.remove('has-query');
+      e.target.blur();
+      render();
+    } else if (e.key === 'ArrowDown' || (e.key === 'j' && e.ctrlKey)) {
+      e.preventDefault();
+      e.target.blur();
+      if (visibleIds.length > 0) {
+        selectedIdx = 1;
+        applySelection();
+      }
+    }
+    return; // Let normal typing work in search input
+  }
+
+  // `/` focuses the search input from anywhere (before the input guard)
+  if (e.key === '/' && tag !== 'input' && tag !== 'textarea' && tag !== 'select' && !editingId) {
+    e.preventDefault();
+    document.getElementById('search-input').focus();
+    return;
+  }
+
   // Ignore when typing in other inputs or editing
   if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
   if (editingId) return;
@@ -2000,8 +2079,23 @@ document.addEventListener('keydown', e => {
   } else if (e.key === 'Escape') {
     e.preventDefault();
     if (addFormVisible) { hideAddForm(); }
+    else if (searchQuery.trim().length > 0) {
+      searchQuery = '';
+      const searchEl = document.getElementById('search-input');
+      searchEl.value = '';
+      searchEl.classList.remove('has-query');
+      render();
+    }
     else { selectedIdx = -1; applySelection(); }
   }
+});
+
+// --- Search input ---
+document.getElementById('search-input').addEventListener('input', e => {
+  searchQuery = e.target.value;
+  e.target.classList.toggle('has-query', searchQuery.trim().length > 0);
+  selectedIdx = -1;
+  render();
 });
 
 // --- Section picker (Opt+Right) ---
