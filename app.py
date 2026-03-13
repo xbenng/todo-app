@@ -854,6 +854,26 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   .empty-state { text-align: center; color: var(--subtle); padding: 48px 0; font-size: 0.95rem; }
 
+  .shortcuts-overlay {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.4);
+    z-index: 3000; justify-content: center; align-items: center;
+  }
+  .shortcuts-overlay.visible { display: flex; }
+  .shortcuts-dialog {
+    background: var(--card); border-radius: var(--radius-lg); padding: 24px 28px;
+    box-shadow: var(--shadow-lg); max-width: 480px; width: 90%; max-height: 80vh;
+    overflow-y: auto;
+  }
+  .shortcuts-dialog h2 { margin: 0 0 16px; font-size: 1.1rem; }
+  .shortcuts-dialog table { width: 100%; border-collapse: collapse; }
+  .shortcuts-dialog td { padding: 4px 0; font-size: 0.85rem; }
+  .shortcuts-dialog td:first-child { font-weight: 600; white-space: nowrap; width: 120px; }
+  .shortcuts-dialog td kbd {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+    padding: 1px 6px; font-size: 0.78rem; font-family: inherit;
+  }
+  .shortcuts-dialog .shortcut-section { color: var(--accent); font-weight: 700; font-size: 0.8rem; padding: 10px 0 4px; text-transform: uppercase; letter-spacing: 0.04em; }
+
   /* Edit mode */
   .edit-title {
     font-size: 1.02rem; font-weight: 600; width: 100%; padding: 8px 12px;
@@ -959,6 +979,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <div class="btn-row">
     <button class="btn btn-primary" id="add-toggle-btn" onclick="showAddForm()">+ New Todo</button>
     <span style="color:var(--subtle);font-size:0.78rem">or press <kbd>n</kbd></span>
+    <button class="btn btn-sm" onclick="showShortcuts()" style="margin-left:auto;border:1px solid var(--border);font-size:0.75rem;padding:5px 10px" title="Keyboard shortcuts (?)">?</button>
   </div>
 </div>
 
@@ -993,6 +1014,42 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <div class="ctx-menu" id="ctx-menu"></div>
 <!-- Section picker -->
 <div class="section-picker" id="section-picker"></div>
+
+<div class="shortcuts-overlay" id="shortcuts-overlay" onclick="if(event.target===this)hideShortcuts()">
+  <div class="shortcuts-dialog">
+    <h2>Keyboard Shortcuts</h2>
+    <table>
+      <tr><td colspan="2" class="shortcut-section">Navigation</td></tr>
+      <tr><td><kbd>j</kbd> / <kbd>&#8595;</kbd></td><td>Move down</td></tr>
+      <tr><td><kbd>k</kbd> / <kbd>&#8593;</kbd></td><td>Move up</td></tr>
+      <tr><td><kbd>&#8984;&#8595;</kbd></td><td>Next section</td></tr>
+      <tr><td><kbd>&#8984;&#8593;</kbd></td><td>Previous section</td></tr>
+      <tr><td><kbd>&#8592;</kbd></td><td>Collapse section</td></tr>
+      <tr><td><kbd>&#8594;</kbd></td><td>Expand section</td></tr>
+      <tr><td colspan="2" class="shortcut-section">Actions</td></tr>
+      <tr><td><kbd>n</kbd></td><td>New todo</td></tr>
+      <tr><td><kbd>e</kbd></td><td>Edit selected</td></tr>
+      <tr><td><kbd>Space</kbd></td><td>Toggle complete</td></tr>
+      <tr><td><kbd>s</kbd></td><td>Start in tmux</td></tr>
+      <tr><td><kbd>c</kbd></td><td>Copy ID</td></tr>
+      <tr><td><kbd>t</kbd></td><td>Bring to top</td></tr>
+      <tr><td><kbd>&#8984;&#9003;</kbd></td><td>Delete</td></tr>
+      <tr><td><kbd>&#8984;Z</kbd></td><td>Undo</td></tr>
+      <tr><td colspan="2" class="shortcut-section">Priority</td></tr>
+      <tr><td><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> <kbd>0</kbd></td><td>Set high / medium / low / none</td></tr>
+      <tr><td><kbd>p</kbd></td><td>Sort section by priority</td></tr>
+      <tr><td><kbd>Ctrl+1</kbd>...<kbd>0</kbd></td><td>Filter by priority</td></tr>
+      <tr><td colspan="2" class="shortcut-section">Reorder</td></tr>
+      <tr><td><kbd>Alt+j</kbd> / <kbd>Alt+k</kbd></td><td>Move item up/down</td></tr>
+      <tr><td><kbd>Shift+J</kbd> / <kbd>K</kbd></td><td>Move to adjacent section</td></tr>
+      <tr><td><kbd>Alt+&#8594;</kbd></td><td>Move to section picker</td></tr>
+      <tr><td colspan="2" class="shortcut-section">Search</td></tr>
+      <tr><td><kbd>/</kbd></td><td>Focus search</td></tr>
+      <tr><td><kbd>Esc</kbd></td><td>Clear search / deselect</td></tr>
+      <tr><td><kbd>?</kbd></td><td>Show this dialog</td></tr>
+    </table>
+  </div>
+</div>
 
 <script>
 const API = '/api/todos';
@@ -1213,9 +1270,9 @@ function renderTodo(t) {
   const priorityBadge = `<span class="priority-badge priority-${t.priority || 'medium'}">${t.priority || 'medium'}</span>`;
 
   const draggable = t.status !== 'completed' ? 'draggable="true"' : '';
-  return `<div class="todo-item ${statusClass}" data-todo-id="${t.id}" ${draggable} onclick="selectTodo('${t.id}')" oncontextmenu="showCtxMenu(event,'${t.id}')" style="cursor:pointer;">
+  return `<div class="todo-item ${statusClass}" data-todo-id="${t.id}" ${draggable} onclick="selectTodo('${t.id}')" ondblclick="startEdit('${t.id}')" oncontextmenu="showCtxMenu(event,'${t.id}')" style="cursor:pointer;">
     <div class="todo-header">
-      <div class="todo-title" style="flex:1;min-width:0" ondblclick="startEdit('${t.id}')">${esc(t.title)}</div>
+      <div class="todo-title" style="flex:1;min-width:0">${esc(t.title)}</div>
       ${priorityBadge}
       <div class="todo-actions">
         ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();startInTmux('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Start in tmux (s)" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#9654;</button>` : ''}
@@ -1615,6 +1672,13 @@ async function startInTmux(id) {
   } catch (e) {
     showToast('Failed to start in tmux', true);
   }
+}
+
+function showShortcuts() {
+  document.getElementById('shortcuts-overlay').classList.add('visible');
+}
+function hideShortcuts() {
+  document.getElementById('shortcuts-overlay').classList.remove('visible');
 }
 
 function fallbackCopy(text) {
@@ -2032,6 +2096,13 @@ function applySelection() {
 }
 
 document.addEventListener('keydown', e => {
+  // Shortcuts dialog: Escape closes it, block all other keys while open
+  const shortcutsOpen = document.getElementById('shortcuts-overlay').classList.contains('visible');
+  if (shortcutsOpen) {
+    if (e.key === 'Escape') { e.preventDefault(); hideShortcuts(); }
+    return;
+  }
+
   // Section picker is fully handled by its own input's keydown — skip main handler
   if (sectionPickerOpen) return;
 
@@ -2200,6 +2271,9 @@ document.addEventListener('keydown', e => {
         render();
       }
     }
+  } else if (e.key === '?') {
+    e.preventDefault();
+    showShortcuts();
   } else if (e.key === 'n') {
     e.preventDefault();
     showAddForm();
