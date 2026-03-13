@@ -794,7 +794,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .add-form.visible { display: block; }
   .add-form.kb-selected { box-shadow: 0 0 0 2px var(--accent), var(--shadow-md); }
-  .active-header { display: flex; align-items: center; gap: 10px; }
+  .active-header { display: flex; align-items: center; gap: 10px; position: sticky; top: 0; z-index: 101; background: var(--bg); padding: 4px 0; }
   .active-header h2 { margin: 0; }
   .ea-update-btn { margin-left: auto; border: 1px solid var(--border); font-size: 0.75rem; padding: 5px 10px; }
   .header-toggle {
@@ -844,8 +844,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: var(--bg); padding-top: 10px;
   }
   body.sticky-filter .active-header {
-    position: sticky; top: var(--sticky-offset, 0px); z-index: 101;
-    background: var(--bg); padding: 4px 0;
+    top: var(--sticky-offset, 0px);
   }
   body.sticky-filter .section-header-row {
     top: var(--sticky-offset, 0px);
