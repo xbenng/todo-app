@@ -15,6 +15,8 @@ import re
 import json
 import uuid
 import copy
+import shutil
+import subprocess
 from collections import deque
 from datetime import datetime
 from flask import Flask, request, jsonify, Response
@@ -38,9 +40,9 @@ def _completed_file_path(path: str) -> str:
 # File format parser / writer
 # ---------------------------------------------------------------------------
 
-VALID_PRIORITIES = {"low", "medium", "high"}
+VALID_PRIORITIES = {"low", "medium", "high", "none"}
 DEFAULT_PRIORITY = "medium"
-PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
+PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2, "none": 3}
 
 
 def _parse_todo_file(path: str) -> list[dict]:
@@ -107,7 +109,7 @@ def _parse_todo_file(path: str) -> list[dict]:
 
             # Extract priority tag: {high}, {medium}, {low}
             priority = DEFAULT_PRIORITY
-            priority_match = re.search(r"\{(high|medium|low)\}", first_line, re.IGNORECASE)
+            priority_match = re.search(r"\{(high|medium|low|none)\}", first_line, re.IGNORECASE)
             if priority_match:
                 priority = priority_match.group(1).lower()
                 first_line = first_line.replace(priority_match.group(0), "").strip()
@@ -581,6 +583,70 @@ def undo():
     return jsonify({"ok": True})
 
 
+@app.route("/api/todos/<todo_id>/start", methods=["POST"])
+def start_in_tmux(todo_id):
+    """Launch a Claude Code session in tmux working on the given todo."""
+    todos = _parse_todo_file(TODO_FILE)
+    todo = next((t for t in todos if t["id"] == todo_id), None)
+    if not todo:
+        return jsonify({"error": "Todo not found"}), 404
+
+    # Sanitize title for tmux window name
+    raw_title = todo.get("title", todo_id)
+    window_name = re.sub(r"[^a-zA-Z0-9_-]", "-", raw_title)[:30].strip("-")
+    if not window_name:
+        window_name = "task"
+
+    tmux_bin = shutil.which("tmux") or "/opt/homebrew/bin/tmux"
+    tmux_session = "0"
+    try:
+        # Ensure session exists
+        result = subprocess.run(
+            [tmux_bin, "has-session", "-t", tmux_session],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            subprocess.run(
+                [tmux_bin, "new-session", "-d", "-s", tmux_session],
+                check=True,
+                capture_output=True,
+            )
+
+        # Create new window and launch claude
+        subprocess.run(
+            [tmux_bin, "new-window", "-t", f"{tmux_session}:", "-n", window_name],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                tmux_bin,
+                "send-keys",
+                "-t",
+                f"{tmux_session}:{window_name}",
+                "claude --dangerously-skip-permissions",
+                "Enter",
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+        # Send /ea workon after a delay (background so we don't block the response)
+        workon_cmd = f"/ea workon {todo_id}"
+        subprocess.Popen(
+            f'sleep 3 && {tmux_bin} send-keys -t "{tmux_session}:{window_name}" "{workon_cmd}" Enter',
+            shell=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        return jsonify({"status": "started", "window": window_name})
+    except FileNotFoundError:
+        return jsonify({"error": "tmux is not installed"}), 500
+    except subprocess.CalledProcessError as exc:
+        return jsonify({"error": f"tmux error: {exc.stderr.decode().strip()}"}), 500
+
+
 # ---------------------------------------------------------------------------
 # Embedded HTML UI
 # ---------------------------------------------------------------------------
@@ -689,9 +755,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .todo-item {
     background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
     padding: 14px 18px; margin-bottom: 6px; box-shadow: var(--shadow);
-    display: flex; align-items: flex-start; gap: 12px;
+    display: flex; flex-direction: column; gap: 0;
     transition: all 0.2s ease;
     border-left: 3px solid transparent;
+  }
+  .todo-header {
+    display: flex; align-items: flex-start; gap: 12px; width: 100%;
   }
   .todo-item:hover { box-shadow: var(--shadow-md); transform: translateY(-1px); }
   .todo-item.status-completed {
@@ -716,7 +785,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .todo-body { flex: 1; min-width: 0; }
   .todo-title { font-weight: 600; font-size: 1.02rem; word-break: break-word; letter-spacing: -0.01em; }
-  .todo-desc { color: var(--muted); font-size: 0.9rem; margin-top: 4px; word-break: break-word; line-height: 1.5; }
+  .todo-desc { color: var(--muted); font-size: 0.9rem; margin-top: 6px; padding-left: 30px; word-break: break-word; line-height: 1.5; }
   .todo-desc p { margin: 0 0 0.4em; }
   .todo-desc p:last-child { margin-bottom: 0; }
   .todo-desc ul, .todo-desc ol { margin: 0.2em 0 0.4em 1.2em; padding: 0; }
@@ -736,6 +805,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .priority-high { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; }
   .priority-medium { background: #fffbeb; color: #a16207; border: 1px solid #fde68a; }
   .priority-low { background: #f0fdf4; color: #15803d; border: 1px solid #bbf7d0; }
+  .priority-none { background: #f3f4f6; color: #9ca3af; border: 1px solid #e5e7eb; }
+  .todo-item.priority-high-item { background: #fef8f8; }
+  .todo-item.priority-none-item { background: #f3f4f6; opacity: 0.65; }
+  .todo-item.priority-none-item:hover { opacity: 0.8; }
 
   .section-header-row {
     display: flex; align-items: center; gap: 8px;
@@ -791,7 +864,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .edit-desc {
     font-size: 0.9rem; width: 100%; padding: 8px 12px;
     border: 1px solid var(--border); border-radius: 8px; resize: vertical;
-    min-height: 44px; font-family: inherit;
+    min-height: 44px; font-family: inherit; overflow: hidden;
     background: var(--bg); transition: border-color 0.15s, box-shadow 0.15s;
   }
   .edit-desc:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-light); }
@@ -906,6 +979,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <option value="high">High</option>
       <option value="medium" selected>Medium</option>
       <option value="low">Low</option>
+      <option value="none">None</option>
     </select>
     <button class="btn btn-primary" onclick="addTodo()">Add Todo</button>
     <button class="btn btn-sm" onclick="hideAddForm()" style="border:1px solid var(--border)">Cancel <span style="opacity:0.6;font-weight:400">Esc</span></button>
@@ -1105,7 +1179,8 @@ function _restoreInlineForm(form, title, desc, priority, section, sectionCustom)
 
 function renderTodo(t) {
   const checked = t.status === 'completed' ? 'checked' : '';
-  const statusClass = t.status === 'completed' ? 'status-completed' : '';
+  const priorityClass = t.priority === 'none' ? 'priority-none-item' : (t.priority === 'high' ? 'priority-high-item' : '');
+  const statusClass = t.status === 'completed' ? 'status-completed' : priorityClass;
 
   if (editingId === t.id) {
     return `<div class="todo-item ${statusClass}">
@@ -1120,7 +1195,7 @@ function renderTodo(t) {
         <input class="edit-title" id="edit-section-custom-${t.id}" placeholder="New section name" style="font-size:0.85rem; font-weight:400; margin-bottom:4px; display:none;">
         <div class="edit-actions">
           <select id="edit-priority-${t.id}">
-            ${['high','medium','low'].map(p =>
+            ${['high','medium','low','none'].map(p =>
               `<option value="${p}" ${p===t.priority?'selected':''}>${p}</option>`
             ).join('')}
           </select>
@@ -1136,17 +1211,17 @@ function renderTodo(t) {
 
   const draggable = t.status !== 'completed' ? 'draggable="true"' : '';
   return `<div class="todo-item ${statusClass}" data-todo-id="${t.id}" ${draggable} onclick="selectTodo('${t.id}')" oncontextmenu="showCtxMenu(event,'${t.id}')" style="cursor:pointer;">
-    <input type="checkbox" class="todo-checkbox" ${checked} onchange="toggleComplete('${t.id}', this.checked)" onclick="event.stopPropagation()">
-    <div class="todo-body" ondblclick="startEdit('${t.id}')">
-      <div class="todo-title">${esc(t.title)}</div>
-      ${desc}
+    <div class="todo-header">
+      <input type="checkbox" class="todo-checkbox" ${checked} onchange="toggleComplete('${t.id}', this.checked)" onclick="event.stopPropagation()">
+      <div class="todo-title" style="flex:1;min-width:0" ondblclick="startEdit('${t.id}')">${esc(t.title)}</div>
+      ${priorityBadge}
+      <div class="todo-actions">
+        ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();startInTmux('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Start in tmux (s)" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#9654;</button>` : ''}
+        ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();bringToTop('${t.id}')" style="border:none;background:transparent;font-size:1rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Bring to top" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#x2912;</button>` : ''}
+        <button onclick="event.stopPropagation();deleteTodo('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 6px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Delete" onmouseover="this.style.color='var(--danger)'" onmouseout="this.style.color='var(--subtle)'">&#10005;</button>
+      </div>
     </div>
-    ${priorityBadge}
-    <div class="todo-actions">
-      ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();copyWorkon('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Copy /ea workon command" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#9654;</button>` : ''}
-      ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();bringToTop('${t.id}')" style="border:none;background:transparent;font-size:1rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Bring to top" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#x2912;</button>` : ''}
-      <button onclick="event.stopPropagation();deleteTodo('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 6px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Delete" onmouseover="this.style.color='var(--danger)'" onmouseout="this.style.color='var(--subtle)'">&#10005;</button>
-    </div>
+    ${desc}
   </div>`;
 }
 
@@ -1205,7 +1280,7 @@ function showCtxMenu(e, id) {
   const menu = document.getElementById('ctx-menu');
 
   const curPriority = todo.priority || 'medium';
-  let priorityItems = ['high','medium','low'].map(p => {
+  let priorityItems = ['high','medium','low','none'].map(p => {
     const isCur = p === curPriority;
     return `<div class="ctx-menu-item${isCur ? ' active-section' : ''}" onclick="ctxSetPriority('${p}')">${p}${isCur ? ' &#10003;' : ''}</div>`;
   }).join('');
@@ -1500,22 +1575,43 @@ async function performUndo() {
   }
 }
 
-function copyWorkon(id) {
-  const text = '/ea workon ' + id;
+function copyTodoId(id) {
   function showToast() {
-    const el = document.querySelector(`.todo-item[data-todo-id="${id}"]`);
-    if (!el) return;
     const toast = document.createElement('div');
-    toast.textContent = 'Copied: ' + text;
+    toast.textContent = 'Copied ID: ' + id;
     toast.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--text);color:var(--card);padding:8px 16px;border-radius:8px;font-size:0.85rem;font-family:monospace;z-index:2000;box-shadow:var(--shadow-lg);opacity:0;transition:opacity .15s';
     document.body.appendChild(toast);
     requestAnimationFrame(() => { toast.style.opacity = '1'; });
     setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 150); }, 1500);
   }
   if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text).then(showToast).catch(() => { fallbackCopy(text); showToast(); });
+    navigator.clipboard.writeText(id).then(showToast).catch(() => { fallbackCopy(id); showToast(); });
   } else {
-    fallbackCopy(text); showToast();
+    fallbackCopy(id); showToast();
+  }
+}
+
+async function startInTmux(id) {
+  const todo = allTodos.find(t => t.id === id);
+  const title = todo ? todo.title : id;
+  function showToast(msg, isError) {
+    const toast = document.createElement('div');
+    toast.textContent = msg;
+    toast.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:' + (isError ? 'var(--danger)' : 'var(--text)') + ';color:var(--card);padding:8px 16px;border-radius:8px;font-size:0.85rem;z-index:2000;box-shadow:var(--shadow-lg);opacity:0;transition:opacity .15s';
+    document.body.appendChild(toast);
+    requestAnimationFrame(() => { toast.style.opacity = '1'; });
+    setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 150); }, 2000);
+  }
+  try {
+    const res = await fetch(API + '/' + id + '/start', { method: 'POST' });
+    const data = await res.json();
+    if (res.ok) {
+      showToast('Started in tmux: ' + title, false);
+    } else {
+      showToast(data.error || 'Failed to start', true);
+    }
+  } catch (e) {
+    showToast('Failed to start in tmux', true);
   }
 }
 
@@ -1565,6 +1661,13 @@ function startEdit(id) {
   editingId = id;
   render();
   document.getElementById('edit-title-' + id)?.focus();
+  // Auto-size description textarea to fit content
+  const descEl = document.getElementById('edit-desc-' + id);
+  if (descEl) {
+    function autoResize() { descEl.style.height = 'auto'; descEl.style.height = descEl.scrollHeight + 'px'; }
+    autoResize();
+    descEl.addEventListener('input', autoResize);
+  }
   setTimeout(() => {
     const editEls = document.querySelectorAll(`#edit-title-${id}, #edit-desc-${id}, #edit-priority-${id}, #edit-section-${id}, #edit-section-custom-${id}`);
     // Section dropdown: show/hide custom input
@@ -2036,13 +2139,24 @@ document.addEventListener('keydown', e => {
   } else if (e.key === 'c') {
     if (selectedIdx >= 1 && selectedIdx <= visibleIds.length) {
       e.preventDefault();
-      copyWorkon(visibleIds[selectedIdx - 1]);
+      copyTodoId(visibleIds[selectedIdx - 1]);
     }
-  } else if (e.key === '1' || e.key === '2' || e.key === '3') {
+  } else if (e.key === 's') {
     if (selectedIdx >= 1 && selectedIdx <= visibleIds.length) {
       e.preventDefault();
-      const pMap = {'1': 'high', '2': 'medium', '3': 'low'};
+      startInTmux(visibleIds[selectedIdx - 1]);
+    }
+  } else if (e.key === '0' || e.key === '1' || e.key === '2' || e.key === '3') {
+    if (selectedIdx >= 1 && selectedIdx <= visibleIds.length) {
+      e.preventDefault();
+      const pMap = {'1': 'high', '2': 'medium', '3': 'low', '0': 'none'};
       changePriority(visibleIds[selectedIdx - 1], pMap[e.key]);
+    }
+  } else if (e.key === 'p') {
+    const sec = getSectionOfSelected();
+    if (sec !== null && sec !== '__completed__') {
+      e.preventDefault();
+      sortByPriority(sec);
     }
   } else if (e.key === 't') {
     if (selectedIdx >= 1 && selectedIdx <= visibleIds.length) {
