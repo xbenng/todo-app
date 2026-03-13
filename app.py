@@ -1073,6 +1073,7 @@ function renderTodo(t) {
     </div>
     ${priorityBadge}
     <div class="todo-actions">
+      ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();copyWorkon('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Copy /ea workon command" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#9654;</button>` : ''}
       ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();bringToTop('${t.id}')" style="border:none;background:transparent;font-size:1rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Bring to top" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#x2912;</button>` : ''}
       <button onclick="event.stopPropagation();deleteTodo('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 6px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Delete" onmouseover="this.style.color='var(--danger)'" onmouseout="this.style.color='var(--subtle)'">&#10005;</button>
     </div>
@@ -1405,6 +1406,36 @@ async function moveToAdjacentSection(direction) {
   selectedIdx = Math.min(prevIdx, visibleIds.length);
   if (selectedIdx < 1 && visibleIds.length > 0) selectedIdx = 1;
   applySelection();
+}
+
+function copyWorkon(id) {
+  const text = '/ea workon ' + id;
+  function showToast() {
+    const el = document.querySelector(`.todo-item[data-todo-id="${id}"]`);
+    if (!el) return;
+    const toast = document.createElement('div');
+    toast.textContent = 'Copied: ' + text;
+    toast.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--text);color:var(--card);padding:8px 16px;border-radius:8px;font-size:0.85rem;font-family:monospace;z-index:2000;box-shadow:var(--shadow-lg);opacity:0;transition:opacity .15s';
+    document.body.appendChild(toast);
+    requestAnimationFrame(() => { toast.style.opacity = '1'; });
+    setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 150); }, 1500);
+  }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(showToast).catch(() => { fallbackCopy(text); showToast(); });
+  } else {
+    fallbackCopy(text); showToast();
+  }
+}
+
+function fallbackCopy(text) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  document.execCommand('copy');
+  document.body.removeChild(ta);
 }
 
 async function bringToTop(id) {
@@ -1874,6 +1905,11 @@ document.addEventListener('keydown', e => {
       document.getElementById('new-title').focus();
     } else if (selectedIdx >= 1 && selectedIdx <= visibleIds.length) {
       startEdit(visibleIds[selectedIdx - 1]);
+    }
+  } else if (e.key === 'c') {
+    if (selectedIdx >= 1 && selectedIdx <= visibleIds.length) {
+      e.preventDefault();
+      copyWorkon(visibleIds[selectedIdx - 1]);
     }
   } else if (e.key === '1' || e.key === '2' || e.key === '3') {
     if (selectedIdx >= 1 && selectedIdx <= visibleIds.length) {
