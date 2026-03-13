@@ -785,7 +785,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .todo-body { flex: 1; min-width: 0; }
   .todo-title { font-weight: 600; font-size: 1.02rem; word-break: break-word; letter-spacing: -0.01em; }
-  .todo-desc { color: var(--muted); font-size: 0.9rem; margin-top: 6px; padding-left: 30px; word-break: break-word; line-height: 1.5; }
+  .todo-desc { color: var(--muted); font-size: 0.9rem; margin-top: 6px; word-break: break-word; line-height: 1.5; }
   .todo-desc p { margin: 0 0 0.4em; }
   .todo-desc p:last-child { margin-bottom: 0; }
   .todo-desc ul, .todo-desc ol { margin: 0.2em 0 0.4em 1.2em; padding: 0; }
@@ -1003,6 +1003,7 @@ let pollTimer = null;
 let selectedIdx = -1; // -1 = nothing, 0 = add-form, 1+ = todo items
 let insertBeforeId = null; // when adding, insert before this todo id
 let searchQuery = ''; // fuzzy search filter
+let filterPriority = ''; // empty = no filter, else 'high','medium','low','none'
 let ctxTargetId = null; // id of todo targeted by context menu
 let visibleIds = []; // ordered list of todo ids as rendered
 let sectionsOrder = []; // ordered list of section names as rendered
@@ -1062,15 +1063,17 @@ function render() {
   const searchBar = document.querySelector('.search-bar');
   if (searchBar) searchBar.after(form);
 
-  // Apply search filter — each space-separated word must appear as a substring
-  const searching = searchQuery.trim().length > 0;
+  // Apply search and priority filters
+  const searching = searchQuery.trim().length > 0 || filterPriority.length > 0;
   const searchTokens = searching ? searchQuery.toLowerCase().trim().split(/\s+/) : [];
   const matchesSearch = t => {
     const text = ((t.title || '') + ' ' + (t.description || '') + ' ' + (t.section || '')).toLowerCase();
     return searchTokens.every(tok => text.includes(tok));
   };
-  const filteredActive = searching ? active.filter(matchesSearch) : active;
-  const filteredCompleted = searching ? completed.filter(matchesSearch) : completed;
+  const afterSearch = f => searching ? f.filter(matchesSearch) : f;
+  const afterPriority = f => filterPriority ? f.filter(t => (t.priority || 'medium') === filterPriority) : f;
+  const filteredActive = afterPriority(afterSearch(active));
+  const filteredCompleted = afterPriority(afterSearch(completed));
 
   if (filteredActive.length === 0 && filteredCompleted.length === 0) {
     if (searching) {
@@ -1212,7 +1215,6 @@ function renderTodo(t) {
   const draggable = t.status !== 'completed' ? 'draggable="true"' : '';
   return `<div class="todo-item ${statusClass}" data-todo-id="${t.id}" ${draggable} onclick="selectTodo('${t.id}')" oncontextmenu="showCtxMenu(event,'${t.id}')" style="cursor:pointer;">
     <div class="todo-header">
-      <input type="checkbox" class="todo-checkbox" ${checked} onchange="toggleComplete('${t.id}', this.checked)" onclick="event.stopPropagation()">
       <div class="todo-title" style="flex:1;min-width:0" ondblclick="startEdit('${t.id}')">${esc(t.title)}</div>
       ${priorityBadge}
       <div class="todo-actions">
@@ -2033,6 +2035,17 @@ document.addEventListener('keydown', e => {
   // Section picker is fully handled by its own input's keydown — skip main handler
   if (sectionPickerOpen) return;
 
+  // Ctrl+number: toggle priority filter (works from anywhere)
+  if (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && ['1','2','3','0'].includes(e.key)) {
+    e.preventDefault();
+    const pMap = {'1': 'high', '2': 'medium', '3': 'low', '0': 'none'};
+    const p = pMap[e.key];
+    filterPriority = filterPriority === p ? '' : p;
+    selectedIdx = -1;
+    render();
+    return;
+  }
+
   const tag = (e.target.tagName || '').toLowerCase();
 
   // When inside the add-form inputs, handle Escape to close form, Cmd+Enter to add
@@ -2193,8 +2206,9 @@ document.addEventListener('keydown', e => {
   } else if (e.key === 'Escape') {
     e.preventDefault();
     if (addFormVisible) { hideAddForm(); }
-    else if (searchQuery.trim().length > 0) {
+    else if (searchQuery.trim().length > 0 || filterPriority) {
       searchQuery = '';
+      filterPriority = '';
       const searchEl = document.getElementById('search-input');
       searchEl.value = '';
       searchEl.classList.remove('has-query');
