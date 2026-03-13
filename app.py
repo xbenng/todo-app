@@ -878,6 +878,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     display: flex; flex-direction: column; gap: 0;
     transition: all 0.2s ease;
     border-left: 3px solid transparent;
+    position: relative; overflow: hidden;
   }
   .todo-header {
     display: flex; align-items: flex-start; gap: 12px; width: 100%;
@@ -912,6 +913,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
   body.simple-mode .todo-item.item-toggled .todo-meta { display: flex; }
   body:not(.simple-mode) .todo-item.item-toggled .todo-desc { display: none; }
   body:not(.simple-mode) .todo-item.item-toggled .todo-meta { display: none; }
+  body.simple-mode .todo-item.preview-expanded .todo-desc { display: block; }
+  body.simple-mode .todo-item.preview-expanded .todo-meta { display: flex; }
   .todo-desc p { margin: 0 0 0.4em; }
   .todo-desc p:last-child { margin-bottom: 0; }
   .todo-desc ul, .todo-desc ol { margin: 0.2em 0 0.4em 1.2em; padding: 0; }
@@ -1040,6 +1043,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     box-shadow: 0 0 0 2px var(--accent), var(--shadow);
     border-left-color: var(--accent);
   }
+  .section-header-row.kb-selected {
+    box-shadow: 0 0 0 2px var(--accent);
+    border-radius: var(--radius);
+  }
 
   /* Context menu */
   .ctx-menu {
@@ -1108,6 +1115,30 @@ HTML_PAGE = r"""<!DOCTYPE html>
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
   ::-webkit-scrollbar-thumb:hover { background: var(--subtle); }
+
+  /* Swipe-to-complete (mobile) */
+  .swipe-reveal {
+    position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+    display: flex; align-items: center; padding-left: 24px;
+    background: #22c55e; color: #fff; font-size: 1.5rem; font-weight: 700;
+    opacity: 0; pointer-events: none; border-radius: var(--radius);
+    transition: opacity 0.15s;
+  }
+  .swipe-reveal-undo {
+    background: #f59e0b;
+  }
+  .swipe-reveal-icon {
+    transition: transform 0.15s;
+  }
+  .swipe-active .swipe-reveal { opacity: 1; }
+  .swipe-threshold .swipe-reveal-icon { transform: scale(1.4); }
+  .swipe-content {
+    position: relative; background: inherit; z-index: 1;
+    border-radius: inherit;
+  }
+  .swiping .swipe-content { transition: none; }
+  .snap-back .swipe-content { transition: transform 0.25s cubic-bezier(0.2,0.8,0.4,1); transform: translateX(0) !important; }
+  .snap-complete .swipe-content { transition: transform 0.2s ease-in; }
 </style>
 </head>
 <body class="simple-mode">
@@ -1209,6 +1240,8 @@ let visibleIds = []; // ordered list of todo ids as rendered
 let sectionsOrder = []; // ordered list of section names as rendered
 let addFormVisible = false;
 let simpleMode = true; // hide all descriptions
+let previewMode = false; // auto-expand selected item
+let previewExpandedId = null; // item currently auto-expanded by preview
 const toggledItems = new Set(); // per-item overrides that flip from mode default
 const collapsedSections = new Set(['__completed__']); // collapsed section names
 const SEL_ADD = 0; // index for the add-form position
@@ -1310,6 +1343,7 @@ function render() {
 
   let activeHtml = '';
   const visibleActive = []; // track which active items are visible (not collapsed)
+  const visibleActiveIds = []; // mix of todo IDs and '__section__:Name' markers for collapsed sections
   sectionsOrder.forEach(section => {
     const items = filteredActive.filter(t => (t.section || '') === section);
     const isCollapsed = !searching && collapsedSections.has(section);
@@ -1322,14 +1356,17 @@ function render() {
         + `<button class="sort-priority-btn" onclick="sortByPriority('${escSection}')" title="Sort by priority (high first)">&#9650; Priority</button>`
         + `</div>`;
     }
-    if (!isCollapsed) {
+    if (isCollapsed) {
+      if (section) visibleActiveIds.push('__section__:' + section);
+    } else {
       activeHtml += items.map(t => renderTodo(t)).join('');
       visibleActive.push(...items);
+      visibleActiveIds.push(...items.map(t => t.id));
     }
   });
 
-  // visibleIds only includes non-collapsed active items + completed
-  visibleIds = [...visibleActive, ...filteredCompleted].map(t => t.id);
+  // visibleIds includes todo IDs + section markers for collapsed sections
+  visibleIds = [...visibleActiveIds, ...filteredCompleted.map(t => t.id)];
 
   const eaBtn = '<button class="btn btn-sm ea-update-btn" onclick="eaUpdate()" title="Run /ea update in tmux">Update</button>';
   const simpleCls = simpleMode ? (toggledItems.size > 0 ? ' partial' : ' active') : (toggledItems.size > 0 ? ' partial' : '');
@@ -1347,20 +1384,21 @@ function render() {
     const label = {high:'H',medium:'M',low:'L',none:'0'}[p];
     return `<button class="header-toggle" style="${style}" onclick="cycleFilter('${p}')" title="Filter ${p}">${label}</button>`;
   }).join('');
-  const headerBtns = filterBtns + simpleBtn + eaBtn;
+  const previewBtn = `<button class="header-toggle preview-toggle-btn${previewMode ? ' active' : ''}" onclick="togglePreviewMode()" title="Preview mode: auto-expand selected (v)">Preview</button>`;
+  const headerBtns = filterBtns + simpleBtn + previewBtn + eaBtn;
   activeEl.innerHTML = filteredActive.length
     ? '<div class="active-header"><h2>Active (' + filteredActive.length + ')</h2>' + headerBtns + '</div>' + activeHtml
     : '<div class="active-header"><h2>Active</h2>' + headerBtns + '</div><div class="empty-state">All done! &#127881;</div>';
 
   const isCompletedCollapsed = !searching && collapsedSections.has('__completed__');
   if (filteredCompleted.length) {
-    completedEl.innerHTML = `<div class="section-header-row">`
+    completedEl.innerHTML = `<div class="section-header-row" data-section="__completed__">`
       + `<button class="collapse-btn${isCompletedCollapsed ? ' collapsed' : ''}" onclick="toggleSectionCollapse('__completed__')" title="${isCompletedCollapsed ? 'Expand' : 'Collapse'}">&#9660;</button>`
       + `<h2 style="margin:0;">Completed (${filteredCompleted.length})</h2>`
       + `</div>`
       + (isCompletedCollapsed ? '' : filteredCompleted.map(t => renderTodo(t)).join(''));
     if (isCompletedCollapsed) {
-      visibleIds = visibleActive.map(t => t.id);
+      visibleIds = [...visibleActiveIds, '__section__:__completed__'];
     }
   } else {
     completedEl.innerHTML = '';
@@ -1451,9 +1489,14 @@ function renderTodo(t) {
 
   const draggable = t.status !== 'completed' ? 'draggable="true"' : '';
   const itemToggled = toggledItems.has(t.id) ? ' item-toggled' : '';
+  const isCompleted = t.status === 'completed';
+  const swipeRevealClass = isCompleted ? 'swipe-reveal swipe-reveal-undo' : 'swipe-reveal';
+  const swipeIcon = isCompleted ? '&#8634;' : '&#10003;';
   return `<div class="todo-item ${statusClass}${itemToggled}" data-todo-id="${t.id}" ${draggable} onclick="selectTodo('${t.id}')" ondblclick="startEdit('${t.id}')" oncontextmenu="showCtxMenu(event,'${t.id}')" style="cursor:pointer;">
+    <div class="${swipeRevealClass}"><span class="swipe-reveal-icon">${swipeIcon}</span></div>
+    <div class="swipe-content">
     <div class="todo-header">
-      <div class="todo-title" style="flex:1;min-width:0" onclick="event.stopPropagation();toggleItemDesc('${t.id}')">${esc(t.title)}</div>
+      <div class="todo-title" style="flex:1;min-width:0" onclick="event.stopPropagation();selectTodo('${t.id}');toggleItemDesc('${t.id}')">${esc(t.title)}</div>
       ${priorityBadge}
       <div class="todo-actions">
         ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();startInTmux('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Start in tmux (s)" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#9654;</button>` : ''}
@@ -1462,6 +1505,7 @@ function renderTodo(t) {
       </div>
     </div>
     ${desc}
+    </div>
   </div>`;
 }
 
@@ -1631,6 +1675,22 @@ function toggleSimpleMode() {
   render();
 }
 
+function togglePreviewMode() {
+  previewMode = !previewMode;
+  if (!previewMode && previewExpandedId) {
+    const el = document.querySelector(`.todo-item[data-todo-id="${previewExpandedId}"]`);
+    if (el) el.classList.remove('preview-expanded');
+    previewExpandedId = null;
+  }
+  updatePreviewBtn();
+  if (previewMode) applySelection();
+}
+
+function updatePreviewBtn() {
+  const btn = document.querySelector('.preview-toggle-btn');
+  if (btn) btn.classList.toggle('active', previewMode);
+}
+
 function cycleFilter(p) {
   if (showPriorities.has(p)) {
     showPriorities.delete(p);
@@ -1647,6 +1707,10 @@ function cycleFilter(p) {
 function toggleItemDesc(id) {
   const el = document.querySelector(`.todo-item[data-todo-id="${id}"]`);
   if (!el) return;
+  if (previewExpandedId === id) {
+    el.classList.remove('preview-expanded');
+    previewExpandedId = null;
+  }
   if (toggledItems.has(id)) {
     toggledItems.delete(id);
     el.classList.remove('item-toggled');
@@ -1732,11 +1796,12 @@ async function addTodo() {
   const section = getSelectedSection();
   const payload = {title, description: desc, priority, section};
   if (insertBeforeId) payload.before_id = insertBeforeId;
-  await fetch(API, {
+  const res = await fetch(API, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(payload)
   });
+  const newTodo = await res.json();
   insertBeforeId = null;
   document.getElementById('new-title').value = '';
   document.getElementById('new-desc').value = '';
@@ -1749,7 +1814,15 @@ async function addTodo() {
   const searchEl = document.getElementById('search-input');
   searchEl.value = '';
   searchEl.classList.remove('has-query');
-  loadTodos();
+  await loadTodos();
+  // Advance cursor to the newly created item
+  if (newTodo && newTodo.id) {
+    const idx = visibleIds.indexOf(newTodo.id);
+    if (idx >= 0) {
+      selectedIdx = idx + 1;
+      applySelection();
+    }
+  }
 }
 
 async function toggleComplete(id, checked) {
@@ -1997,6 +2070,43 @@ async function moveSelected(direction) {
   applySelection();
 }
 
+async function moveSectionSelected(direction) {
+  if (selectedIdx < 1 || selectedIdx > visibleIds.length) return;
+  const curId = visibleIds[selectedIdx - 1];
+  if (!curId.startsWith('__section__:')) return;
+  const section = curId.slice('__section__:'.length);
+  if (section === '__completed__') return;
+
+  const idx = sectionsOrder.indexOf(section);
+  if (idx < 0) return;
+
+  let beforeSection = null;
+  if (direction === 'up') {
+    // Move before the previous section; skip empty-string (unsectioned)
+    let target = idx - 1;
+    while (target >= 0 && sectionsOrder[target] === '') target--;
+    if (target < 0) return;
+    beforeSection = sectionsOrder[target];
+  } else {
+    // Move after the next section = move before the one two ahead
+    let target = idx + 1;
+    if (target >= sectionsOrder.length) return;
+    // Place before the section that's two positions ahead, or null (end)
+    beforeSection = (target + 1 < sectionsOrder.length) ? sectionsOrder[target + 1] : null;
+  }
+
+  const res = await fetch('/api/sections/reorder', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({section, before_section: beforeSection})
+  });
+  if (!res.ok) return;
+  await loadTodos();
+  const markerIdx = visibleIds.indexOf('__section__:' + section);
+  if (markerIdx >= 0) selectedIdx = markerIdx + 1;
+  applySelection();
+}
+
 async function startEdit(id) {
   editingId = id;
   render();
@@ -2076,7 +2186,7 @@ async function startEdit(id) {
     editEls.forEach(el => {
       el.addEventListener('keydown', e => {
         if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); saveEdit(id); }
-        if (e.key === 'Escape') { e.preventDefault(); cancelEdit(); }
+        if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); cancelEdit(); }
       });
     });
     // Cancel edit when clicking outside the todo item card
@@ -2091,10 +2201,14 @@ async function startEdit(id) {
   }, 0);
 }
 
+let _justCancelledEdit = false;
 function cancelEdit() {
+  const restoreId = editingId;
   if (cmEditor) { cmEditor.destroy(); cmEditor = null; }
   editingId = null;
+  _justCancelledEdit = true;
   render();
+  if (restoreId) selectTodo(restoreId);
 }
 
 async function saveEdit(id) {
@@ -2349,6 +2463,153 @@ document.addEventListener('drop', async e => {
   dragId = null;
 });
 
+/* ── Swipe-right to complete/uncomplete (mobile touch) ── */
+(function() {
+  if (!('ontouchstart' in window)) return;
+
+  var THRESHOLD_RATIO = 0.30;
+  var VELOCITY_THRESHOLD = 0.4; // px/ms
+
+  var startX, startY, startTime, locked, item, content, itemW, isCompleted, todoId;
+
+  function reset() {
+    if (item) {
+      item.classList.remove('swiping', 'swipe-active', 'swipe-threshold', 'snap-back', 'snap-complete');
+      if (content) content.style.transform = '';
+    }
+    startX = startY = startTime = locked = item = content = itemW = isCompleted = todoId = null;
+  }
+
+  function findItem(el) {
+    while (el && el !== document) {
+      if (el.classList && el.classList.contains('todo-item')) return el;
+      el = el.parentElement;
+    }
+    return null;
+  }
+
+  function shouldIgnore(target) {
+    var tag = (target.tagName || '').toLowerCase();
+    return tag === 'button' || tag === 'input' || tag === 'select' || tag === 'textarea' || tag === 'a';
+  }
+
+  document.addEventListener('touchstart', function(e) {
+    if (e.touches.length !== 1) return;
+    var t = e.touches[0];
+    var target = e.target;
+    if (shouldIgnore(target)) return;
+    var el = findItem(target);
+    if (!el) return;
+    // Bail if item is in edit mode
+    if (el.querySelector('.edit-form, .todo-edit')) return;
+
+    item = el;
+    content = el.querySelector('.swipe-content');
+    if (!content) { item = null; return; }
+    todoId = el.getAttribute('data-todo-id');
+    itemW = el.offsetWidth;
+    isCompleted = el.classList.contains('completed');
+    startX = t.clientX;
+    startY = t.clientY;
+    startTime = Date.now();
+    locked = null; // null = undecided, 'h' = horizontal, 'v' = vertical
+  }, { passive: true });
+
+  document.addEventListener('touchmove', function(e) {
+    if (!item) return;
+    var t = e.touches[0];
+    var dx = t.clientX - startX;
+    var dy = t.clientY - startY;
+
+    if (locked === null) {
+      var adx = Math.abs(dx), ady = Math.abs(dy);
+      if (adx < 10 && ady < 10) return; // deadzone
+      if (ady > adx) { locked = 'v'; reset(); return; }
+      locked = 'h';
+      item.classList.add('swiping', 'swipe-active');
+    }
+
+    if (locked !== 'h') return;
+    e.preventDefault();
+
+    // Only allow swiping right
+    if (dx < 0) dx = 0;
+
+    // Rubber-band past threshold
+    var threshold = itemW * THRESHOLD_RATIO;
+    var tx;
+    if (dx <= threshold) {
+      tx = dx;
+    } else {
+      tx = threshold + (dx - threshold) * 0.4;
+    }
+    content.style.transform = 'translateX(' + tx + 'px)';
+
+    if (dx >= threshold) {
+      item.classList.add('swipe-threshold');
+    } else {
+      item.classList.remove('swipe-threshold');
+    }
+  }, { passive: false });
+
+  document.addEventListener('touchend', function(e) {
+    if (!item || locked !== 'h') { reset(); return; }
+
+    var t = e.changedTouches[0];
+    var dx = t.clientX - startX;
+    var elapsed = Date.now() - startTime;
+    var velocity = dx / (elapsed || 1);
+    var threshold = itemW * THRESHOLD_RATIO;
+    var pastThreshold = dx >= threshold || (velocity > VELOCITY_THRESHOLD && dx > 30);
+
+    if (pastThreshold) {
+      // Animate off-screen, then toggle
+      item.classList.remove('swiping');
+      item.classList.add('snap-complete');
+      content.style.transform = 'translateX(' + itemW + 'px)';
+
+      var capturedId = todoId;
+      var capturedCompleted = isCompleted;
+      var capturedItem = item;
+
+      var done = function() {
+        capturedItem.removeEventListener('transitionend', done);
+        toggleComplete(capturedId, !capturedCompleted);
+      };
+      // Listen on the content div for the transform transition
+      content.addEventListener('transitionend', done, { once: true });
+      // Safety fallback in case transitionend doesn't fire
+      setTimeout(function() {
+        done();
+      }, 350);
+    } else {
+      // Snap back
+      item.classList.remove('swiping', 'swipe-threshold');
+      item.classList.add('snap-back');
+      content.style.transform = '';
+      var snapItem = item;
+      setTimeout(function() {
+        snapItem.classList.remove('snap-back', 'swipe-active');
+      }, 300);
+    }
+
+    item = null; content = null; locked = null;
+  }, { passive: true });
+
+  document.addEventListener('touchcancel', function() {
+    if (item) {
+      item.classList.remove('swiping', 'swipe-threshold');
+      item.classList.add('snap-back');
+      if (content) content.style.transform = '';
+      var snapItem = item;
+      setTimeout(function() {
+        snapItem.classList.remove('snap-back', 'swipe-active');
+      }, 300);
+    }
+    item = null; content = null; locked = null;
+  }, { passive: true });
+})();
+
 let _scrollAnim = null;
 let _scrollTarget = null; // the element we're scrolling toward
 function scrollIntoViewCentered(el) {
@@ -2397,9 +2658,22 @@ function scrollIntoViewCentered(el) {
   _scrollAnim = requestAnimationFrame(step);
 }
 
+function selectedIsSection() {
+  if (selectedIdx < 1 || selectedIdx > visibleIds.length) return false;
+  return visibleIds[selectedIdx - 1].startsWith('__section__:');
+}
+
 function applySelection() {
+  // Collapse previous preview-expanded item
+  if (previewExpandedId) {
+    const prevEl = document.querySelector(`.todo-item[data-todo-id="${previewExpandedId}"]`);
+    if (prevEl) prevEl.classList.remove('preview-expanded');
+    previewExpandedId = null;
+  }
+
   // Clear all highlights
   document.querySelectorAll('.todo-item.kb-selected').forEach(el => el.classList.remove('kb-selected'));
+  document.querySelectorAll('.section-header-row.kb-selected').forEach(el => el.classList.remove('kb-selected'));
   const form = document.getElementById('add-form');
   form.classList.remove('kb-selected');
 
@@ -2407,11 +2681,28 @@ function applySelection() {
     form.classList.add('kb-selected');
     scrollIntoViewCentered(form);
   } else if (selectedIdx >= 1 && selectedIdx <= visibleIds.length) {
-    const todoIdx = selectedIdx - 1;
-    const el = document.querySelector(`.todo-item[data-todo-id="${visibleIds[todoIdx]}"]`);
-    if (el) {
-      el.classList.add('kb-selected');
-      scrollIntoViewCentered(el);
+    const curId = visibleIds[selectedIdx - 1];
+    if (curId.startsWith('__section__:')) {
+      const sec = curId.slice('__section__:'.length);
+      const el = document.querySelector(`.section-header-row[data-section="${sec}"]`);
+      if (el) {
+        el.classList.add('kb-selected');
+        scrollIntoViewCentered(el);
+      }
+    } else {
+      const el = document.querySelector(`.todo-item[data-todo-id="${curId}"]`);
+      if (el) {
+        el.classList.add('kb-selected');
+        scrollIntoViewCentered(el);
+        // Preview mode: auto-expand if currently collapsed
+        if (previewMode) {
+          const isExpanded = simpleMode ? toggledItems.has(curId) : !toggledItems.has(curId);
+          if (!isExpanded) {
+            el.classList.add('preview-expanded');
+            previewExpandedId = curId;
+          }
+        }
+      }
     }
   }
 }
@@ -2518,10 +2809,12 @@ document.addEventListener('keydown', e => {
     showSectionPicker();
   } else if ((e.key === 'ArrowDown' || e.key === 'j') && e.altKey) {
     e.preventDefault();
-    moveSelected('down');
+    if (selectedIsSection()) moveSectionSelected('down');
+    else moveSelected('down');
   } else if ((e.key === 'ArrowUp' || e.key === 'k') && e.altKey) {
     e.preventDefault();
-    moveSelected('up');
+    if (selectedIsSection()) moveSectionSelected('up');
+    else moveSelected('up');
   } else if (e.key === 'ArrowDown' || e.key === 'j') {
     e.preventDefault();
     if (visibleIds.length === 0 && !addFormVisible) return;
@@ -2546,27 +2839,34 @@ document.addEventListener('keydown', e => {
   } else if (e.key === 'Enter') {
     if (selectedIdx >= 1 && selectedIdx <= visibleIds.length) {
       e.preventDefault();
-      toggleItemDesc(visibleIds[selectedIdx - 1]);
+      const curId = visibleIds[selectedIdx - 1];
+      if (curId.startsWith('__section__:')) {
+        const sec = curId.slice('__section__:'.length);
+        collapsedSections.delete(sec);
+        render();
+      } else {
+        toggleItemDesc(curId);
+      }
     }
   } else if (e.key === 'e') {
     e.preventDefault();
     if (selectedIdx === SEL_ADD && addFormVisible) {
       document.getElementById('new-title').focus();
-    } else if (selectedIdx >= 1 && selectedIdx <= visibleIds.length) {
+    } else if (selectedIdx >= 1 && selectedIdx <= visibleIds.length && !selectedIsSection()) {
       startEdit(visibleIds[selectedIdx - 1]);
     }
   } else if (e.key === 'c') {
-    if (selectedIdx >= 1 && selectedIdx <= visibleIds.length) {
+    if (selectedIdx >= 1 && selectedIdx <= visibleIds.length && !selectedIsSection()) {
       e.preventDefault();
       copyTodoId(visibleIds[selectedIdx - 1]);
     }
   } else if (e.key === 's') {
-    if (selectedIdx >= 1 && selectedIdx <= visibleIds.length) {
+    if (selectedIdx >= 1 && selectedIdx <= visibleIds.length && !selectedIsSection()) {
       e.preventDefault();
       startInTmux(visibleIds[selectedIdx - 1]);
     }
   } else if (e.key === '0' || e.key === '1' || e.key === '2' || e.key === '3') {
-    if (selectedIdx >= 1 && selectedIdx <= visibleIds.length) {
+    if (selectedIdx >= 1 && selectedIdx <= visibleIds.length && !selectedIsSection()) {
       e.preventDefault();
       const pMap = {'1': 'high', '2': 'medium', '3': 'low', '0': 'none'};
       changePriority(visibleIds[selectedIdx - 1], pMap[e.key]);
@@ -2578,37 +2878,64 @@ document.addEventListener('keydown', e => {
       sortByPriority(sec);
     }
   } else if (e.key === 't') {
-    if (selectedIdx >= 1 && selectedIdx <= visibleIds.length) {
+    if (selectedIdx >= 1 && selectedIdx <= visibleIds.length && !selectedIsSection()) {
       e.preventDefault();
       bringToTop(visibleIds[selectedIdx - 1]);
     }
   } else if (e.key === 'Backspace' && e.metaKey) {
-    if (selectedIdx >= 1 && selectedIdx <= visibleIds.length) {
+    if (selectedIdx >= 1 && selectedIdx <= visibleIds.length && !selectedIsSection()) {
       e.preventDefault();
       deleteTodo(visibleIds[selectedIdx - 1]);
     }
   } else if (e.key === 'ArrowLeft' && !e.metaKey && !e.altKey && !e.shiftKey) {
-    // Collapse section of selected item
-    const sec = getSectionOfSelected();
-    if (sec !== null && sec !== '' && !collapsedSections.has(sec)) {
-      e.preventDefault();
-      collapsedSections.add(sec);
-      render();
+    if (selectedIdx >= 1 && selectedIdx <= visibleIds.length) {
+      const curId = visibleIds[selectedIdx - 1];
+      if (!curId.startsWith('__section__:')) {
+        const isExpanded = simpleMode ? toggledItems.has(curId) : !toggledItems.has(curId);
+        if (isExpanded) {
+          // Collapse item description
+          e.preventDefault();
+          toggleItemDesc(curId);
+        } else {
+          // Collapse the section, select the section marker
+          const sec = getSectionOfSelected();
+          if (sec !== null && sec !== '' && !collapsedSections.has(sec)) {
+            e.preventDefault();
+            collapsedSections.add(sec);
+            render();
+            const markerIdx = visibleIds.indexOf('__section__:' + sec);
+            if (markerIdx >= 0) {
+              selectedIdx = markerIdx + 1;
+              applySelection();
+            }
+          }
+        }
+      }
     }
   } else if (e.key === 'ArrowRight' && !e.metaKey && !e.altKey && !e.shiftKey) {
-    // Expand nearest collapsed section above/at current position
-    if (collapsedSections.size > 0) {
-      e.preventDefault();
-      // Find which collapsed section the selection is adjacent to
-      const sec = getNextCollapsedSection();
-      if (sec) {
+    if (selectedIdx >= 1 && selectedIdx <= visibleIds.length) {
+      const curId = visibleIds[selectedIdx - 1];
+      if (curId.startsWith('__section__:')) {
+        // Expand collapsed section
+        e.preventDefault();
+        const sec = curId.slice('__section__:'.length);
         collapsedSections.delete(sec);
         render();
+      } else {
+        // Expand item description
+        const isExpanded = simpleMode ? toggledItems.has(curId) : !toggledItems.has(curId);
+        if (!isExpanded) {
+          e.preventDefault();
+          toggleItemDesc(curId);
+        }
       }
     }
   } else if (e.key === 'a') {
     e.preventDefault();
     toggleSimpleMode();
+  } else if (e.key === 'v') {
+    e.preventDefault();
+    togglePreviewMode();
   } else if (e.key === '?') {
     e.preventDefault();
     showShortcuts();
@@ -2616,6 +2943,7 @@ document.addEventListener('keydown', e => {
     e.preventDefault();
     showAddForm();
   } else if (e.key === 'Escape') {
+    if (_justCancelledEdit) { _justCancelledEdit = false; return; }
     e.preventDefault();
     if (addFormVisible) { hideAddForm(); }
     else if (searchQuery.trim().length > 0 || showPriorities.size > 0 || hidePriorities.size > 0) {
@@ -2644,6 +2972,7 @@ let sectionPickerOpen = false;
 let sectionPickerIdx = 0;
 let spAllItems = [];      // full unfiltered list [{name, label, isCurrent}]
 let spFilteredItems = [];  // after fuzzy filter
+let spLastQuery = '';      // persists across open/close
 let sectionPickerTodoId = null;
 
 function spFuzzyMatch(query, text) {
@@ -2686,7 +3015,15 @@ function showSectionPicker() {
 
   sectionPickerTodoId = id;
   sectionPickerOpen = true;
-  spFilteredItems = spAllItems.filter(x => !x.isCurrent);
+
+  // Restore last query and filter accordingly
+  if (spLastQuery) {
+    spFilteredItems = spAllItems
+      .filter(x => !x.isCurrent && spFuzzyMatch(spLastQuery, x.label))
+      .sort((a, b) => spFuzzyScore(spLastQuery, a.label) - spFuzzyScore(spLastQuery, b.label));
+  } else {
+    spFilteredItems = spAllItems.filter(x => !x.isCurrent);
+  }
   sectionPickerIdx = 0;
 
   renderSectionPicker();
@@ -2704,16 +3041,20 @@ function showSectionPicker() {
     picker.style.top = y + 'px';
   }
 
-  // Focus input after render
+  // Focus input after render, select all text so user can type to replace
   setTimeout(() => {
     const inp = document.getElementById('sp-input');
-    if (inp) inp.focus();
+    if (inp) {
+      inp.focus();
+      if (spLastQuery) inp.select();
+    }
   }, 0);
 }
 
 function renderSectionPicker() {
   const picker = document.getElementById('section-picker');
-  const inputVal = document.getElementById('sp-input')?.value || '';
+  const existingInput = document.getElementById('sp-input');
+  const inputVal = existingInput ? existingInput.value : spLastQuery;
 
   let itemsHtml = '';
   if (spFilteredItems.length === 0 && inputVal.trim()) {
@@ -2740,6 +3081,7 @@ function renderSectionPicker() {
 
 function spOnInput(e) {
   const query = e.target.value.trim();
+  spLastQuery = e.target.value;
   if (!query) {
     spFilteredItems = spAllItems.filter(x => !x.isCurrent);
   } else {
@@ -2805,6 +3147,11 @@ function spOnKeydown(e) {
   } else if (e.key === 'Escape') {
     e.preventDefault();
     hideSectionPicker();
+  } else if (e.key === 'ArrowLeft') {
+    if (!e.target.value) {
+      e.preventDefault();
+      hideSectionPicker();
+    }
   }
   e.stopPropagation();
 }
