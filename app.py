@@ -706,6 +706,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Todo List</title>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script type="importmap">
+{
+  "imports": {
+    "codemirror": "https://esm.sh/codemirror@6.0.1",
+    "@codemirror/lang-markdown": "https://esm.sh/@codemirror/lang-markdown@6.3.2",
+    "@codemirror/view": "https://esm.sh/@codemirror/view@6.36.5",
+    "@codemirror/state": "https://esm.sh/@codemirror/state@6.5.2",
+    "@codemirror/commands": "https://esm.sh/@codemirror/commands@6.8.0"
+  }
+}
+</script>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
   :root {
@@ -937,6 +948,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: var(--bg); transition: border-color 0.15s, box-shadow 0.15s;
   }
   .edit-desc:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-light); }
+  .edit-desc-cm { width: 100%; }
+  .edit-desc-cm .cm-editor {
+    font-size: 80%; border: 1px solid var(--border); border-radius: 8px;
+    background: var(--bg); transition: border-color 0.15s, box-shadow 0.15s;
+  }
+  .edit-desc-cm .cm-editor.cm-focused {
+    outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-light);
+  }
+  .edit-desc-cm .cm-content { min-height: 44px; padding: 8px 12px; font-family: inherit; }
+  .edit-desc-cm .cm-scroller { overflow: auto; }
+  .edit-desc-cm .cm-line { line-height: 1.6; }
   .edit-actions { display: flex; gap: 6px; margin-top: 8px; }
 
   /* Section headers */
@@ -1104,6 +1126,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
 const API = '/api/todos';
 let allTodos = [];
 let editingId = null;
+let cmEditor = null;
+let cmModules = null; // lazily loaded CodeMirror modules
 let lastMtime = 0;
 let pollTimer = null;
 let selectedIdx = -1; // -1 = nothing, 0 = add-form, 1+ = todo items
@@ -1295,7 +1319,7 @@ function renderTodo(t) {
     return `<div class="todo-item ${statusClass}">
       <div class="todo-body">
         <input class="edit-title" id="edit-title-${t.id}" value="${esc(t.title)}">
-        <textarea class="edit-desc" id="edit-desc-${t.id}">${esc(t.description)}</textarea>
+        <div class="edit-desc-cm" id="edit-desc-${t.id}"></div>
         <select id="edit-section-${t.id}" style="font-size:0.85rem; font-weight:400; margin-bottom:4px; width:100%; padding:4px 8px; border:1px solid var(--border); border-radius:4px;">
           <option value="">No section</option>
           ${allSectionsForEdit().map(s => `<option value="${esc(s)}" ${(t.section||'')===s?'selected':''}>${esc(s)}</option>`).join('')}
@@ -1799,17 +1823,55 @@ async function moveSelected(direction) {
   applySelection();
 }
 
-function startEdit(id) {
+async function startEdit(id) {
   editingId = id;
   render();
-  // Auto-size description textarea to fit content and place cursor at end
+  // Lazily load CodeMirror modules
+  if (!cmModules) {
+    const [cmBundle, cmMd, cmView, cmState, cmCmd] = await Promise.all([
+      import('codemirror'),
+      import('@codemirror/lang-markdown'),
+      import('@codemirror/view'),
+      import('@codemirror/state'),
+      import('@codemirror/commands')
+    ]);
+    cmModules = {
+      basicSetup: cmBundle.basicSetup, markdown: cmMd.markdown,
+      markdownKeymap: cmMd.markdownKeymap,
+      EditorView: cmView.EditorView, keymap: cmView.keymap,
+      EditorState: cmState.EditorState,
+      moveLineUp: cmCmd.moveLineUp, moveLineDown: cmCmd.moveLineDown,
+    };
+  }
+  const { basicSetup, markdown, EditorView, keymap, EditorState, markdownKeymap, moveLineUp, moveLineDown } = cmModules;
+  const t = allTodos.find(t => t.id === id);
   const descEl = document.getElementById('edit-desc-' + id);
   if (descEl) {
-    function autoResize() { descEl.style.height = 'auto'; descEl.style.height = descEl.scrollHeight + 'px'; }
-    autoResize();
-    descEl.addEventListener('input', autoResize);
-    descEl.focus();
-    descEl.setSelectionRange(descEl.value.length, descEl.value.length);
+    if (cmEditor) { cmEditor.destroy(); cmEditor = null; }
+    const customKeymap = keymap.of([
+      { key: 'Mod-Enter', run: () => { saveEdit(id); return true; } },
+      { key: 'Escape', run: () => { cancelEdit(); return true; } },
+      { key: 'Alt-ArrowUp', run: moveLineUp },
+      { key: 'Alt-ArrowDown', run: moveLineDown },
+    ]);
+    cmEditor = new EditorView({
+      doc: t ? t.description : '',
+      extensions: [
+        customKeymap,
+        basicSetup,
+        keymap.of(markdownKeymap),
+        markdown(),
+        EditorView.lineWrapping,
+        EditorView.theme({
+          '&': { maxHeight: '300px' },
+          '.cm-scroller': { overflow: 'auto' }
+        })
+      ],
+      parent: descEl
+    });
+    // Move cursor to end and focus
+    cmEditor.dispatch({ selection: { anchor: cmEditor.state.doc.length } });
+    cmEditor.focus();
   }
   setTimeout(() => {
     const editEls = document.querySelectorAll(`#edit-title-${id}, #edit-desc-${id}, #edit-priority-${id}, #edit-section-${id}, #edit-section-custom-${id}`);
@@ -1827,36 +1889,52 @@ function startEdit(id) {
         }
       });
     }
-    // Keydown: Cmd+Enter to save, Escape to cancel
+    // Keydown: Cmd+Enter to save, Escape to cancel (for non-CM fields)
     editEls.forEach(el => {
       el.addEventListener('keydown', e => {
         if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); saveEdit(id); }
         if (e.key === 'Escape') { e.preventDefault(); cancelEdit(); }
       });
     });
-    // Cancel edit when focus leaves all edit fields
+    // Cancel edit when focus leaves all edit fields (including CM)
+    const cmEl = descEl ? descEl.querySelector('.cm-editor') : null;
     editEls.forEach(el => {
       el.addEventListener('blur', () => {
         setTimeout(() => {
           if (editingId !== id) return;
           const active = document.activeElement;
           const stillInEdit = Array.from(editEls).some(e => e === active || e.contains(active));
+          const inCm = cmEl && (cmEl === active || cmEl.contains(active));
           const clickedBtn = active && active.closest('.edit-actions');
-          if (!stillInEdit && !clickedBtn) cancelEdit();
+          if (!stillInEdit && !inCm && !clickedBtn) cancelEdit();
         }, 100);
       });
     });
+    // Also handle blur from CM editor
+    if (cmEl) {
+      cmEl.addEventListener('focusout', () => {
+        setTimeout(() => {
+          if (editingId !== id) return;
+          const active = document.activeElement;
+          const stillInEdit = Array.from(editEls).some(e => e === active || e.contains(active));
+          const inCm = cmEl === active || cmEl.contains(active);
+          const clickedBtn = active && active.closest('.edit-actions');
+          if (!stillInEdit && !inCm && !clickedBtn) cancelEdit();
+        }, 100);
+      });
+    }
   }, 0);
 }
 
 function cancelEdit() {
+  if (cmEditor) { cmEditor.destroy(); cmEditor = null; }
   editingId = null;
   render();
 }
 
 async function saveEdit(id) {
   const title = document.getElementById('edit-title-' + id).value.trim();
-  const desc = document.getElementById('edit-desc-' + id).value.trim();
+  const desc = cmEditor ? cmEditor.state.doc.toString().trim() : '';
   const priority = document.getElementById('edit-priority-' + id).value;
   const secSelect = document.getElementById('edit-section-' + id);
   const section = secSelect.value === '__custom__'
@@ -1868,6 +1946,7 @@ async function saveEdit(id) {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({title, description: desc, priority, section})
   });
+  if (cmEditor) { cmEditor.destroy(); cmEditor = null; }
   editingId = null;
   loadTodos();
 }
