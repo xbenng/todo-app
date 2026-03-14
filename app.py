@@ -648,9 +648,20 @@ def start_in_tmux(todo_id):
         return jsonify({"error": f"tmux error: {exc.stderr.decode().strip()}"}), 500
 
 
+def _tmux_window_exists(tmux_bin, session, window_name):
+    """Check if a tmux window with the given name exists."""
+    result = subprocess.run(
+        [tmux_bin, "list-panes", "-t", f"{session}:={window_name}"],
+        capture_output=True,
+    )
+    return result.returncode == 0
+
+
 @app.route("/api/ea-update", methods=["POST"])
 def ea_update():
     """Run /ea update in a tmux window."""
+    data = request.json or {}
+    force = data.get("force", False)
     tmux_bin = shutil.which("tmux") or "/opt/homebrew/bin/tmux"
     tmux_session = "0"
     window_name = "ea-update"
@@ -666,6 +677,14 @@ def ea_update():
                 capture_output=True,
             )
 
+        if _tmux_window_exists(tmux_bin, tmux_session, window_name):
+            if not force:
+                return jsonify({"status": "already_running", "window": window_name})
+            subprocess.run(
+                [tmux_bin, "kill-window", "-t", f"{tmux_session}:={window_name}"],
+                capture_output=True,
+            )
+
         subprocess.run(
             [tmux_bin, "new-window", "-t", f"{tmux_session}:", "-n", window_name],
             check=True,
@@ -675,7 +694,7 @@ def ea_update():
         subprocess.run(
             [
                 tmux_bin, "send-keys",
-                "-t", f"{tmux_session}:{window_name}",
+                "-t", f"{tmux_session}:={window_name}",
                 f"cd {todo_dir} && claude --dangerously-skip-permissions '/ea update'",
                 "Enter",
             ],
@@ -692,9 +711,10 @@ def ea_update():
 
 @app.route("/api/ea-update-item", methods=["POST"])
 def ea_update_item():
-    """Run /ea update <item_id> in a tmux window."""
+    """Run /ea checkon <item_id> in a tmux window."""
     data = request.json
     item_id = (data.get("id") or "").strip()
+    force = data.get("force", False)
     if not item_id:
         return jsonify({"error": "id required"}), 400
     tmux_bin = shutil.which("tmux") or "/opt/homebrew/bin/tmux"
@@ -711,6 +731,15 @@ def ea_update_item():
                 check=True,
                 capture_output=True,
             )
+
+        if _tmux_window_exists(tmux_bin, tmux_session, window_name):
+            if not force:
+                return jsonify({"status": "already_running", "window": window_name})
+            subprocess.run(
+                [tmux_bin, "kill-window", "-t", f"{tmux_session}:={window_name}"],
+                capture_output=True,
+            )
+
         subprocess.run(
             [tmux_bin, "new-window", "-t", f"{tmux_session}:", "-n", window_name],
             check=True,
@@ -720,8 +749,8 @@ def ea_update_item():
         subprocess.run(
             [
                 tmux_bin, "send-keys",
-                "-t", f"{tmux_session}:{window_name}",
-                f"cd {todo_dir} && claude --dangerously-skip-permissions '/ea update {item_id}'",
+                "-t", f"{tmux_session}:={window_name}",
+                f"cd {todo_dir} && claude --dangerously-skip-permissions '/ea checkon {item_id}'",
                 "Enter",
             ],
             check=True,
@@ -791,6 +820,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Todo List</title>
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+<link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32x32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="/static/favicon-16x16.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png">
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script type="importmap">
 {
@@ -994,9 +1027,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
     margin: 22px 0 10px; padding: 8px 0 6px;
     border-bottom: 2px solid var(--border);
     position: sticky; z-index: 100; background: var(--bg);
+    transition: opacity 0.1s;
+  }
+  .section-header-row::after {
+    content: ''; position: absolute; left: 0; right: 0; top: 100%;
+    height: 24px; background: linear-gradient(to bottom, var(--bg), transparent);
+    pointer-events: none;
   }
   .section-header-row h3 {
-    font-size: 0.92rem; color: var(--text); font-weight: 700; margin: 0;
+    font-size: 1rem; color: var(--muted); font-weight: 400; margin: 0;
     letter-spacing: -0.01em; cursor: pointer;
   }
   .section-header-row h3:hover { color: var(--accent); }
@@ -1548,7 +1587,7 @@ function renderTodo(t) {
       <div class="todo-title" style="flex:1;min-width:0" onclick="event.stopPropagation();selectTodo('${t.id}');toggleItemDesc('${t.id}')">${esc(t.title)}</div>
       ${priorityBadge}
       <div class="todo-actions">
-        ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();eaUpdateItem('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Refresh via /ea update" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#8635;</button>` : ''}
+        ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();eaUpdateItem('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Refresh via /ea checkon" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#8635;</button>` : ''}
         ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();startInTmux('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Start in tmux (s)" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#9654;</button>` : ''}
         ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();bringToTop('${t.id}')" style="border:none;background:transparent;font-size:1rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Bring to top" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#x2912;</button>` : ''}
         <button onclick="event.stopPropagation();deleteTodo('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 6px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Delete" onmouseover="this.style.color='var(--danger)'" onmouseout="this.style.color='var(--subtle)'">&#10005;</button>
@@ -2056,19 +2095,22 @@ async function resumeConv(convId) {
   }
 }
 
-async function eaUpdate() {
-  function showToast(msg, isError) {
+async function eaUpdate(force) {
+  function showToast(msg, isError, onClick) {
     const toast = document.createElement('div');
     toast.textContent = msg;
-    toast.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:' + (isError ? 'var(--danger)' : 'var(--text)') + ';color:var(--card);padding:8px 16px;border-radius:8px;font-size:0.85rem;z-index:2000;box-shadow:var(--shadow-lg);opacity:0;transition:opacity .15s';
+    toast.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:' + (isError ? 'var(--danger)' : 'var(--text)') + ';color:var(--card);padding:8px 16px;border-radius:8px;font-size:0.85rem;z-index:2000;box-shadow:var(--shadow-lg);opacity:0;transition:opacity .15s' + (onClick ? ';cursor:pointer' : '');
+    if (onClick) toast.addEventListener('click', () => { toast.remove(); onClick(); });
     document.body.appendChild(toast);
     requestAnimationFrame(() => { toast.style.opacity = '1'; });
     setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 150); }, 2000);
   }
   try {
-    const res = await fetch('/api/ea-update', { method: 'POST' });
+    const res = await fetch('/api/ea-update', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({force: !!force}) });
     const data = await res.json();
-    if (res.ok) {
+    if (res.ok && data.status === 'already_running') {
+      showToast('Already running — click to restart', false, () => eaUpdate(true));
+    } else if (res.ok) {
       showToast('EA update started in tmux', false);
     } else {
       showToast(data.error || 'Failed to start EA update', true);
@@ -2078,21 +2120,30 @@ async function eaUpdate() {
   }
 }
 
-async function eaUpdateItem(id) {
+async function eaUpdateItem(id, force) {
+  function showToast(msg, isError, onClick) {
+    const toast = document.createElement('div');
+    toast.textContent = msg;
+    toast.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:' + (isError ? 'var(--danger)' : 'var(--text)') + ';color:var(--card);padding:8px 16px;border-radius:8px;font-size:0.85rem;z-index:2000;box-shadow:var(--shadow-lg);opacity:0;transition:opacity .15s' + (onClick ? ';cursor:pointer' : '');
+    if (onClick) toast.addEventListener('click', () => { toast.remove(); onClick(); });
+    document.body.appendChild(toast);
+    requestAnimationFrame(() => { toast.style.opacity = '1'; });
+    setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 150); }, 2000);
+  }
   try {
     const res = await fetch('/api/ea-update-item', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({id})
+      body: JSON.stringify({id, force: !!force})
     });
     const data = await res.json();
-    const toast = document.createElement('div');
-    const ok = res.ok;
-    toast.textContent = ok ? `Updating ${id} in tmux` : (data.error || 'Failed');
-    toast.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:' + (ok ? 'var(--text)' : 'var(--danger)') + ';color:var(--card);padding:8px 16px;border-radius:8px;font-size:0.85rem;z-index:2000;box-shadow:var(--shadow-lg);opacity:0;transition:opacity .15s';
-    document.body.appendChild(toast);
-    requestAnimationFrame(() => { toast.style.opacity = '1'; });
-    setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 150); }, 2000);
+    if (res.ok && data.status === 'already_running') {
+      showToast('Already running — click to restart', false, () => eaUpdateItem(id, true));
+    } else if (res.ok) {
+      showToast(`Checking on ${id} in tmux`, false);
+    } else {
+      showToast(data.error || 'Failed', true);
+    }
   } catch (e) {
     // silent
   }
@@ -3321,6 +3372,29 @@ async function saveSectionRename(oldName, newName) {
 
 loadTodos();
 startPolling();
+
+// Fade section headers and items behind them as they get covered by the next sticky header
+window.addEventListener('scroll', () => {
+  const offset = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--section-offset')) || 0;
+  const headers = [...document.querySelectorAll('.section-header-row')];
+  for (let i = 0; i < headers.length; i++) {
+    const h = headers[i];
+    const rect = h.getBoundingClientRect();
+    const isStuck = rect.top <= offset + 1;
+    if (!isStuck) { h.style.opacity = ''; continue; }
+    const next = headers[i + 1];
+    if (!next) { h.style.opacity = ''; continue; }
+    const nextTop = next.getBoundingClientRect().top;
+    const dist = nextTop - offset;
+    const hh = h.offsetHeight;
+    const fadeZone = hh * 1.5;
+    let fade;
+    if (dist <= 0) fade = '0';
+    else if (dist < fadeZone) fade = (dist / fadeZone).toFixed(2);
+    else fade = '';
+    h.style.opacity = fade;
+  }
+}, { passive: true });
 </script>
 
 </body>
