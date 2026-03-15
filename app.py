@@ -2746,21 +2746,31 @@ function _startTermResize(e) {
   const panel = document.getElementById('terminal-panel');
   const startY = e.clientY;
   const startH = panel.offsetHeight;
-  function onMove(e) {
-    const h = Math.min(window.innerHeight * 0.9, Math.max(150, startH - (e.clientY - startY)));
-    panel.style.height = h + 'px';
-  }
-  function onUp() {
-    document.removeEventListener('mousemove', onMove);
-    document.removeEventListener('mouseup', onUp);
-    if (_activeTermTodoId && _termSessions[_activeTermTodoId]) {
+  let _dragFitTimer = null;
+  const fitDuringDrag = () => {
+    if (_dragFitTimer) return;
+    _dragFitTimer = setTimeout(() => {
+      _dragFitTimer = null;
+      if (!_activeTermTodoId || !_termSessions[_activeTermTodoId]) return;
       const s = _termSessions[_activeTermTodoId];
+      if (!s.fitAddon) return;
       s.fitAddon.fit();
       if (s.ws && s.ws.readyState === WebSocket.OPEN) {
         const dims = s.fitAddon.proposeDimensions();
         if (dims) s.ws.send(JSON.stringify({ type: 'resize', rows: dims.rows, cols: dims.cols }));
       }
-    }
+    }, 50);
+  };
+  function onMove(e) {
+    const h = Math.min(window.innerHeight * 0.9, Math.max(150, startH - (e.clientY - startY)));
+    panel.style.height = h + 'px';
+    fitDuringDrag();
+  }
+  function onUp() {
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup', onUp);
+    if (_dragFitTimer) { clearTimeout(_dragFitTimer); _dragFitTimer = null; }
+    fitDuringDrag();
   }
   document.addEventListener('mousemove', onMove);
   document.addEventListener('mouseup', onUp);
