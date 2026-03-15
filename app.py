@@ -2420,20 +2420,12 @@ function navigateSection(direction) {
   const range = sectionRanges[rangeIdx];
 
   if (direction === 'down') {
-    if (selectedIdx < range.end) {
-      // Snap to last in section
-      selectedIdx = range.end;
-    } else if (rangeIdx + 1 < sectionRanges.length) {
-      // Jump to first of next section
+    if (rangeIdx + 1 < sectionRanges.length) {
       selectedIdx = sectionRanges[rangeIdx + 1].start;
     }
   } else {
-    if (selectedIdx > range.start) {
-      // Snap to first in section
-      selectedIdx = range.start;
-    } else if (rangeIdx - 1 >= 0) {
-      // Jump to last of previous section
-      selectedIdx = sectionRanges[rangeIdx - 1].end;
+    if (rangeIdx - 1 >= 0) {
+      selectedIdx = sectionRanges[rangeIdx - 1].start;
     }
   }
   applySelection();
