@@ -39,8 +39,9 @@ _undo_stack: deque[tuple[list[dict], list[dict]]] = deque(maxlen=30)
 
 # job_id -> {id, label, job_key, status, output_lines, proc, created_at}
 _jobs: dict[str, dict] = {}
-# session_id -> {id, todo_id, title, pid, master_fd, proc, alive, created_at, needs_auto_send}
+# session_id -> {id, todo_id, title, tmux_target, alive, created_at, needs_auto_send, resume_id}
 _pty_sessions: dict[str, dict] = {}
+TMUX_SESSION = "todo-app"
 
 
 def _completed_file_path(path: str) -> str:
@@ -741,6 +742,60 @@ def _pty_set_winsize(fd: int, rows: int, cols: int) -> None:
         pass
 
 
+def _tmux_bin():
+    return shutil.which("tmux") or "/opt/homebrew/bin/tmux"
+
+
+def _tmux_ensure_session():
+    """Ensure the todo-app tmux session exists."""
+    tmux = _tmux_bin()
+    result = subprocess.run([tmux, "has-session", "-t", TMUX_SESSION],
+                            capture_output=True)
+    if result.returncode != 0:
+        subprocess.run([tmux, "new-session", "-d", "-s", TMUX_SESSION],
+                       capture_output=True)
+
+
+def _tmux_window_exists(target: str) -> bool:
+    """Check if a tmux window/target exists."""
+    tmux = _tmux_bin()
+    result = subprocess.run([tmux, "has-session", "-t", target],
+                            capture_output=True)
+    return result.returncode == 0
+
+
+def _tmux_list_windows() -> list[str]:
+    """List window names in the todo-app tmux session."""
+    tmux = _tmux_bin()
+    result = subprocess.run(
+        [tmux, "list-windows", "-t", TMUX_SESSION, "-F", "#{window_name}"],
+        capture_output=True, text=True)
+    if result.returncode != 0:
+        return []
+    return [w.strip() for w in result.stdout.strip().splitlines() if w.strip()]
+
+
+def _tmux_recover_sessions():
+    """On startup, recover existing tmux windows into _pty_sessions."""
+    for wname in _tmux_list_windows():
+        if not wname.startswith("t-"):
+            continue
+        session_id = wname[2:]
+        if session_id in _pty_sessions:
+            continue
+        _pty_sessions[session_id] = {
+            "id": session_id,
+            "todo_id": None,  # unknown after restart
+            "title": f"Recovered: {session_id}",
+            "tmux_target": f"{TMUX_SESSION}:{wname}",
+            "alive": True,
+            "needs_auto_send": False,
+            "resume_id": None,
+            "created_at": time.time(),
+        }
+    print(f"[terminal] Recovered {len(_pty_sessions)} tmux sessions", flush=True)
+
+
 def _get_user_shell_env():
     """Get the full user login shell environment (needed under launchctl)."""
     try:
@@ -815,7 +870,7 @@ def start_in_tmux(todo_id):
 
 @app.route("/api/todos/<todo_id>/terminal", methods=["POST"])
 def open_terminal(todo_id):
-    """Register a terminal session for a todo. Returns existing if alive."""
+    """Create a tmux-backed terminal session for a todo. Returns existing if alive."""
     data = request.json or {}
     resume_id = data.get("resume_id")
 
@@ -830,25 +885,65 @@ def open_terminal(todo_id):
     if not todo:
         return jsonify({"error": "Todo not found"}), 404
 
+    claude_bin, env = _resolve_claude_bin()
+    if not claude_bin:
+        return jsonify({"error": "claude binary not found"}), 500
+
     session_id = str(uuid.uuid4())[:8]
+    tmux_target = f"{TMUX_SESSION}:t-{session_id}"
+    todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
+
+    # Create tmux window running claude
+    _tmux_ensure_session()
+    tmux = _tmux_bin()
+    cmd_parts = [claude_bin, "--dangerously-skip-permissions"]
+    if resume_id:
+        cmd_parts.extend(["--resume", resume_id])
+    shell_cmd = f"cd {todo_dir} && {' '.join(cmd_parts)}"
+
+    # Set env vars in tmux before creating window
+    for k, v in env.items():
+        subprocess.run([tmux, "set-environment", "-t", TMUX_SESSION, k, v],
+                       capture_output=True)
+
+    subprocess.run(
+        [tmux, "new-window", "-t", f"{TMUX_SESSION}:", "-n", f"t-{session_id}", shell_cmd],
+        capture_output=True, check=True,
+    )
+
     _pty_sessions[session_id] = {
         "id": session_id,
         "todo_id": todo_id,
         "title": todo.get("title", todo_id),
-        "pid": None,
-        "master_fd": None,
-        "proc": None,
-        "alive": False,
+        "tmux_target": tmux_target,
+        "alive": True,
         "needs_auto_send": not resume_id,
         "resume_id": resume_id,
         "created_at": time.time(),
     }
+
+    # Auto-send /ea workon via tmux send-keys
+    if not resume_id:
+        def _auto_send():
+            time.sleep(1.5)
+            if _pty_sessions.get(session_id, {}).get("alive"):
+                subprocess.run(
+                    [tmux, "send-keys", "-t", tmux_target, f"/ea workon {todo_id}", "Enter"],
+                    capture_output=True,
+                )
+        threading.Thread(target=_auto_send, daemon=True).start()
+
     return jsonify({"session_id": session_id, "title": todo.get("title", todo_id), "existing": False})
 
 
 @app.route("/api/terminal/sessions")
 def list_terminal_sessions():
-    """List active PTY sessions."""
+    """List terminal sessions, syncing alive state with tmux."""
+    live_windows = set(_tmux_list_windows())
+    # Sync alive state with tmux reality
+    for s in _pty_sessions.values():
+        wname = f"t-{s['id']}"
+        s["alive"] = wname in live_windows
     # Purge dead sessions older than 5 min
     cutoff = time.time() - 300
     stale = [sid for sid, s in _pty_sessions.items()
@@ -864,100 +959,59 @@ def list_terminal_sessions():
 
 @app.route("/api/terminal/<session_id>/kill", methods=["POST"])
 def kill_terminal(session_id):
-    """Kill a terminal session's process."""
+    """Kill a terminal session by destroying its tmux window."""
     session = _pty_sessions.get(session_id)
     if not session:
         return jsonify({"error": "not found"}), 404
     session["alive"] = False
-    if session.get("master_fd") is not None:
-        try:
-            os.close(session["master_fd"])
-        except OSError:
-            pass
-        session["master_fd"] = None
-    if session.get("proc"):
-        _kill_process_tree(session["proc"].pid)
-        try:
-            session["proc"].wait(timeout=2)
-        except Exception:
-            pass
+    tmux_target = session.get("tmux_target", f"{TMUX_SESSION}:t-{session_id}")
+    subprocess.run([_tmux_bin(), "kill-window", "-t", tmux_target], capture_output=True)
     return jsonify({"ok": True})
 
 
 @sock.route("/api/terminal/<session_id>/ws")
 def terminal_ws(ws, session_id):
-    """WebSocket handler bridging browser ↔ PTY for an interactive Claude session."""
+    """WebSocket handler: attach to tmux window via PTY, bridge to browser."""
     session = _pty_sessions.get(session_id)
     if not session:
         ws.close()
         return
 
-    # If session already has a live PTY, reconnect to it
-    if session["alive"] and session.get("master_fd") is not None:
-        _terminal_io_loop(ws, session)
-        return
+    tmux_target = session.get("tmux_target", f"{TMUX_SESSION}:t-{session_id}")
 
-    todo_id = session["todo_id"]
-    todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
-
-    claude_bin, env = _resolve_claude_bin()
-    if not claude_bin:
-        ws.send(json.dumps({"type": "error", "msg": "claude binary not found"}))
+    # Verify tmux window still exists
+    if not _tmux_window_exists(tmux_target):
+        ws.send(json.dumps({"type": "error", "msg": "tmux session not found"}))
         ws.close()
+        session["alive"] = False
         return
 
-    # Create PTY and spawn claude
+    # Create a PTY and spawn `tmux attach` into it
     master_fd, slave_fd = pty.openpty()
     _pty_set_winsize(master_fd, 24, 80)
 
-    env["TERM"] = "xterm-256color"
-    # Ensure ~/.local/bin is in PATH (launchctl has minimal PATH)
-    local_bin = os.path.expanduser("~/.local/bin")
-    if local_bin not in env.get("PATH", ""):
-        env["PATH"] = local_bin + ":" + env.get("PATH", os.defpath)
-    cmd = [claude_bin, "--dangerously-skip-permissions"]
-    if session.get("resume_id"):
-        cmd.extend(["--resume", session["resume_id"]])
-    print(f"[terminal] Spawning: {' '.join(cmd)} in {todo_dir}", flush=True)
+    tmux = _tmux_bin()
+    print(f"[terminal] Attaching to {tmux_target}", flush=True)
     proc = subprocess.Popen(
-        cmd,
+        [tmux, "attach-session", "-t", tmux_target],
         stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
-        cwd=todo_dir, env=env, start_new_session=True, close_fds=True,
+        start_new_session=True, close_fds=True,
     )
     os.close(slave_fd)
 
-    session["pid"] = proc.pid
-    session["master_fd"] = master_fd
-    session["proc"] = proc
-    session["alive"] = True
-    print(f"[terminal] PTY spawned pid={proc.pid} master_fd={master_fd}", flush=True)
-
-    # Auto-send /ea workon command after claude starts up
-    if session["needs_auto_send"]:
-        session["needs_auto_send"] = False
-        def _auto_send():
-            time.sleep(1.5)
-            if session["alive"]:
-                try:
-                    os.write(master_fd, f"/ea workon {todo_id}\r".encode())
-                except OSError:
-                    pass
-        threading.Thread(target=_auto_send, daemon=True).start()
-
-    _terminal_io_loop(ws, session)
+    # Bridge PTY ↔ WS (transient per connection — session persists in tmux)
+    _terminal_io_loop(ws, master_fd, proc)
 
 
-def _terminal_io_loop(ws, session):
+def _terminal_io_loop(ws, master_fd, proc):
     """Bridge PTY master fd ↔ WebSocket in a single-threaded poll loop."""
-    master_fd = session["master_fd"]
-
     # Make master_fd non-blocking so we can poll it alongside WS
     flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
     fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
-    print(f"[terminal] IO loop starting for {session['id']}", flush=True)
+    print(f"[terminal] IO loop starting (pid={proc.pid})", flush=True)
     try:
-        while session["alive"]:
+        while proc.poll() is None:
             # 1. Read any available PTY output and forward to WS
             try:
                 r, _, _ = _select.select([master_fd], [], [], 0)
@@ -966,10 +1020,8 @@ def _terminal_io_loop(ws, session):
                     if data:
                         ws.send(data)
                     else:
-                        print(f"[terminal] PTY EOF for {session['id']}", flush=True)
                         break
             except OSError:
-                print(f"[terminal] PTY read error for {session['id']}", flush=True)
                 break
 
             # 2. Check for WS input (short timeout to keep loop responsive)
@@ -999,10 +1051,12 @@ def _terminal_io_loop(ws, session):
                 except (json.JSONDecodeError, ValueError, OSError):
                     pass
     finally:
-        session["alive"] = False
-        proc = session.get("proc")
-        rc = proc.poll() if proc else None
-        print(f"[terminal] IO loop exited for {session['id']} (proc rc={rc})", flush=True)
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+        proc.wait()
+        print(f"[terminal] IO loop exited (rc={proc.returncode})", flush=True)
 
 
 @app.route("/api/ea-update", methods=["POST"])
@@ -1746,7 +1800,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <tr><td><kbd>n</kbd></td><td>New todo</td></tr>
       <tr><td><kbd>e</kbd></td><td>Edit selected</td></tr>
       <tr><td><kbd>Space</kbd></td><td>Toggle complete</td></tr>
-      <tr><td><kbd>s</kbd></td><td>Start in tmux</td></tr>
+      <tr><td><kbd>s</kbd></td><td>Open terminal</td></tr>
       <tr><td><kbd>c</kbd></td><td>Copy ID</td></tr>
       <tr><td><kbd>t</kbd></td><td>Bring to top</td></tr>
       <tr><td><kbd>&#8984;&#9003;</kbd></td><td>Delete</td></tr>
@@ -1787,6 +1841,7 @@ let visibleIds = []; // ordered list of todo ids as rendered
 let sectionsOrder = []; // ordered list of section names as rendered
 let addFormVisible = false;
 let simpleMode = true; // hide all descriptions
+let filterActiveSessions = false; // only show items with active terminal sessions
 let previewMode = false; // auto-expand selected item
 let previewExpandedId = null; // item currently auto-expanded by preview
 const toggledItems = new Set(); // per-item overrides that flip from mode default
@@ -1862,8 +1917,12 @@ function render() {
       return !hidePriorities.has(p);
     });
   };
-  const filteredActive = afterPriority(afterSearch(active));
-  const filteredCompleted = afterPriority(afterSearch(completed));
+  const afterSessions = f => {
+    if (!filterActiveSessions) return f;
+    return f.filter(t => _termSessions[t.id] && _termSessions[t.id].alive);
+  };
+  const filteredActive = afterSessions(afterPriority(afterSearch(active)));
+  const filteredCompleted = afterSessions(afterPriority(afterSearch(completed)));
 
 
   if (filteredActive.length === 0 && filteredCompleted.length === 0) {
@@ -1932,7 +1991,8 @@ function render() {
     return `<button class="header-toggle" style="${style}" onclick="cycleFilter('${p}')" title="Filter ${p}">${label}</button>`;
   }).join('');
   const previewBtn = `<button class="header-toggle preview-toggle-btn${previewMode ? ' active' : ''}" onclick="togglePreviewMode()" title="Preview mode: auto-expand selected (v)">Preview</button>`;
-  const headerBtns = filterBtns + simpleBtn + previewBtn + eaBtn;
+  const sessionsBtn = `<button class="header-toggle${filterActiveSessions ? ' active' : ''}" onclick="toggleFilterSessions()" title="Filter by active sessions (Ctrl+S)" style="${filterActiveSessions ? '' : 'color:var(--subtle)'}">Sessions</button>`;
+  const headerBtns = filterBtns + simpleBtn + previewBtn + sessionsBtn + eaBtn;
   activeEl.innerHTML = filteredActive.length
     ? '<div class="active-header"><h2>Active (' + filteredActive.length + ')</h2>' + headerBtns + '</div>' + activeHtml
     : '<div class="active-header"><h2>Active</h2>' + headerBtns + '</div><div class="empty-state">All done! &#127881;</div>';
@@ -2053,7 +2113,7 @@ function renderTodo(t) {
       <div class="todo-title" style="flex:1;min-width:0;display:flex;align-items:center;gap:2px" onclick="event.stopPropagation();selectTodo('${t.id}');toggleItemDesc('${t.id}')">${spinner}${esc(t.title)}</div>
       <div class="todo-actions">
         ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();eaUpdateItem('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Refresh via /ea checkon" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#8635;</button>` : ''}
-        ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();startInTmux('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Start in tmux (s)" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#9654;</button>` : ''}
+        ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();startInTmux('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Open terminal (s)" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#9654;</button>` : ''}
         <button onclick="event.stopPropagation();deleteTodo('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 6px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Delete" onmouseover="this.style.color='var(--danger)'" onmouseout="this.style.color='var(--subtle)'">&#10005;</button>
       </div>
       ${priorityBadge}
@@ -2216,6 +2276,11 @@ function updateSimpleBtn() {
   const hasToggled = toggledItems.size > 0;
   btn.classList.toggle('active', simpleMode && !hasToggled);
   btn.classList.toggle('partial', hasToggled);
+}
+
+function toggleFilterSessions() {
+  filterActiveSessions = !filterActiveSessions;
+  render();
 }
 
 function toggleSimpleMode() {
@@ -3844,6 +3909,13 @@ document.addEventListener('keydown', e => {
   if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
   if (editingId) return;
 
+  // Filter sessions: Ctrl+S
+  if (e.ctrlKey && e.key === 's' && !e.metaKey && !e.shiftKey) {
+    e.preventDefault();
+    toggleFilterSessions();
+    return;
+  }
+
   // Undo: Cmd+Z / Ctrl+Z
   if ((e.metaKey || e.ctrlKey) && e.key === 'z' && !e.shiftKey) {
     e.preventDefault();
@@ -4391,6 +4463,9 @@ if __name__ == "__main__":
     if not os.path.exists(TODO_FILE):
         _write_todo_file(TODO_FILE, [])
         print(f"Created new todo file: {TODO_FILE}")
+
+    # Recover any existing tmux sessions from a previous server run
+    _tmux_recover_sessions()
 
     print(f"Serving todo UI for: {os.path.abspath(TODO_FILE)}")
     print(f"Open http://{args.host}:{args.port} in your browser")
