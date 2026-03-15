@@ -1200,6 +1200,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png">
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script type="module" src="https://cdn.jsdelivr.net/npm/ldrs/dist/auto/mirage.js"></script>
+<script type="module" src="https://cdn.jsdelivr.net/npm/ldrs/dist/auto/jellyTriangle.js"></script>
+<script type="module" src="https://cdn.jsdelivr.net/npm/ldrs/dist/auto/bouncy.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"></script>
@@ -1283,6 +1285,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: rgba(0,0,0,0.025); border: 1px solid var(--border); border-radius: 6px;
     padding: 6px 10px; margin-top: 8px; white-space: pre-wrap; word-break: break-word;
   }
+  .checkon-summary .checkon-inline-spinner { display: inline-flex; vertical-align: middle; margin-left: 4px; }
   .checkon-summary.has-content { display: block; }
   body.simple-mode .checkon-summary { display: none; }
   body.simple-mode .todo-item.item-toggled .checkon-summary.has-content { display: block; }
@@ -1687,27 +1690,27 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   /* Inline job spinner — SpinKit double bounce, morphs to ✕ on hover */
   .job-spinner {
-    display: inline-block; width: 13px; height: 13px; flex-shrink: 0;
+    display: inline-flex; align-items: center; width: 13px; height: 13px; flex-shrink: 0;
     vertical-align: middle; margin-right: 5px; position: relative; cursor: pointer;
   }
-  .job-spinner .sk-child {
-    width: 100%; height: 100%; border-radius: 50%;
-    background: var(--accent); opacity: 0.6;
-    position: absolute; top: 0; left: 0;
-    animation: sk-doubleBounce 2s infinite ease-in-out;
-    transition: opacity 0.15s;
-  }
-  .job-spinner .sk-bounce2 { animation-delay: -1s; }
-  @keyframes sk-doubleBounce { 0%, 100% { transform: scale(0); } 50% { transform: scale(1); } }
   .job-spinner::after {
     content: '✕'; position: absolute; top: 50%; left: 50%;
     transform: translate(-50%, -50%); font-size: 9px;
     color: var(--danger); opacity: 0; transition: opacity 0.15s; pointer-events: none;
   }
+  .job-spinner:hover l-jelly-triangle { opacity: 0; }
   .job-spinner:hover .sk-child { opacity: 0 !important; }
   .job-spinner:hover::after { opacity: 1; }
-  /* Terminal session indicator — reuses job-spinner with green accent */
-  .term-spinner .sk-child { background: #22c55e !important; }
+  /* Terminal session indicator */
+  .term-spinner .sk-child {
+    width: 100%; height: 100%; border-radius: 50%;
+    background: #22c55e; opacity: 0.6;
+    position: absolute; top: 0; left: 0;
+    animation: sk-doubleBounce 2s infinite ease-in-out;
+    transition: opacity 0.15s;
+  }
+  .term-spinner .sk-bounce2 { animation-delay: -1s; }
+  @keyframes sk-doubleBounce { 0%, 100% { transform: scale(0); } 50% { transform: scale(1); } }
   .term-spinner::after { content: '↑'; color: #22c55e; font-size: 11px; font-weight: 700; }
   /* Terminal overlay */
   #terminal-overlay.visible { display: flex !important; }
@@ -2087,7 +2090,7 @@ function renderTodo(t) {
 
   const activeJob = _getActiveJobForTodo(t.id);
   const isRunning = activeJob && activeJob.status === 'running';
-  const spinner = isRunning ? `<span class="job-spinner" title="Stop job" onclick="event.stopPropagation();killJob('${activeJob.id}')"><span class="sk-child"></span><span class="sk-child sk-bounce2"></span></span>` : '';
+  const spinner = isRunning ? `<span class="job-spinner" title="Stop job" onclick="event.stopPropagation();killJob('${activeJob.id}')"><l-jelly-triangle size="13" speed="1.75" color="var(--accent)"></l-jelly-triangle></span>` : '';
   const jobBubble = `<div class="checkon-bubble" id="checkon-bubble-${t.id}"></div>`;
   const jobSummary = `<div class="checkon-summary" id="checkon-summary-${t.id}"></div>`;
 
@@ -2909,9 +2912,9 @@ function _openItemStream(todoId, jobId) {
     _clientJobLines[todoId] = [];
     _clientJobSummary[todoId] = [];
     _clientJobIds[todoId] = jobId;
-    // Clear summary div
+    // Clear summary div and add spinner
     const sumEl = document.getElementById('checkon-summary-' + todoId);
-    if (sumEl) { sumEl.innerHTML = ''; sumEl.classList.remove('has-content'); }
+    if (sumEl) { sumEl.innerHTML = '<l-bouncy class="checkon-inline-spinner" size="20" speed="1.75" color="var(--accent)"></l-bouncy>'; sumEl.classList.add('has-content'); }
   }
   if (!_clientJobLines[todoId]) _clientJobLines[todoId] = [];
   if (!_clientJobSummary[todoId]) _clientJobSummary[todoId] = [];
@@ -2927,6 +2930,9 @@ function _openItemStream(todoId, jobId) {
       // Mark bubble as done so hover no longer shows it
       const bubble = document.getElementById('checkon-bubble-' + todoId);
       if (bubble) bubble.classList.add('done');
+      // Remove inline spinner from summary
+      const sumSpinner = document.querySelector('#checkon-summary-' + todoId + ' .checkon-inline-spinner');
+      if (sumSpinner) sumSpinner.remove();
       pollJobs();
       return;
     }
@@ -2952,7 +2958,9 @@ function _openItemStream(todoId, jobId) {
       const sumEl = document.getElementById('checkon-summary-' + todoId);
       if (sumEl) {
         sumEl.classList.add('has-content');
+        const spinnerEl = sumEl.querySelector('.checkon-inline-spinner');
         sumEl.textContent = _clientJobSummary[todoId].join('\n');
+        if (spinnerEl) sumEl.appendChild(spinnerEl);
       }
     }
   };
@@ -2990,7 +2998,7 @@ function _updateSpinnersInPlace() {
       if (!existingJobSpinner) {
         const s = document.createElement('span');
         s.className = 'job-spinner'; s.title = 'Stop job';
-        s.innerHTML = '<span class="sk-child"></span><span class="sk-child sk-bounce2"></span>';
+        s.innerHTML = '<l-jelly-triangle size="13" speed="1.75" color="var(--accent)"></l-jelly-triangle>';
         s.onclick = e => { e.stopPropagation(); killJob(job.id); };
         const insertBefore = titleEl.querySelector('.term-spinner') ? titleEl.querySelector('.term-spinner').nextSibling : titleEl.firstChild;
         titleEl.insertBefore(s, insertBefore);
