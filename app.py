@@ -888,7 +888,7 @@ def open_terminal(todo_id):
 
     subprocess.run(
         [tmux, "new-session", "-d", "-s", tmux_name, "-x", "80", "-y", "24",
-         "zsh", "-l", "-c", f"unset CLAUDECODE; cd {todo_dir} && {inner_cmd}"],
+         "zsh", "-lic", f"unset CLAUDECODE; cd {todo_dir} && {inner_cmd}"],
         capture_output=True, check=True,
     )
     # Let the window resize to match the latest attached client
