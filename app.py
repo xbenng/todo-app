@@ -16,6 +16,7 @@ import json
 import uuid
 import copy
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -589,18 +590,146 @@ def undo():
 
 
 def _run_claude_job(job_id: str, prompt: str, cwd: str):
-    """Thread target: run claude headless and capture streaming output."""
-    claude_bin = shutil.which("claude") or "/opt/homebrew/bin/claude"
+    """Thread target: run claude -p as a subprocess and parse stream-json output."""
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+
+    candidates = [
+        shutil.which("claude", path=env.get("PATH", os.defpath)),
+        os.path.expanduser("~/.local/bin/claude"),
+        "/opt/homebrew/bin/claude",
+        "/usr/local/bin/claude",
+    ]
+    claude_bin = next((c for c in candidates if c and os.path.isfile(c)), None)
+    if not claude_bin:
+        _jobs[job_id]["output_lines"].append("error: claude binary not found")
+        _jobs[job_id]["status"] = "error"
+        return
+
     cmd = [claude_bin, "-p", prompt, "--dangerously-skip-permissions",
-           "--output-format", "stream-json", "--verbose"]
-    proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True)
-    _jobs[job_id]["proc"] = proc
+           "--output-format", "stream-json", "--verbose",
+           "--effort", "low", "--include-partial-messages"]
     _jobs[job_id]["status"] = "running"
-    for line in proc.stdout:
-        _jobs[job_id]["output_lines"].append(line.rstrip())
-    proc.wait()
-    _jobs[job_id]["status"] = "done" if proc.returncode == 0 else "error"
+
+    def emit(line: str) -> None:
+        if line.strip():
+            _jobs[job_id]["output_lines"].append(line)
+
+    try:
+        proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, env=env,
+                                start_new_session=True)
+        _jobs[job_id]["proc"] = proc
+
+        text_buf = ""       # accumulates text_delta fragments until a newline or block end
+        got_streaming = False  # True if we receive content_block_delta events
+
+        for raw_line in proc.stdout:
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            try:
+                data = json.loads(raw_line)
+            except json.JSONDecodeError:
+                emit(raw_line[:200])
+                continue
+
+            t = data.get("type", "")
+
+            if t == "content_block_start":
+                block = data.get("content_block", {})
+                if block.get("type") == "tool_use":
+                    if text_buf.strip():
+                        emit(text_buf.strip())
+                        text_buf = ""
+                    emit(f"▶ {block.get('name', '?')}...")
+                elif block.get("type") == "text" and text_buf.strip():
+                    emit(text_buf.strip())
+                    text_buf = ""
+
+            elif t == "content_block_delta":
+                got_streaming = True
+                delta = data.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    text_buf += delta.get("text", "")
+                    while "\n" in text_buf:
+                        line, text_buf = text_buf.split("\n", 1)
+                        emit(line)
+
+            elif t == "content_block_stop":
+                if text_buf.strip():
+                    emit(text_buf.strip())
+                    text_buf = ""
+
+            elif t == "assistant" and not got_streaming:
+                # Fallback: no streaming events, parse the complete assistant message
+                parts = []
+                for block in data.get("message", {}).get("content", []):
+                    if block.get("type") == "text":
+                        text = block["text"].strip()
+                        if text:
+                            parts.append(text)
+                    elif block.get("type") == "tool_use":
+                        name = block.get("name", "?")
+                        inp = json.dumps(block.get("input", {}))[:80]
+                        parts.append(f"▶ {name}({inp})")
+                for part in parts:
+                    for line in part.splitlines():
+                        emit(line)
+
+            elif t == "result":
+                result = data.get("result", "").strip()
+                cost = data.get("cost_usd")
+                cost_str = f" — ${cost:.4f}" if cost else ""
+                emit(f"✓ Done{cost_str}" + (f": {result}" if result else ""))
+
+            # Skip: user, tool_result, system, debug, rate_limit_event
+
+        if text_buf.strip():
+            emit(text_buf.strip())
+
+        proc.wait()
+        if _jobs[job_id]["status"] != "killed":
+            _jobs[job_id]["status"] = "done" if proc.returncode == 0 else "error"
+    except Exception as exc:
+        _jobs[job_id]["output_lines"].append(f"error: {exc}")
+        _jobs[job_id]["status"] = "error"
+
+
+def _kill_process_tree(pid: int) -> None:
+    """Send SIGTERM to a process and all its descendants.
+
+    Reads the full process tree snapshot first so children that create their
+    own sessions (like claude subagents) are still caught before reparenting.
+    """
+    try:
+        result = subprocess.run(["ps", "-o", "pid,ppid", "-ax"],
+                                capture_output=True, text=True)
+        children: dict[int, list[int]] = {}
+        for line in result.stdout.strip().splitlines()[1:]:
+            parts = line.split()
+            if len(parts) >= 2:
+                p, pp = int(parts[0]), int(parts[1])
+                children.setdefault(pp, []).append(p)
+
+        # BFS from root to collect descendants
+        to_kill: list[int] = []
+        queue = [pid]
+        while queue:
+            p = queue.pop()
+            to_kill.append(p)
+            queue.extend(children.get(p, []))
+
+        # Kill leaves first so parents don't spawn replacements
+        for p in reversed(to_kill):
+            try:
+                os.kill(p, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+    except Exception:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
 
 
 def _start_claude_job(label: str, job_key: str, prompt: str, cwd: str) -> str:
@@ -730,8 +859,8 @@ def list_jobs():
     for jid in stale:
         del _jobs[jid]
     return jsonify([{
-        "id": j["id"], "label": j["label"], "status": j["status"],
-        "line_count": len(j["output_lines"]), "created_at": j["created_at"]
+        "id": j["id"], "label": j["label"], "job_key": j["job_key"],
+        "status": j["status"], "line_count": len(j["output_lines"]), "created_at": j["created_at"]
     } for j in _jobs.values()])
 
 
@@ -759,13 +888,13 @@ def stream_job(job_id):
 
 @app.route("/api/jobs/<job_id>/kill", methods=["POST"])
 def kill_job(job_id):
-    """Terminate a running job."""
+    """Cancel a running job."""
     job = _jobs.get(job_id)
     if not job:
         return jsonify({"error": "not found"}), 404
     proc = job.get("proc")
     if proc and proc.poll() is None:
-        proc.terminate()
+        _kill_process_tree(proc.pid)
     job["status"] = "killed"
     return jsonify({"ok": True})
 
@@ -838,7 +967,32 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .add-form.kb-selected { box-shadow: 0 0 0 2px var(--accent), var(--shadow-md); }
   .active-header { display: flex; align-items: center; gap: 10px; position: sticky; top: 0; z-index: 101; background: var(--bg); padding: 4px 0; }
   .active-header h2 { margin: 0; }
-  .ea-update-btn { margin-left: auto; border: 1px solid var(--border); font-size: 0.75rem; padding: 5px 10px; }
+  .ea-update-wrap { margin-left: auto; display: inline-flex; align-items: center; gap: 4px; }
+  .ea-update-btn { border: 1px solid var(--border); font-size: 0.75rem; padding: 5px 10px; min-width: 72px; display: flex; align-items: center; gap: 5px; }
+  .ea-update-btn.running { border-color: var(--accent); color: var(--accent); }
+  /* SpinKit rotating double-bounce loader for the Update button */
+  .ea-loader {
+    width: 14px; height: 14px; position: relative; flex-shrink: 0; margin-right: 4px;
+    animation: ea-sk-rotate 2s infinite linear;
+  }
+  .ea-loader .dot1, .ea-loader .dot2 {
+    width: 60%; height: 60%; display: inline-block; position: absolute;
+    top: 0; background-color: var(--accent); border-radius: 100%;
+    animation: ea-sk-bounce 2s infinite ease-in-out;
+    transition: background-color 0.15s;
+  }
+  .ea-loader .dot2 { top: auto; bottom: 0; animation-delay: -1s; }
+  @keyframes ea-sk-rotate { 100% { transform: rotate(360deg); } }
+  @keyframes ea-sk-bounce { 0%, 100% { transform: scale(0); } 50% { transform: scale(1); } }
+  .ea-update-btn.running:hover .ea-loader .dot1,
+  .ea-update-btn.running:hover .ea-loader .dot2 { background-color: var(--danger); }
+  /* ml4-style scale transition for Update button */
+  .ea-btn-wrap { position: relative; display: inline-flex; align-items: center; justify-content: center; height: 18px; min-width: 3.5em; }
+  .ea-lbl, .ea-running { position: absolute; inset: 0; white-space: nowrap; display: flex; align-items: center; justify-content: center; gap: 5px; transform-origin: center; }
+  @keyframes ea-btn-scale-in { from { opacity: 0; transform: scale(0.2); } to { opacity: 1; transform: scale(1); } }
+  @keyframes ea-btn-scale-out { from { opacity: 1; transform: scale(1); } to { opacity: 0; transform: scale(3); } }
+  .ea-lbl.anim-in, .ea-running.anim-in { animation: ea-btn-scale-in 350ms ease forwards; }
+  .ea-lbl.anim-out, .ea-running.anim-out { animation: ea-btn-scale-out 250ms cubic-bezier(0.95,0.05,0.795,0.035) forwards; }
   .header-toggle {
     font-size: 0.7rem; padding: 3px 8px; border-radius: 12px;
     border: 1px solid var(--border); background: var(--card); color: var(--subtle);
@@ -891,17 +1045,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .section-header-row {
     top: var(--section-offset, 0px);
   }
-  .add-form input, .add-form textarea, .add-form select {
+  .add-form input, .add-form textarea {
     width: 100%; padding: 10px 14px; border: 1px solid var(--border); border-radius: 8px;
     font-size: 1rem; font-family: inherit; margin-bottom: 10px;
     background: var(--bg); transition: border-color 0.15s, box-shadow 0.15s; color: var(--text);
   }
-  .add-form input:focus, .add-form textarea:focus, .add-form select:focus {
+  .add-form input:focus, .add-form textarea:focus {
     outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-light);
   }
   .add-form textarea { resize: vertical; min-height: 56px; }
   .add-form .row { display: flex; gap: 8px; align-items: center; }
-  .add-form .row select { width: auto; margin-bottom: 0; }
   .btn {
     padding: 9px 18px; border: none; border-radius: 8px; font-size: 0.9rem;
     font-weight: 600; cursor: pointer; transition: all 0.15s; letter-spacing: -0.01em;
@@ -923,7 +1076,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     position: relative; overflow: hidden;
   }
   .todo-header {
-    display: flex; align-items: flex-start; gap: 12px; width: 100%;
+    display: flex; align-items: center; gap: 12px; width: 100%;
   }
   .todo-item:hover { box-shadow: var(--shadow-md); transform: translateY(-1px); }
   .todo-item.status-completed {
@@ -1196,50 +1349,37 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .snap-back .swipe-content { transition: transform 0.25s cubic-bezier(0.2,0.8,0.4,1); transform: translateX(0) !important; }
   .snap-complete .swipe-content { transition: transform 0.2s ease-in; }
 
-  /* Jobs panel */
-  .jobs-panel {
-    position: fixed; bottom: 0; right: 24px; width: 380px;
-    max-height: 60vh; background: var(--card); border: 1px solid var(--border);
-    border-bottom: none; border-radius: var(--radius-lg) var(--radius-lg) 0 0;
-    box-shadow: var(--shadow-lg); z-index: 1000;
-    display: flex; flex-direction: column;
-    animation: slideUp 0.2s ease-out;
+  /* Inline job spinner — SpinKit double bounce, morphs to ✕ on hover */
+  .job-spinner {
+    display: inline-block; width: 13px; height: 13px; flex-shrink: 0;
+    vertical-align: middle; margin-right: 5px; position: relative; cursor: pointer;
   }
-  @keyframes slideUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
-  .jobs-header {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 10px 14px; border-bottom: 1px solid var(--border);
-    font-size: 0.85rem; font-weight: 600; flex-shrink: 0;
+  .job-spinner .sk-child {
+    width: 100%; height: 100%; border-radius: 50%;
+    background: var(--accent); opacity: 0.6;
+    position: absolute; top: 0; left: 0;
+    animation: sk-doubleBounce 2s infinite ease-in-out;
+    transition: opacity 0.15s;
   }
-  .jobs-header button { background: none; border: none; cursor: pointer; font-size: 1rem; color: var(--muted); padding: 0 4px; }
-  .jobs-header button:hover { color: var(--text); }
-  #jobs-list { overflow-y: auto; flex: 1; }
-  .job-item {
-    padding: 8px 14px; border-bottom: 1px solid var(--border);
-    cursor: pointer; transition: background 0.1s;
+  .job-spinner .sk-bounce2 { animation-delay: -1s; }
+  @keyframes sk-doubleBounce { 0%, 100% { transform: scale(0); } 50% { transform: scale(1); } }
+  .job-spinner::after {
+    content: '✕'; position: absolute; top: 50%; left: 50%;
+    transform: translate(-50%, -50%); font-size: 9px;
+    color: var(--danger); opacity: 0; transition: opacity 0.15s; pointer-events: none;
   }
-  .job-item:last-child { border-bottom: none; }
-  .job-item:hover { background: var(--bg); }
-  .job-item.expanded { background: var(--bg); }
-  .job-row { display: flex; align-items: center; gap: 8px; }
-  .job-icon { font-size: 0.9rem; flex-shrink: 0; }
-  .job-label { flex: 1; font-size: 0.82rem; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .job-kill { font-size: 0.7rem; padding: 2px 6px; border-radius: 4px; border: 1px solid var(--border); background: none; color: var(--muted); cursor: pointer; flex-shrink: 0; }
-  .job-kill:hover { background: var(--danger); color: #fff; border-color: var(--danger); }
-  .job-output {
-    font-family: monospace; font-size: 0.72rem; line-height: 1.5;
-    overflow-y: auto; max-height: 200px; margin-top: 6px;
-    background: rgba(0,0,0,0.02); border-radius: 6px;
-    padding: 6px 8px; color: var(--muted); white-space: pre-wrap; word-break: break-all;
+  .job-spinner:hover .sk-child { opacity: 0 !important; }
+  .job-spinner:hover::after { opacity: 1; }
+  /* Inline job output — only visible when item is expanded */
+  .item-job-output {
+    display: none; font-family: monospace; font-size: 0.72rem; line-height: 1.5;
+    color: var(--muted); white-space: pre-wrap; word-break: break-all;
+    background: rgba(0,0,0,0.025); border-radius: 6px;
+    padding: 6px 10px; margin-top: 8px; max-height: 200px; overflow-y: auto;
+    border: 1px solid var(--border);
   }
+  .todo-item.item-toggled .item-job-output { display: block; }
   .job-done-line { color: var(--accent); font-weight: 600; }
-  .jobs-badge {
-    display: inline-flex; align-items: center; justify-content: center;
-    background: var(--danger); color: #fff; border-radius: 99px;
-    font-size: 0.65rem; font-weight: 700; min-width: 16px; height: 16px;
-    padding: 0 4px; margin-left: 4px; vertical-align: middle;
-  }
-  .jobs-btn { position: relative; }
 </style>
 </head>
 <body class="simple-mode">
@@ -1259,20 +1399,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </div>
 
 <div class="add-form" id="add-form">
-  <input type="text" id="new-title" placeholder="What needs to be done?">
+  <input class="edit-title" type="text" id="new-title" placeholder="What needs to be done?">
   <textarea id="new-desc" placeholder="Description (optional)"></textarea>
-  <select id="new-section" style="font-size:0.85rem; width:100%; margin-bottom:8px;">
+  <select class="edit-select" id="new-section">
     <option value="">No section</option>
   </select>
-  <input type="text" id="new-section-custom" placeholder="New section name" style="font-size:0.85rem; display:none;">
+  <input class="edit-title" type="text" id="new-section-custom" placeholder="New section name" style="display:none;">
   <div class="row">
-    <select id="new-priority">
+    <select class="edit-select" id="new-priority" style="width:auto;margin-bottom:0">
       <option value="high">High</option>
       <option value="medium" selected>Medium</option>
       <option value="low">Low</option>
       <option value="none">None</option>
     </select>
-    <button class="btn btn-primary" onclick="addTodo()">Add Todo</button>
+    <button class="btn btn-primary btn-sm" onclick="addTodo()">Add Todo</button>
     <button class="btn btn-sm" onclick="hideAddForm()" style="border:1px solid var(--border)">Cancel <span style="opacity:0.6;font-weight:400">Esc</span></button>
   </div>
 </div>
@@ -1469,10 +1609,7 @@ function render() {
   // visibleIds includes todo IDs + section markers for collapsed sections
   visibleIds = [...visibleActiveIds, ...filteredCompleted.map(t => t.id)];
 
-  const eaBtn = '<button class="btn btn-sm ea-update-btn" onclick="eaUpdate()" title="Run /ea update">Update</button>';
-  const runningCount = Object.values(_jobsState || {}).filter(j => j.status === 'running').length;
-  const badge = runningCount > 0 ? `<span class="jobs-badge">${runningCount}</span>` : '';
-  const jobsBtn = `<button class="btn btn-sm jobs-btn" onclick="toggleJobsPanel()" title="View Claude jobs" style="border:1px solid var(--border);margin-left:4px">Jobs${badge}</button>`;
+  const eaBtn = '<div class="ea-update-wrap"><button id="ea-update-btn" class="btn btn-sm ea-update-btn" onclick="eaUpdateToggle()" title="Run /ea update"><span class="ea-btn-wrap"><span id="ea-update-label" class="ea-lbl" style="opacity:1">Update</span><span id="ea-update-running" class="ea-running" style="opacity:0"><span id="ea-update-spinner" class="ea-loader"><span class="dot1"></span><span class="dot2"></span></span><span id="ea-update-timer">0:00</span></span></span></button></div>';
   const simpleCls = simpleMode ? (toggledItems.size > 0 ? ' partial' : ' active') : (toggledItems.size > 0 ? ' partial' : '');
   const simpleBtn = `<button class="header-toggle simple-toggle-btn${simpleCls}" onclick="toggleSimpleMode()" title="Toggle simple mode (a)">Simple</button>`;
   const pColors = {high:'#b91c1c',medium:'#a16207',low:'#15803d',none:'#9ca3af'};
@@ -1489,7 +1626,7 @@ function render() {
     return `<button class="header-toggle" style="${style}" onclick="cycleFilter('${p}')" title="Filter ${p}">${label}</button>`;
   }).join('');
   const previewBtn = `<button class="header-toggle preview-toggle-btn${previewMode ? ' active' : ''}" onclick="togglePreviewMode()" title="Preview mode: auto-expand selected (v)">Preview</button>`;
-  const headerBtns = filterBtns + simpleBtn + previewBtn + eaBtn + jobsBtn;
+  const headerBtns = filterBtns + simpleBtn + previewBtn + eaBtn;
   activeEl.innerHTML = filteredActive.length
     ? '<div class="active-header"><h2>Active (' + filteredActive.length + ')</h2>' + headerBtns + '</div>' + activeHtml
     : '<div class="active-header"><h2>Active</h2>' + headerBtns + '</div><div class="empty-state">All done! &#127881;</div>';
@@ -1535,6 +1672,7 @@ function render() {
   document.documentElement.style.setProperty('--section-offset', (searchH + activeH) + 'px');
 
   applySelection();
+  _restoreJobOutputs();
 }
 
 function _restoreInlineForm(form, title, desc, priority, section, sectionCustom) {
@@ -1591,6 +1729,11 @@ function renderTodo(t) {
   const desc = descHtml ? `<div class="todo-desc">${descHtml}</div>` : '';
   const priorityBadge = `<span class="priority-badge priority-${t.priority || 'medium'}">${t.priority || 'medium'}</span>`;
 
+  const activeJob = _getActiveJobForTodo(t.id);
+  const isRunning = activeJob && activeJob.status === 'running';
+  const spinner = isRunning ? `<span class="job-spinner" title="Stop job" onclick="event.stopPropagation();killJob('${activeJob.id}')"><span class="sk-child"></span><span class="sk-child sk-bounce2"></span></span>` : '';
+  const jobOutputDiv = activeJob ? `<div class="item-job-output" id="job-out-${t.id}"></div>` : '';
+
   const draggable = t.status !== 'completed' ? 'draggable="true"' : '';
   const itemToggled = toggledItems.has(t.id) ? ' item-toggled' : '';
   const isCompleted = t.status === 'completed';
@@ -1600,7 +1743,7 @@ function renderTodo(t) {
     <div class="${swipeRevealClass}"><span class="swipe-reveal-icon">${swipeIcon}</span></div>
     <div class="swipe-content">
     <div class="todo-header">
-      <div class="todo-title" style="flex:1;min-width:0" onclick="event.stopPropagation();selectTodo('${t.id}');toggleItemDesc('${t.id}')">${esc(t.title)}</div>
+      <div class="todo-title" style="flex:1;min-width:0;display:flex;align-items:center;gap:2px" onclick="event.stopPropagation();selectTodo('${t.id}');toggleItemDesc('${t.id}')">${spinner}${esc(t.title)}</div>
       ${priorityBadge}
       <div class="todo-actions">
         ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();eaUpdateItem('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Refresh via /ea checkon" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#8635;</button>` : ''}
@@ -1609,7 +1752,7 @@ function renderTodo(t) {
         <button onclick="event.stopPropagation();deleteTodo('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 6px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Delete" onmouseover="this.style.color='var(--danger)'" onmouseout="this.style.color='var(--subtle)'">&#10005;</button>
       </div>
     </div>
-    ${desc}
+    ${desc}${jobOutputDiv}
     </div>
   </div>`;
 }
@@ -2062,8 +2205,7 @@ async function startInTmux(id) {
     const data = await res.json();
     if (res.ok) {
       showToast('Started: ' + title, false);
-      openJobsPanel();
-      if (data.job_id) expandJob(data.job_id);
+      if (data.job_id) { await pollJobs(); _openItemStream(id, data.job_id); }
     } else {
       showToast(data.error || 'Failed to start', true);
     }
@@ -2097,18 +2239,28 @@ async function resumeConv(convId) {
   }
 }
 
+async function eaUpdateToggle() {
+  const isRunning = Object.values(_jobsState).some(
+    j => j.job_key === 'ea-update' && (j.status === 'running' || j.status === 'pending')
+  );
+  if (isRunning) await cancelEaUpdate(); else await eaUpdate();
+}
+
 async function eaUpdate(force) {
   try {
     const res = await fetch('/api/ea-update', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({force: !!force}) });
     const data = await res.json();
     if (res.ok && data.status === 'already_running') {
       showToast('Already running — click to restart', false, () => eaUpdate(true));
-      openJobsPanel();
-      if (data.job_id) expandJob(data.job_id);
     } else if (res.ok) {
       showToast('EA update started', false);
-      openJobsPanel();
-      if (data.job_id) expandJob(data.job_id);
+      if (data.job_id) {
+        // Animate immediately — don't wait for pollJobs round trip
+        if (!_eaWasRunning) { _eaWasRunning = true; _transitionEaBtn(true); }
+        const btn = document.getElementById('ea-update-btn');
+        if (btn) btn.classList.add('running');
+        pollJobs();
+      }
     } else {
       showToast(data.error || 'Failed to start EA update', true);
     }
@@ -2127,12 +2279,9 @@ async function eaUpdateItem(id, force) {
     const data = await res.json();
     if (res.ok && data.status === 'already_running') {
       showToast('Already running — click to restart', false, () => eaUpdateItem(id, true));
-      openJobsPanel();
-      if (data.job_id) expandJob(data.job_id);
     } else if (res.ok) {
       showToast(`Checking ${id}...`, false);
-      openJobsPanel();
-      if (data.job_id) expandJob(data.job_id);
+      if (data.job_id) { await pollJobs(); _openItemStream(id, data.job_id); }
     } else {
       showToast(data.error || 'Failed', true);
     }
@@ -2152,110 +2301,125 @@ function showToast(msg, isError, onClick) {
   setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 150); }, 2000);
 }
 
-// ---- Jobs panel ----
-let _jobsOpen = false;
+// ---- Inline job streaming ----
 let _jobsPollTimer = null;
-let _jobsStreamSource = null;
-let _expandedJobId = null;
-let _jobsState = {};
+let _jobsState = {};          // jobId -> job metadata (from server)
+let _clientJobLines = {};     // todoId -> string[] of parsed display lines
+let _clientJobIds = {};       // todoId -> jobId that populated _clientJobLines
+let _itemStreamSources = {};  // todoId -> EventSource
+let _eaUpdateTimerInterval = null;
+let _eaWasRunning = false;
+let _eaTransitionTimer = null;
 
-function openJobsPanel() {
-  _jobsOpen = true;
-  document.getElementById('jobs-panel').style.display = 'flex';
-  pollJobs();
+function _todoIdForJob(job) {
+  if (!job || !job.job_key) return null;
+  const key = job.job_key;
+  if (key.startsWith('workon-')) return key.slice(7);
+  if (key.startsWith('ea-') && key !== 'ea-update') return key.slice(3);
+  return null;
 }
 
-function toggleJobsPanel() {
-  if (_jobsOpen) {
-    _jobsOpen = false;
-    document.getElementById('jobs-panel').style.display = 'none';
-    clearTimeout(_jobsPollTimer);
-    if (_jobsStreamSource) { _jobsStreamSource.close(); _jobsStreamSource = null; }
-  } else {
-    openJobsPanel();
+function _getActiveJobForTodo(todoId) {
+  let fallback = null;
+  for (const j of Object.values(_jobsState)) {
+    if (_todoIdForJob(j) !== todoId || j.status === 'killed') continue;
+    if (j.status === 'running' || j.status === 'pending') return j;
+    if (!fallback) fallback = j;
   }
+  return fallback;
 }
 
-function parseStreamLine(raw) {
-  try {
-    const obj = JSON.parse(raw);
-    if (obj.__done__) return null; // sentinel handled elsewhere
-    if (obj.type === 'assistant' && obj.message) {
-      const texts = (obj.message.content || [])
-        .filter(b => b.type === 'text').map(b => b.text).join('');
-      return texts || null;
-    }
-    if (obj.type === 'tool_use') {
-      const preview = JSON.stringify(obj.input || {}).slice(0, 80);
-      return `▶ ${obj.name}(${preview})`;
-    }
-    if (obj.type === 'tool_result') {
-      const content = Array.isArray(obj.content)
-        ? obj.content.filter(b => b.type === 'text').map(b => b.text).join('').slice(0, 100)
-        : String(obj.content || '').slice(0, 100);
-      return content ? `◀ ${content}` : null;
-    }
-    if (obj.type === 'result') {
-      return `✓ Done: ${(obj.result || '').slice(0, 120)}`;
-    }
-    return null;
-  } catch {
-    return raw.slice(0, 120);
+function _openItemStream(todoId, jobId) {
+  if (_itemStreamSources[todoId]) {
+    _itemStreamSources[todoId].close();
+    delete _itemStreamSources[todoId];
   }
-}
-
-function renderJobs(jobs) {
-  _jobsState = {};
-  jobs.forEach(j => { _jobsState[j.id] = j; });
-  const list = document.getElementById('jobs-list');
-  if (!list) return;
-  if (!jobs.length) { list.innerHTML = '<div style="padding:14px;color:var(--subtle);font-size:0.82rem;text-align:center">No jobs yet</div>'; return; }
-  const icons = { running: '⏳', done: '✓', error: '✗', killed: '⊘', pending: '·' };
-  list.innerHTML = jobs.map(j => {
-    const icon = icons[j.status] || '·';
-    const isExpanded = j.id === _expandedJobId;
-    const killBtn = j.status === 'running' ? `<button class="job-kill" onclick="event.stopPropagation();killJob('${j.id}')">kill</button>` : '';
-    return `<div class="job-item${isExpanded ? ' expanded' : ''}" onclick="expandJob('${j.id}')" id="ji-${j.id}">
-      <div class="job-row">
-        <span class="job-icon">${icon}</span>
-        <span class="job-label">${j.label}</span>
-        ${killBtn}
-      </div>
-      ${isExpanded ? `<div class="job-output" id="jo-${j.id}"></div>` : ''}
-    </div>`;
-  }).join('');
-  if (_expandedJobId && _jobsState[_expandedJobId]) {
-    // output div already in DOM; stream will fill it
+  // New job for this todo — start fresh output
+  if (_clientJobIds[todoId] !== jobId) {
+    _clientJobLines[todoId] = [];
+    _clientJobIds[todoId] = jobId;
   }
-}
-
-function expandJob(jobId) {
-  if (_jobsStreamSource) { _jobsStreamSource.close(); _jobsStreamSource = null; }
-  _expandedJobId = jobId;
-  // Re-render to show/hide output divs
-  const jobs = Object.values(_jobsState);
-  renderJobs(jobs);
-  const outEl = document.getElementById('jo-' + jobId);
-  if (!outEl) return;
+  if (!_clientJobLines[todoId]) _clientJobLines[todoId] = [];
+  const existingCount = _clientJobLines[todoId].length;
+  let parsedCount = 0;
   const src = new EventSource('/api/jobs/' + jobId + '/stream');
-  _jobsStreamSource = src;
+  _itemStreamSources[todoId] = src;
   src.onmessage = (e) => {
     let raw;
     try { raw = JSON.parse(e.data); } catch { return; }
     if (typeof raw === 'object' && raw.__done__) {
-      src.close(); _jobsStreamSource = null;
-      pollJobs(); // refresh status
+      src.close(); delete _itemStreamSources[todoId];
+      pollJobs();
       return;
     }
-    const line = parseStreamLine(e.data);
+    const line = parseStreamLine(raw);
     if (!line) return;
-    const div = document.createElement('div');
-    if (line.startsWith('✓ Done:')) div.className = 'job-done-line';
-    div.textContent = line;
-    outEl.appendChild(div);
-    outEl.scrollTop = outEl.scrollHeight;
+    if (parsedCount < existingCount) { parsedCount++; return; } // skip already-buffered
+    console.log(`[job:${jobId}]`, line);
+    _clientJobLines[todoId].push(line);
+    parsedCount++;
+    const outEl = document.getElementById('job-out-' + todoId);
+    if (outEl) {
+      const div = document.createElement('div');
+      if (line.startsWith('✓')) div.className = 'job-done-line';
+      div.textContent = line;
+      outEl.appendChild(div);
+      outEl.scrollTop = outEl.scrollHeight;
+    }
   };
-  src.onerror = () => { src.close(); _jobsStreamSource = null; };
+  src.onerror = () => { src.close(); delete _itemStreamSources[todoId]; };
+}
+
+function _updateSpinnersInPlace() {
+  document.querySelectorAll('.todo-item[data-todo-id]').forEach(el => {
+    const todoId = el.dataset.todoId;
+    const job = _getActiveJobForTodo(todoId);
+    const titleEl = el.querySelector('.todo-title');
+    if (!titleEl) return;
+    const existingSpinner = titleEl.querySelector('.job-spinner');
+    if (job && job.status === 'running') {
+      if (!existingSpinner) {
+        const s = document.createElement('span');
+        s.className = 'job-spinner'; s.title = 'Stop job';
+        s.innerHTML = '<span class="sk-child"></span><span class="sk-child sk-bounce2"></span>';
+        s.onclick = e => { e.stopPropagation(); killJob(job.id); };
+        titleEl.insertBefore(s, titleEl.firstChild);
+      } else {
+        existingSpinner.onclick = e => { e.stopPropagation(); killJob(job.id); };
+      }
+      // Ensure output div exists for this item
+      if (!el.querySelector('.item-job-output')) {
+        const swipe = el.querySelector('.swipe-content');
+        if (swipe) {
+          const div = document.createElement('div');
+          div.className = 'item-job-output'; div.id = 'job-out-' + todoId;
+          swipe.appendChild(div);
+        }
+      }
+    } else {
+      if (existingSpinner) existingSpinner.remove();
+    }
+  });
+}
+
+function _restoreJobOutputs() {
+  for (const [todoId, lines] of Object.entries(_clientJobLines)) {
+    if (!lines.length) continue;
+    const outEl = document.getElementById('job-out-' + todoId);
+    if (!outEl) continue;
+    outEl.innerHTML = lines.map(l => {
+      const cls = l.startsWith('✓') ? ' class="job-done-line"' : '';
+      const d = document.createElement('div'); d.textContent = l;
+      return `<div${cls}>${d.innerHTML}</div>`;
+    }).join('');
+    outEl.scrollTop = outEl.scrollHeight;
+  }
+}
+
+function parseStreamLine(raw) {
+  // Server pre-formats lines via the Claude Agent SDK; raw is already a display string.
+  if (typeof raw !== 'string') return null;
+  return raw.trim() || null;
 }
 
 async function killJob(jobId) {
@@ -2263,16 +2427,99 @@ async function killJob(jobId) {
   pollJobs();
 }
 
+function _transitionEaBtn(toRunning) {
+  if (_eaTransitionTimer) { clearTimeout(_eaTransitionTimer); _eaTransitionTimer = null; }
+  const lbl = document.getElementById('ea-update-label');
+  const run = document.getElementById('ea-update-running');
+  if (!lbl || !run) return;
+
+  lbl.classList.remove('anim-in', 'anim-out');
+  run.classList.remove('anim-in', 'anim-out');
+  void lbl.offsetWidth; // force reflow
+
+  const outEl = toRunning ? lbl : run;
+  const inEl  = toRunning ? run : lbl;
+
+  // Ensure outgoing starts at opacity:1, incoming at opacity:0
+  outEl.style.opacity = '1';
+  inEl.style.opacity = '0';
+  void inEl.offsetWidth;
+
+  outEl.classList.add('anim-out');
+  inEl.classList.add('anim-in');
+
+  _eaTransitionTimer = setTimeout(() => {
+    outEl.classList.remove('anim-out'); outEl.style.opacity = '0';
+    inEl.classList.remove('anim-in');   inEl.style.opacity = '1';
+    _eaTransitionTimer = null;
+  }, 400);
+}
+
+function _updateEaUpdateBtn() {
+  const btn = document.getElementById('ea-update-btn');
+  if (!btn) return;
+
+  const job = Object.values(_jobsState).find(
+    j => j.job_key === 'ea-update' && (j.status === 'running' || j.status === 'pending')
+  );
+  const isRunning = !!job;
+
+  if (isRunning !== _eaWasRunning) {
+    _eaWasRunning = isRunning;
+    _transitionEaBtn(isRunning);
+  }
+
+  if (isRunning) {
+    btn.classList.add('running');
+    if (_eaUpdateTimerInterval) clearInterval(_eaUpdateTimerInterval);
+    const tick = () => {
+      const timer = document.getElementById('ea-update-timer');
+      if (!timer) return;
+      const elapsed = Math.floor(Date.now() / 1000 - job.created_at);
+      const m = Math.floor(elapsed / 60);
+      const s = String(elapsed % 60).padStart(2, '0');
+      timer.textContent = m > 0 ? `${m}:${s}` : `0:${s}`;
+    };
+    tick();
+    _eaUpdateTimerInterval = setInterval(tick, 1000);
+  } else {
+    btn.classList.remove('running');
+    if (_eaUpdateTimerInterval) { clearInterval(_eaUpdateTimerInterval); _eaUpdateTimerInterval = null; }
+  }
+}
+
+async function cancelEaUpdate() {
+  const job = Object.values(_jobsState).find(
+    j => j.job_key === 'ea-update' && (j.status === 'running' || j.status === 'pending')
+  );
+  if (job) await killJob(job.id);
+}
+
 async function pollJobs() {
   clearTimeout(_jobsPollTimer);
-  if (!_jobsOpen) return;
   try {
     const res = await fetch('/api/jobs');
     const jobs = await res.json();
-    renderJobs(jobs);
-    renderTodos(); // refresh badge
+    const prevState = _jobsState;
+    _jobsState = {};
+    jobs.forEach(j => { _jobsState[j.id] = j; });
+    // Open streams for running jobs that don't have one yet
+    for (const j of jobs) {
+      if (j.status !== 'running') continue;
+      const todoId = _todoIdForJob(j);
+      if (todoId && !_itemStreamSources[todoId]) _openItemStream(todoId, j.id);
+    }
+    // Clear client lines for jobs that are gone
+    for (const todoId of Object.keys(_clientJobLines)) {
+      const stillActive = jobs.some(j => _todoIdForJob(j) === todoId && j.status !== 'killed');
+      if (!stillActive) delete _clientJobLines[todoId];
+    }
+    _updateSpinnersInPlace();
+    _restoreJobOutputs();
+    _updateEaUpdateBtn();
   } catch {}
-  if (_jobsOpen) _jobsPollTimer = setTimeout(pollJobs, 2000);
+  const hasActive = Object.values(_jobsState).some(j => j.status === 'running' || j.status === 'pending');
+  _jobsPollTimer = setTimeout(pollJobs, hasActive ? 2000 : 5000);
 }
 
 function fallbackCopy(text) {
@@ -3498,6 +3745,7 @@ async function saveSectionRename(oldName, newName) {
 
 loadTodos();
 startPolling();
+pollJobs();
 
 // Fade section headers and items behind them as they get covered by the next sticky header
 window.addEventListener('scroll', () => {
@@ -3523,13 +3771,6 @@ window.addEventListener('scroll', () => {
 }, { passive: true });
 </script>
 
-<div id="jobs-panel" class="jobs-panel" style="display:none">
-  <div class="jobs-header">
-    <span>Jobs</span>
-    <button onclick="toggleJobsPanel()">&#x2715;</button>
-  </div>
-  <div id="jobs-list"></div>
-</div>
 
 </body>
 </html>
