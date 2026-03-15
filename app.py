@@ -1289,9 +1289,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .checkon-header { font-size: 0.72rem; font-weight: 600; color: var(--subtle); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; padding-bottom: 3px; border-bottom: 1px solid var(--border); }
   .checkon-footer { font-size: 0.72rem; font-weight: 600; color: var(--subtle); text-transform: uppercase; letter-spacing: 0.05em; margin-top: 4px; padding-top: 3px; border-top: 1px solid var(--border); }
   .checkon-summary.has-content { display: block; }
-  body.simple-mode .checkon-summary { display: none; }
-  body.simple-mode .todo-item.item-toggled .checkon-summary.has-content { display: block; }
-  body:not(.simple-mode) .todo-item.item-toggled .checkon-summary { display: none; }
+  .checkon-summary { display: none; }
+  .todo-item.item-expanded .checkon-summary.has-content { display: block; }
   .todo-item:has(.job-spinner:not(.term-spinner):hover) { z-index: 200; overflow: visible; }
   .ea-update-btn {
     border: none; font-size: 0.72rem; font-weight: 600; letter-spacing: 0.02em;
@@ -1422,15 +1421,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .todo-body { flex: 1; min-width: 0; }
   .todo-title { font-weight: 600; font-size: 1.02rem; word-break: break-word; letter-spacing: -0.01em; }
-  .todo-desc { color: var(--muted); font-size: 0.9rem; margin-top: 6px; word-break: break-word; line-height: 1.5; }
-  body.simple-mode .todo-desc { display: none; }
-  body.simple-mode .todo-item.item-toggled .todo-desc { display: block; }
-  body.simple-mode .todo-meta { display: none; }
-  body.simple-mode .todo-item.item-toggled .todo-meta { display: flex; }
-  body:not(.simple-mode) .todo-item.item-toggled .todo-desc { display: none; }
-  body:not(.simple-mode) .todo-item.item-toggled .todo-meta { display: none; }
-  body.simple-mode .todo-item.preview-expanded .todo-desc { display: block; }
-  body.simple-mode .todo-item.preview-expanded .todo-meta { display: flex; }
+  .ea-update-dot {
+    display: inline-block; width: 8px; height: 8px; border-radius: 100%;
+    background-color: #f59e0b; margin-left: 6px; flex-shrink: 0;
+    animation: sk-scaleout 1.0s infinite ease-in-out;
+  }
+  @keyframes sk-scaleout {
+    0% { transform: scale(0); } 100% { transform: scale(1.0); opacity: 0; }
+  }
+  .ea-update-comment { font-weight: 400; font-size: 0.82rem; color: #f59e0b; margin-left: 4px; }
+  .todo-desc { color: var(--muted); font-size: 0.9rem; margin-top: 6px; word-break: break-word; line-height: 1.5; display: none; }
+  .todo-item.item-expanded .todo-desc { display: block; }
+  .todo-item.item-expanded .todo-meta { display: flex; }
+  .todo-item.preview-expanded .todo-desc { display: block; }
+  .todo-item.preview-expanded .todo-meta { display: flex; }
   .todo-desc p { margin: 0 0 0.4em; }
   .todo-desc p:last-child { margin-bottom: 0; }
   .todo-desc ul, .todo-desc ol { margin: 0.2em 0 0.4em 1.2em; padding: 0; }
@@ -1443,7 +1447,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .todo-desc a:hover { text-decoration: underline; }
   .todo-desc h1, .todo-desc h2, .todo-desc h3 { font-size: 0.9em; margin: 0.4em 0 0.2em; }
   .todo-desc blockquote { border-left: 3px solid var(--border); margin: 0.3em 0; padding-left: 10px; color: var(--muted); }
-  .todo-meta { display: flex; align-items: center; gap: 8px; margin-top: 6px; flex-wrap: wrap; }
+  .todo-meta { display: none; align-items: center; gap: 8px; margin-top: 6px; flex-wrap: wrap; }
   .priority-badge {
     font-size: 0.68rem; font-weight: 700; text-transform: uppercase; padding: 2px 0;
     border-radius: 12px; letter-spacing: 0.04em; flex-shrink: 0;
@@ -1719,11 +1723,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     padding: 6px 10px; margin-top: 8px; max-height: 200px; overflow-y: auto;
     border: 1px solid var(--border);
   }
-  .todo-item.item-toggled .item-job-output { display: block; }
+  .todo-item.item-expanded .item-job-output { display: block; }
   .job-done-line { color: var(--accent); font-weight: 600; }
 </style>
 </head>
-<body class="simple-mode">
+<body>
 
 <div class="fab-new">
   <button class="btn btn-primary" id="add-toggle-btn" onclick="showAddForm()">+ New <span style="opacity:0.6;font-weight:400;font-size:0.8em">(n)</span></button>
@@ -1822,12 +1826,12 @@ let ctxTargetId = null; // id of todo targeted by context menu
 let visibleIds = []; // ordered list of todo ids as rendered
 let sectionsOrder = []; // ordered list of section names as rendered
 let addFormVisible = false;
-let simpleMode = true; // hide all descriptions
 let filterActiveSessions = false; // only show items with active terminal sessions
 let previewMode = false; // auto-expand selected item
 let previewExpandedId = null; // item currently auto-expanded by preview
-const toggledItems = new Set(); // per-item overrides that flip from mode default
+const expandedItems = new Set(); // items whose descriptions are expanded
 const collapsedSections = new Set(['__completed__']); // collapsed section names
+const _seenUpdates = new Set(); // todo IDs whose ⚡ update has been viewed
 const SEL_ADD = 0; // index for the add-form position
 
 async function loadTodos() {
@@ -1954,7 +1958,9 @@ function render() {
   visibleIds = [...visibleActiveIds, ...filteredCompleted.map(t => t.id)];
 
   const eaBtn = '<div class="ea-update-wrap"><button id="ea-update-btn" class="btn btn-sm ea-update-btn" onclick="eaUpdateToggle()" title="Run /ea update"><span class="ea-btn-wrap"><span id="ea-update-label" class="ea-lbl" style="opacity:1">Update</span><span id="ea-update-running" class="ea-running" style="opacity:0"><l-mirage size="28" speed="2.5" color="' + getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() + '"></l-mirage><span id="ea-update-timer">0:00</span></span></span></button><div id="ea-update-bubble" class="ea-update-bubble"></div></div>';
-  const simpleCls = simpleMode ? (toggledItems.size > 0 ? ' partial' : ' active') : (toggledItems.size > 0 ? ' partial' : '');
+  const totalItems = filteredActive.length;
+  const expandedCount = filteredActive.filter(t => expandedItems.has(t.id)).length;
+  const simpleCls = expandedCount === 0 ? ' active' : (expandedCount < totalItems ? ' partial' : '');
   const simpleBtn = `<button class="header-toggle simple-toggle-btn${simpleCls}" onclick="toggleSimpleMode()" title="Toggle simple mode (a)">Simple</button>`;
   const pColors = {high:'#b91c1c',medium:'#a16207',low:'#15803d',none:'#9ca3af'};
   const pBg = {high:'#fef2f2',medium:'#fffbeb',low:'#f0fdf4',none:'#f3f4f6'};
@@ -2088,7 +2094,7 @@ function renderTodo(t) {
   const jobSummary = `<div class="checkon-summary" id="checkon-summary-${t.id}"></div>`;
 
   const draggable = t.status !== 'completed' ? 'draggable="true"' : '';
-  const itemToggled = toggledItems.has(t.id) ? ' item-toggled' : '';
+  const itemToggled = expandedItems.has(t.id) ? ' item-expanded' : '';
   const isCompleted = t.status === 'completed';
   const swipeRevealClass = isCompleted ? 'swipe-reveal swipe-reveal-undo' : 'swipe-reveal';
   const swipeIcon = isCompleted ? '&#8634;' : '&#10003;';
@@ -2096,7 +2102,7 @@ function renderTodo(t) {
     <div class="${swipeRevealClass}"><span class="swipe-reveal-icon">${swipeIcon}</span></div>
     <div class="swipe-content">
     <div class="todo-header">
-      <div class="todo-title" style="flex:1;min-width:0;display:flex;align-items:center;gap:2px" onclick="event.stopPropagation();selectTodo('${t.id}');toggleItemDesc('${t.id}')">${spinner}${esc(t.title)}</div>
+      <div class="todo-title" style="flex:1;min-width:0;display:flex;align-items:center;gap:2px" onclick="event.stopPropagation();selectTodo('${t.id}');toggleItemDesc('${t.id}')">${spinner}${_renderTitle(t)}</div>
       <div class="todo-actions">
         ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();eaUpdateItem('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Refresh via /ea checkon" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#8635;</button>` : ''}
         ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();startInTmux('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Open terminal (s)" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#9654;</button>` : ''}
@@ -2107,6 +2113,16 @@ function renderTodo(t) {
     ${desc}${jobSummary}${jobBubble}
     </div>
   </div>`;
+}
+
+function _renderTitle(t) {
+  const raw = t.title || '';
+  const idx = raw.indexOf('⚡');
+  if (idx === -1) return esc(raw);
+  const title = raw.substring(0, idx).replace(/\*+$/, '').trimEnd();
+  const comment = raw.substring(idx + 1).trim();
+  const hasUpdate = !_seenUpdates.has(t.id);
+  return esc(title) + (hasUpdate ? '<span class="ea-update-dot"></span>' : '') + (comment ? '<span class="ea-update-comment">' + esc(comment) + '</span>' : '');
 }
 
 function esc(s) {
@@ -2259,9 +2275,10 @@ document.addEventListener('keydown', e => {
 function updateSimpleBtn() {
   const btn = document.querySelector('.simple-toggle-btn');
   if (!btn) return;
-  const hasToggled = toggledItems.size > 0;
-  btn.classList.toggle('active', simpleMode && !hasToggled);
-  btn.classList.toggle('partial', hasToggled);
+  const totalItems = allTodos.filter(t => t.status !== 'completed').length;
+  const expandedCount = expandedItems.size;
+  btn.classList.toggle('active', expandedCount === 0);
+  btn.classList.toggle('partial', expandedCount > 0 && expandedCount < totalItems);
 }
 
 function toggleFilterSessions() {
@@ -2270,13 +2287,11 @@ function toggleFilterSessions() {
 }
 
 function toggleSimpleMode() {
-  if (toggledItems.size > 0) {
-    toggledItems.clear();
+  if (expandedItems.size > 0) {
+    expandedItems.clear();
   } else {
-    simpleMode = !simpleMode;
-    document.body.classList.toggle('simple-mode', simpleMode);
+    allTodos.filter(t => t.status !== 'completed').forEach(t => expandedItems.add(t.id));
   }
-  updateSimpleBtn();
   render();
 }
 
@@ -2316,12 +2331,21 @@ function toggleItemDesc(id) {
     el.classList.remove('preview-expanded');
     previewExpandedId = null;
   }
-  if (toggledItems.has(id)) {
-    toggledItems.delete(id);
-    el.classList.remove('item-toggled');
+  if (expandedItems.has(id)) {
+    expandedItems.delete(id);
+    el.classList.remove('item-expanded');
   } else {
-    toggledItems.add(id);
-    el.classList.add('item-toggled');
+    expandedItems.add(id);
+    el.classList.add('item-expanded');
+    // Mark ⚡ update as seen when expanding
+    if (!_seenUpdates.has(id)) {
+      const t = allTodos.find(x => x.id === id);
+      if (t && t.title && t.title.includes('⚡')) {
+        _seenUpdates.add(id);
+        const dot = el.querySelector('.ea-update-dot');
+        if (dot) dot.remove();
+      }
+    }
   }
   updateSimpleBtn();
 }
@@ -3915,7 +3939,7 @@ function applySelection() {
         scrollIntoViewCentered(el);
         // Preview mode: auto-expand if currently collapsed
         if (previewMode) {
-          const isExpanded = simpleMode ? toggledItems.has(curId) : !toggledItems.has(curId);
+          const isExpanded = expandedItems.has(curId);
           if (!isExpanded) {
             el.classList.add('preview-expanded');
             previewExpandedId = curId;
@@ -4131,7 +4155,7 @@ document.addEventListener('keydown', e => {
     if (selectedIdx >= 1 && selectedIdx <= visibleIds.length) {
       const curId = visibleIds[selectedIdx - 1];
       if (!curId.startsWith('__section__:')) {
-        const isExpanded = simpleMode ? toggledItems.has(curId) : !toggledItems.has(curId);
+        const isExpanded = expandedItems.has(curId);
         if (isExpanded) {
           // Collapse item description
           e.preventDefault();
@@ -4163,7 +4187,7 @@ document.addEventListener('keydown', e => {
         render();
       } else {
         // Expand item description
-        const isExpanded = simpleMode ? toggledItems.has(curId) : !toggledItems.has(curId);
+        const isExpanded = expandedItems.has(curId);
         if (!isExpanded) {
           e.preventDefault();
           toggleItemDesc(curId);
