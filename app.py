@@ -1713,6 +1713,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .term-spinner::after { content: '↑'; color: #22c55e; font-size: 11px; font-weight: 700; }
   /* Terminal overlay */
   #terminal-overlay.visible { display: flex !important; }
+  #terminal-container { width: 100%; }
+  #terminal-container .xterm { width: 100% !important; height: 100% !important; }
   .xterm-viewport::-webkit-scrollbar { width: 6px; }
   .xterm-viewport::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 3px; }
   /* Inline job output — only visible when item is expanded */
@@ -2586,8 +2588,8 @@ async function startInTmux(id) {
 }
 
 async function openTerminal(todoId, resumeId) {
-  // If already have a live session for this todo and not resuming, just switch to it
-  if (!resumeId && _termSessions[todoId] && _termSessions[todoId].alive) {
+  // If already have a live session with a terminal for this todo and not resuming, just switch to it
+  if (!resumeId && _termSessions[todoId] && _termSessions[todoId].alive && _termSessions[todoId].term) {
     _showTerminalOverlay(todoId);
     return;
   }
@@ -2610,8 +2612,8 @@ async function openTerminal(todoId, resumeId) {
 
   const sessionId = data.session_id;
 
-  // If server returned existing session and we already have a client for it, switch
-  if (data.existing && _termSessions[todoId] && _termSessions[todoId].sessionId === sessionId) {
+  // If server returned existing session and we already have a full client for it, switch
+  if (data.existing && _termSessions[todoId] && _termSessions[todoId].sessionId === sessionId && _termSessions[todoId].term) {
     _showTerminalOverlay(todoId);
     return;
   }
@@ -2682,7 +2684,7 @@ function _connectTermWs(todoId, sessionId) {
 
 function _showTerminalOverlay(todoId) {
   const session = _termSessions[todoId];
-  if (!session) return;
+  if (!session || !session.term) return;
 
   _activeTermTodoId = todoId;
   const todo = allTodos.find(t => t.id === todoId);
@@ -2705,9 +2707,9 @@ function _showTerminalOverlay(todoId) {
   session.fitAddon.fit();
   session.term.focus();
 
-  // Resize observer
+  // Resize observer + window resize for horizontal/vertical reflow
   if (!_termResizeObserver) {
-    _termResizeObserver = new ResizeObserver(() => {
+    const doFit = () => {
       if (!_activeTermTodoId || !_termSessions[_activeTermTodoId]) return;
       const s = _termSessions[_activeTermTodoId];
       s.fitAddon.fit();
@@ -2715,7 +2717,9 @@ function _showTerminalOverlay(todoId) {
         const dims = s.fitAddon.proposeDimensions();
         if (dims) s.ws.send(JSON.stringify({ type: 'resize', rows: dims.rows, cols: dims.cols }));
       }
-    });
+    };
+    _termResizeObserver = new ResizeObserver(doFit);
+    window.addEventListener('resize', doFit);
   }
   _termResizeObserver.observe(container);
 }
@@ -2733,7 +2737,12 @@ function _startTermResize(e) {
     document.removeEventListener('mousemove', onMove);
     document.removeEventListener('mouseup', onUp);
     if (_activeTermTodoId && _termSessions[_activeTermTodoId]) {
-      _termSessions[_activeTermTodoId].fitAddon.fit();
+      const s = _termSessions[_activeTermTodoId];
+      s.fitAddon.fit();
+      if (s.ws && s.ws.readyState === WebSocket.OPEN) {
+        const dims = s.fitAddon.proposeDimensions();
+        if (dims) s.ws.send(JSON.stringify({ type: 'resize', rows: dims.rows, cols: dims.cols }));
+      }
     }
   }
   document.addEventListener('mousemove', onMove);
@@ -3256,14 +3265,21 @@ async function pollJobs() {
       const tRes = await fetch('/api/terminal/sessions');
       const sessions = await tRes.json();
       const aliveIds = new Set();
+      const serverSessions = {};
       for (const s of sessions) {
-        if (s.alive) aliveIds.add(s.todo_id);
+        if (s.alive) { aliveIds.add(s.todo_id); serverSessions[s.todo_id] = s; }
+      }
+      // Create placeholder entries for server-known sessions missing on client
+      for (const [todoId, s] of Object.entries(serverSessions)) {
+        if (!_termSessions[todoId]) {
+          _termSessions[todoId] = { sessionId: s.session_id, term: null, fitAddon: null, ws: null, alive: true };
+        }
       }
       // Mark dead sessions on client
       for (const [todoId, ts] of Object.entries(_termSessions)) {
         if (!aliveIds.has(todoId) && ts.alive) {
           ts.alive = false;
-          ts.term.writeln('\\r\\n\\x1b[2m[session ended]\\x1b[0m');
+          if (ts.term) ts.term.writeln('\\r\\n\\x1b[2m[session ended]\\x1b[0m');
         }
       }
       _updateSpinnersInPlace();
