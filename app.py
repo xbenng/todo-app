@@ -20,11 +20,18 @@ import signal
 import subprocess
 import threading
 import time
+import pty
+import fcntl
+import termios
+import struct
+import select as _select
 from collections import deque
 from datetime import datetime
 from flask import Flask, request, jsonify, Response
+from flask_sock import Sock
 
 app = Flask(__name__)
+sock = Sock(app)
 TODO_FILE = "todos.md"
 
 # Undo stack: each entry is (active_todos_list, completed_todos_list)
@@ -32,6 +39,8 @@ _undo_stack: deque[tuple[list[dict], list[dict]]] = deque(maxlen=30)
 
 # job_id -> {id, label, job_key, status, output_lines, proc, created_at}
 _jobs: dict[str, dict] = {}
+# session_id -> {id, todo_id, title, pid, master_fd, proc, alive, created_at, needs_auto_send}
+_pty_sessions: dict[str, dict] = {}
 
 
 def _completed_file_path(path: str) -> str:
@@ -591,15 +600,7 @@ def undo():
 
 def _run_claude_job(job_id: str, prompt: str, cwd: str):
     """Thread target: run claude -p as a subprocess and parse stream-json output."""
-    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
-
-    candidates = [
-        shutil.which("claude", path=env.get("PATH", os.defpath)),
-        os.path.expanduser("~/.local/bin/claude"),
-        "/opt/homebrew/bin/claude",
-        "/usr/local/bin/claude",
-    ]
-    claude_bin = next((c for c in candidates if c and os.path.isfile(c)), None)
+    claude_bin, env = _resolve_claude_bin()
     if not claude_bin:
         _jobs[job_id]["output_lines"].append("error: claude binary not found")
         _jobs[job_id]["status"] = "error"
@@ -732,6 +733,48 @@ def _kill_process_tree(pid: int) -> None:
             pass
 
 
+def _pty_set_winsize(fd: int, rows: int, cols: int) -> None:
+    """Set PTY window size via TIOCSWINSZ ioctl."""
+    try:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    except OSError:
+        pass
+
+
+def _get_user_shell_env():
+    """Get the full user login shell environment (needed under launchctl)."""
+    try:
+        result = subprocess.run(
+            ["zsh", "-l", "-c", "env -0"],
+            capture_output=True, text=True, timeout=5,
+        )
+        env = {}
+        for entry in result.stdout.split("\0"):
+            if "=" in entry:
+                k, v = entry.split("=", 1)
+                env[k] = v
+        if env:
+            env.pop("CLAUDECODE", None)
+            return env
+    except Exception:
+        pass
+    # Fallback: current env minus CLAUDECODE
+    return {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+
+
+def _resolve_claude_bin():
+    """Resolve the claude binary path, stripping CLAUDECODE from env."""
+    env = _get_user_shell_env()
+    candidates = [
+        shutil.which("claude", path=env.get("PATH", os.defpath)),
+        os.path.expanduser("~/.local/bin/claude"),
+        "/opt/homebrew/bin/claude",
+        "/usr/local/bin/claude",
+    ]
+    claude_bin = next((c for c in candidates if c and os.path.isfile(c)), None)
+    return claude_bin, env
+
+
 def _start_claude_job(label: str, job_key: str, prompt: str, cwd: str) -> str:
     """Start a headless Claude job; return job_id. Deduplicates by job_key."""
     for j in _jobs.values():
@@ -764,6 +807,202 @@ def start_in_tmux(todo_id):
     job_id = _start_claude_job(todo.get("title", todo_id), f"workon-{todo_id}",
                                f"/ea workon {todo_id}", todo_dir)
     return jsonify({"status": "started", "job_id": job_id})
+
+
+# ---------------------------------------------------------------------------
+# Interactive PTY terminal sessions
+# ---------------------------------------------------------------------------
+
+@app.route("/api/todos/<todo_id>/terminal", methods=["POST"])
+def open_terminal(todo_id):
+    """Register a terminal session for a todo. Returns existing if alive."""
+    data = request.json or {}
+    resume_id = data.get("resume_id")
+
+    # Return existing alive session for this todo (unless resuming a specific conv)
+    if not resume_id:
+        for s in _pty_sessions.values():
+            if s["todo_id"] == todo_id and s["alive"]:
+                return jsonify({"session_id": s["id"], "title": s["title"], "existing": True})
+
+    todos = _parse_todo_file(TODO_FILE)
+    todo = next((t for t in todos if t["id"] == todo_id), None)
+    if not todo:
+        return jsonify({"error": "Todo not found"}), 404
+
+    session_id = str(uuid.uuid4())[:8]
+    _pty_sessions[session_id] = {
+        "id": session_id,
+        "todo_id": todo_id,
+        "title": todo.get("title", todo_id),
+        "pid": None,
+        "master_fd": None,
+        "proc": None,
+        "alive": False,
+        "needs_auto_send": not resume_id,
+        "resume_id": resume_id,
+        "created_at": time.time(),
+    }
+    return jsonify({"session_id": session_id, "title": todo.get("title", todo_id), "existing": False})
+
+
+@app.route("/api/terminal/sessions")
+def list_terminal_sessions():
+    """List active PTY sessions."""
+    # Purge dead sessions older than 5 min
+    cutoff = time.time() - 300
+    stale = [sid for sid, s in _pty_sessions.items()
+             if not s["alive"] and s["created_at"] < cutoff]
+    for sid in stale:
+        del _pty_sessions[sid]
+    return jsonify([{
+        "session_id": s["id"], "todo_id": s["todo_id"],
+        "title": s["title"], "alive": s["alive"],
+        "created_at": s["created_at"],
+    } for s in _pty_sessions.values()])
+
+
+@app.route("/api/terminal/<session_id>/kill", methods=["POST"])
+def kill_terminal(session_id):
+    """Kill a terminal session's process."""
+    session = _pty_sessions.get(session_id)
+    if not session:
+        return jsonify({"error": "not found"}), 404
+    session["alive"] = False
+    if session.get("master_fd") is not None:
+        try:
+            os.close(session["master_fd"])
+        except OSError:
+            pass
+        session["master_fd"] = None
+    if session.get("proc"):
+        _kill_process_tree(session["proc"].pid)
+        try:
+            session["proc"].wait(timeout=2)
+        except Exception:
+            pass
+    return jsonify({"ok": True})
+
+
+@sock.route("/api/terminal/<session_id>/ws")
+def terminal_ws(ws, session_id):
+    """WebSocket handler bridging browser ↔ PTY for an interactive Claude session."""
+    session = _pty_sessions.get(session_id)
+    if not session:
+        ws.close()
+        return
+
+    # If session already has a live PTY, reconnect to it
+    if session["alive"] and session.get("master_fd") is not None:
+        _terminal_io_loop(ws, session)
+        return
+
+    todo_id = session["todo_id"]
+    todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
+
+    claude_bin, env = _resolve_claude_bin()
+    if not claude_bin:
+        ws.send(json.dumps({"type": "error", "msg": "claude binary not found"}))
+        ws.close()
+        return
+
+    # Create PTY and spawn claude
+    master_fd, slave_fd = pty.openpty()
+    _pty_set_winsize(master_fd, 24, 80)
+
+    env["TERM"] = "xterm-256color"
+    # Ensure ~/.local/bin is in PATH (launchctl has minimal PATH)
+    local_bin = os.path.expanduser("~/.local/bin")
+    if local_bin not in env.get("PATH", ""):
+        env["PATH"] = local_bin + ":" + env.get("PATH", os.defpath)
+    cmd = [claude_bin, "--dangerously-skip-permissions"]
+    if session.get("resume_id"):
+        cmd.extend(["--resume", session["resume_id"]])
+    print(f"[terminal] Spawning: {' '.join(cmd)} in {todo_dir}", flush=True)
+    proc = subprocess.Popen(
+        cmd,
+        stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+        cwd=todo_dir, env=env, start_new_session=True, close_fds=True,
+    )
+    os.close(slave_fd)
+
+    session["pid"] = proc.pid
+    session["master_fd"] = master_fd
+    session["proc"] = proc
+    session["alive"] = True
+    print(f"[terminal] PTY spawned pid={proc.pid} master_fd={master_fd}", flush=True)
+
+    # Auto-send /ea workon command after claude starts up
+    if session["needs_auto_send"]:
+        session["needs_auto_send"] = False
+        def _auto_send():
+            time.sleep(1.5)
+            if session["alive"]:
+                try:
+                    os.write(master_fd, f"/ea workon {todo_id}\r".encode())
+                except OSError:
+                    pass
+        threading.Thread(target=_auto_send, daemon=True).start()
+
+    _terminal_io_loop(ws, session)
+
+
+def _terminal_io_loop(ws, session):
+    """Bridge PTY master fd ↔ WebSocket in a single-threaded poll loop."""
+    master_fd = session["master_fd"]
+
+    # Make master_fd non-blocking so we can poll it alongside WS
+    flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+    fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+    print(f"[terminal] IO loop starting for {session['id']}", flush=True)
+    try:
+        while session["alive"]:
+            # 1. Read any available PTY output and forward to WS
+            try:
+                r, _, _ = _select.select([master_fd], [], [], 0)
+                if r:
+                    data = os.read(master_fd, 16384)
+                    if data:
+                        ws.send(data)
+                    else:
+                        print(f"[terminal] PTY EOF for {session['id']}", flush=True)
+                        break
+            except OSError:
+                print(f"[terminal] PTY read error for {session['id']}", flush=True)
+                break
+
+            # 2. Check for WS input (short timeout to keep loop responsive)
+            try:
+                msg = ws.receive(timeout=0.05)
+            except Exception:
+                break
+            if msg is None:
+                continue  # timeout — no input yet, loop back to read PTY
+
+            if isinstance(msg, bytes):
+                try:
+                    os.write(master_fd, msg)
+                except OSError:
+                    break
+            elif isinstance(msg, str):
+                try:
+                    ctrl = json.loads(msg)
+                    if ctrl.get("type") == "resize":
+                        rows = int(ctrl.get("rows", 24))
+                        cols = int(ctrl.get("cols", 80))
+                        _pty_set_winsize(master_fd, rows, cols)
+                    elif ctrl.get("type") == "close":
+                        break
+                    elif ctrl.get("type") == "input":
+                        os.write(master_fd, ctrl["data"].encode())
+                except (json.JSONDecodeError, ValueError, OSError):
+                    pass
+    finally:
+        session["alive"] = False
+        proc = session.get("proc")
+        rc = proc.poll() if proc else None
+        print(f"[terminal] IO loop exited for {session['id']} (proc rc={rc})", flush=True)
 
 
 @app.route("/api/ea-update", methods=["POST"])
@@ -914,6 +1153,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <link rel="icon" type="image/png" sizes="16x16" href="/static/favicon-16x16.png">
 <link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png">
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"></script>
 <script type="importmap">
 {
   "imports": {
@@ -1376,6 +1618,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .job-spinner:hover .sk-child { opacity: 0 !important; }
   .job-spinner:hover::after { opacity: 1; }
+  /* Terminal session indicator — reuses job-spinner with green accent */
+  .term-spinner .sk-child { background: #22c55e !important; }
+  .term-spinner::after { content: '↑'; color: #22c55e; font-size: 11px; font-weight: 700; }
+  /* Terminal overlay */
+  #terminal-overlay.visible { display: flex !important; }
+  .xterm-viewport::-webkit-scrollbar { width: 6px; }
+  .xterm-viewport::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 3px; }
   /* Inline job output — only visible when item is expanded */
   .item-job-output {
     display: none; font-family: monospace; font-size: 0.72rem; line-height: 1.5;
@@ -1731,7 +1980,7 @@ function renderTodo(t) {
     </div>`;
   }
 
-  const descHtml = t.description ? renderMd(t.description).replace(/conv:([a-zA-Z0-9_-]+)/g, '<a href="#" class="conv-link" onclick="event.preventDefault();event.stopPropagation();resumeConv(\'$1\')" title="Resume conversation $1">conv:$1</a>') : '';
+  const descHtml = t.description ? renderMd(t.description).replace(/conv:([a-zA-Z0-9_-]+)/g, `<a href="#" class="conv-link" onclick="event.preventDefault();event.stopPropagation();resumeConv('$1','${t.id}')" title="Resume conversation $1">conv:$1</a>`) : '';
   const desc = descHtml ? `<div class="todo-desc">${descHtml}</div>` : '';
   const priorityBadge = `<span class="priority-badge priority-${t.priority || 'medium'}">${t.priority || 'medium'}</span>`;
 
@@ -2204,20 +2453,200 @@ function copyTodoId(id) {
 }
 
 async function startInTmux(id) {
-  const todo = allTodos.find(t => t.id === id);
-  const title = todo ? todo.title : id;
-  try {
-    const res = await fetch(API + '/' + id + '/start', { method: 'POST' });
-    const data = await res.json();
-    if (res.ok) {
-      showToast('Started: ' + title, false);
-      if (data.job_id) { await pollJobs(); _openItemStream(id, data.job_id); }
-    } else {
-      showToast(data.error || 'Failed to start', true);
-    }
-  } catch (e) {
-    showToast('Failed to start', true);
+  await openTerminal(id);
+}
+
+async function openTerminal(todoId, resumeId) {
+  // If already have a live session for this todo and not resuming, just switch to it
+  if (!resumeId && _termSessions[todoId] && _termSessions[todoId].alive) {
+    _showTerminalOverlay(todoId);
+    return;
   }
+
+  // Register session on server
+  let data;
+  try {
+    const body = resumeId ? { resume_id: resumeId } : {};
+    const res = await fetch(API + '/' + todoId + '/terminal', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) { showToast('Failed to open terminal', true); return; }
+    data = await res.json();
+  } catch (e) {
+    showToast('Failed to open terminal', true);
+    return;
+  }
+
+  const sessionId = data.session_id;
+
+  // If server returned existing session and we already have a client for it, switch
+  if (data.existing && _termSessions[todoId] && _termSessions[todoId].sessionId === sessionId) {
+    _showTerminalOverlay(todoId);
+    return;
+  }
+
+  // Create new terminal instance
+  const term = new Terminal({
+    theme: { background: '#1a1b1e', foreground: '#e2e8f0', cursor: '#4f6ef7',
+             selectionBackground: 'rgba(79,110,247,0.3)' },
+    fontFamily: 'Menlo, Monaco, "Cascadia Code", monospace',
+    fontSize: 13, lineHeight: 1.4, cursorBlink: true,
+  });
+  const fitAddon = new FitAddon.FitAddon();
+  term.loadAddon(fitAddon);
+
+  _termSessions[todoId] = { sessionId, term, fitAddon, ws: null, alive: true };
+
+  _updateSpinnersInPlace();
+  _showTerminalOverlay(todoId);
+
+  // Connect WebSocket
+  _connectTermWs(todoId, sessionId);
+}
+
+function _connectTermWs(todoId, sessionId) {
+  const session = _termSessions[todoId];
+  if (!session) return;
+
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(proto + '://' + location.host + '/api/terminal/' + sessionId + '/ws');
+  ws.binaryType = 'arraybuffer';
+  session.ws = ws;
+
+  ws.onopen = () => {
+    const dims = session.fitAddon.proposeDimensions();
+    if (dims) ws.send(JSON.stringify({ type: 'resize', rows: dims.rows, cols: dims.cols }));
+  };
+
+  ws.onmessage = (e) => {
+    if (e.data instanceof ArrayBuffer) {
+      session.term.write(new Uint8Array(e.data));
+    } else if (typeof e.data === 'string') {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'error') session.term.writeln('\\r\\n\\x1b[31m' + msg.msg + '\\x1b[0m');
+      } catch {}
+    }
+  };
+
+  ws.onclose = () => {
+    // Don't mark dead — PTY may still be alive for reconnection
+  };
+
+  ws.onerror = () => {};
+
+  // Keystrokes → WS
+  session.term.onData((data) => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(new TextEncoder().encode(data));
+    }
+  });
+
+  session.term.onBinary((data) => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(Uint8Array.from(data, c => c.charCodeAt(0)));
+    }
+  });
+}
+
+function _showTerminalOverlay(todoId) {
+  const session = _termSessions[todoId];
+  if (!session) return;
+
+  _activeTermTodoId = todoId;
+  const todo = allTodos.find(t => t.id === todoId);
+  document.getElementById('terminal-title').textContent = todo ? todo.title : todoId;
+
+  const overlay = document.getElementById('terminal-overlay');
+  overlay.style.display = 'flex';
+  document.body.style.overflow = 'hidden';
+  requestAnimationFrame(() => overlay.classList.add('visible'));
+
+  // Mount this session's terminal into the container
+  const container = document.getElementById('terminal-container');
+  container.innerHTML = '';
+  if (session.term.element) {
+    // Already opened — just re-attach the existing DOM element
+    container.appendChild(session.term.element);
+  } else {
+    session.term.open(container);
+  }
+  session.fitAddon.fit();
+  session.term.focus();
+
+  // Resize observer
+  if (!_termResizeObserver) {
+    _termResizeObserver = new ResizeObserver(() => {
+      if (!_activeTermTodoId || !_termSessions[_activeTermTodoId]) return;
+      const s = _termSessions[_activeTermTodoId];
+      s.fitAddon.fit();
+      if (s.ws && s.ws.readyState === WebSocket.OPEN) {
+        const dims = s.fitAddon.proposeDimensions();
+        if (dims) s.ws.send(JSON.stringify({ type: 'resize', rows: dims.rows, cols: dims.cols }));
+      }
+    });
+  }
+  _termResizeObserver.observe(container);
+}
+
+function _startTermResize(e) {
+  e.preventDefault();
+  const panel = document.getElementById('terminal-panel');
+  const startY = e.clientY;
+  const startH = panel.offsetHeight;
+  function onMove(e) {
+    const h = Math.min(window.innerHeight * 0.9, Math.max(150, startH - (e.clientY - startY)));
+    panel.style.height = h + 'px';
+  }
+  function onUp() {
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup', onUp);
+    if (_activeTermTodoId && _termSessions[_activeTermTodoId]) {
+      _termSessions[_activeTermTodoId].fitAddon.fit();
+    }
+  }
+  document.addEventListener('mousemove', onMove);
+  document.addEventListener('mouseup', onUp);
+}
+
+function termSendCommand(cmd) {
+  if (!_activeTermTodoId) return;
+  const session = _termSessions[_activeTermTodoId];
+  if (!session || !session.ws || session.ws.readyState !== WebSocket.OPEN) return;
+  session.ws.send(new TextEncoder().encode(cmd + '\r'));
+  session.term.focus();
+}
+
+function minimizeTerminal() {
+  const overlay = document.getElementById('terminal-overlay');
+  overlay.classList.remove('visible');
+  document.body.style.overflow = '';
+  setTimeout(() => { overlay.style.display = 'none'; }, 100);
+  if (_termResizeObserver) _termResizeObserver.disconnect();
+  _activeTermTodoId = null;
+}
+
+async function killTerminal(todoId, skipMinimize) {
+  if (!todoId) return;
+  const session = _termSessions[todoId];
+  if (!session) return;
+
+  // Kill on server
+  try {
+    await fetch('/api/terminal/' + session.sessionId + '/kill', { method: 'POST' });
+  } catch {}
+
+  // Clean up client
+  if (session.ws) { try { session.ws.close(); } catch {} }
+  session.alive = false;
+
+  if (!skipMinimize && _activeTermTodoId === todoId) {
+    minimizeTerminal();
+  }
+  delete _termSessions[todoId];
+  _updateSpinnersInPlace();
 }
 
 function showShortcuts() {
@@ -2227,21 +2656,14 @@ function hideShortcuts() {
   document.getElementById('shortcuts-overlay').classList.remove('visible');
 }
 
-async function resumeConv(convId) {
-  try {
-    const res = await fetch('/api/resume-conv', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({conversation_id: convId})
-    });
-    const data = await res.json();
-    if (res.ok) {
-      showToast('Resuming conversation in tmux', false);
-    } else {
-      showToast(data.error || 'Failed to resume', true);
-    }
-  } catch (e) {
-    showToast('Failed to resume conversation', true);
+async function resumeConv(convId, todoId) {
+  // Kill existing web terminal for this item first (skip minimize — we're reopening)
+  if (todoId && _termSessions[todoId] && _termSessions[todoId].alive) {
+    await killTerminal(todoId, true);
+  }
+  // Open a new web terminal that resumes this conversation
+  if (todoId) {
+    await openTerminal(todoId, convId);
   }
 }
 
@@ -2315,6 +2737,11 @@ let _clientJobIds = {};       // todoId -> jobId that populated _clientJobLines
 let _itemStreamSources = {};  // todoId -> EventSource
 let _eaUpdateTimerInterval = null;
 let _eaWasRunning = false;
+
+// Interactive terminal sessions
+let _termSessions = {};       // todoId -> {sessionId, term, fitAddon, ws, alive}
+let _activeTermTodoId = null;  // which session is visible in the overlay
+let _termResizeObserver = null;
 let _eaTransitionTimer = null;
 
 function _todoIdForJob(job) {
@@ -2380,20 +2807,41 @@ function _updateSpinnersInPlace() {
   document.querySelectorAll('.todo-item[data-todo-id]').forEach(el => {
     const todoId = el.dataset.todoId;
     const job = _getActiveJobForTodo(todoId);
+    const termSession = _termSessions[todoId];
     const titleEl = el.querySelector('.todo-title');
     if (!titleEl) return;
     const existingSpinner = titleEl.querySelector('.job-spinner');
-    if (job && job.status === 'running') {
-      if (!existingSpinner) {
+    const hasTerminal = termSession && termSession.alive;
+    const hasJob = job && job.status === 'running';
+
+    // Terminal spinner (green, opens terminal on click)
+    const existingTermSpinner = titleEl.querySelector('.term-spinner');
+    if (hasTerminal) {
+      if (!existingTermSpinner) {
+        const s = document.createElement('span');
+        s.className = 'job-spinner term-spinner'; s.title = 'Open terminal';
+        s.innerHTML = '<span class="sk-child"></span><span class="sk-child sk-bounce2"></span>';
+        s.onclick = e => { e.stopPropagation(); openTerminal(todoId); };
+        titleEl.insertBefore(s, titleEl.firstChild);
+      }
+    } else {
+      if (existingTermSpinner) existingTermSpinner.remove();
+    }
+
+    // Job spinner (accent color, kills job on click)
+    const existingJobSpinner = titleEl.querySelector('.job-spinner:not(.term-spinner)');
+    if (hasJob) {
+      if (!existingJobSpinner) {
         const s = document.createElement('span');
         s.className = 'job-spinner'; s.title = 'Stop job';
         s.innerHTML = '<span class="sk-child"></span><span class="sk-child sk-bounce2"></span>';
         s.onclick = e => { e.stopPropagation(); killJob(job.id); };
-        titleEl.insertBefore(s, titleEl.firstChild);
+        const insertBefore = titleEl.querySelector('.term-spinner') ? titleEl.querySelector('.term-spinner').nextSibling : titleEl.firstChild;
+        titleEl.insertBefore(s, insertBefore);
       } else {
-        existingSpinner.onclick = e => { e.stopPropagation(); killJob(job.id); };
+        existingJobSpinner.onclick = e => { e.stopPropagation(); killJob(job.id); };
       }
-      // Ensure output div exists for this item
+      // Ensure output div exists
       if (!el.querySelector('.item-job-output')) {
         const swipe = el.querySelector('.swipe-content');
         if (swipe) {
@@ -2403,7 +2851,7 @@ function _updateSpinnersInPlace() {
         }
       }
     } else {
-      if (existingSpinner) existingSpinner.remove();
+      if (existingJobSpinner) existingJobSpinner.remove();
     }
   });
 }
@@ -2523,9 +2971,27 @@ async function pollJobs() {
     _updateSpinnersInPlace();
     _restoreJobOutputs();
     _updateEaUpdateBtn();
+    // Poll terminal sessions too
+    try {
+      const tRes = await fetch('/api/terminal/sessions');
+      const sessions = await tRes.json();
+      const aliveIds = new Set();
+      for (const s of sessions) {
+        if (s.alive) aliveIds.add(s.todo_id);
+      }
+      // Mark dead sessions on client
+      for (const [todoId, ts] of Object.entries(_termSessions)) {
+        if (!aliveIds.has(todoId) && ts.alive) {
+          ts.alive = false;
+          ts.term.writeln('\\r\\n\\x1b[2m[session ended]\\x1b[0m');
+        }
+      }
+      _updateSpinnersInPlace();
+    } catch {}
   } catch {}
   const hasActive = Object.values(_jobsState).some(j => j.status === 'running' || j.status === 'pending');
-  _jobsPollTimer = setTimeout(pollJobs, hasActive ? 2000 : 5000);
+  const hasTerminals = Object.values(_termSessions).some(s => s.alive);
+  _jobsPollTimer = setTimeout(pollJobs, (hasActive || hasTerminals) ? 2000 : 5000);
 }
 
 function fallbackCopy(text) {
@@ -3445,6 +3911,9 @@ document.addEventListener('keydown', e => {
   } else if (e.key === 'Escape') {
     if (_justCancelledEdit) { _justCancelledEdit = false; return; }
     e.preventDefault();
+    if (document.getElementById('terminal-overlay').classList.contains('visible')) {
+      minimizeTerminal(); return;
+    }
     if (addFormVisible) { hideAddForm(); }
     else if (searchQuery.trim().length > 0 || showPriorities.size > 0 || hidePriorities.size > 0) {
       searchQuery = '';
@@ -3777,6 +4246,20 @@ window.addEventListener('scroll', () => {
 }, { passive: true });
 </script>
 
+
+<!-- Terminal overlay -->
+<div id="terminal-overlay" onclick="if(event.target===this)minimizeTerminal()" style="display:none;position:fixed;inset:0;z-index:4000;background:rgba(0,0,0,0.5);flex-direction:column;justify-content:flex-end">
+  <div id="terminal-panel" style="background:#1a1b1e;border-radius:14px 14px 0 0;height:55vh;min-height:150px;max-height:90vh;display:flex;flex-direction:column;box-shadow:0 -8px 32px rgba(0,0,0,0.4)">
+    <div id="terminal-resize-handle" style="height:12px;cursor:ns-resize;flex-shrink:0;display:flex;justify-content:center;align-items:center" onmousedown="_startTermResize(event)"><span style="width:40px;height:4px;border-radius:2px;background:rgba(255,255,255,0.25)"></span></div>
+    <div id="terminal-titlebar" style="display:flex;align-items:center;padding:6px 14px 10px;gap:10px;border-bottom:1px solid rgba(255,255,255,0.1);flex-shrink:0;cursor:ns-resize" onmousedown="_startTermResize(event)">
+      <span id="terminal-title" style="color:#e2e8f0;font-size:0.85rem;font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+      <button onclick="termSendCommand('/ea sync')" style="background:rgba(255,255,255,0.1);border:none;color:#e2e8f0;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem">Log Status</button>
+      <button onclick="minimizeTerminal()" style="background:rgba(255,255,255,0.1);border:none;color:#e2e8f0;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem">Minimize</button>
+      <button onclick="killTerminal(_activeTermTodoId)" style="background:rgba(239,68,68,0.2);border:1px solid rgba(239,68,68,0.4);color:#fca5a5;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem">Kill</button>
+    </div>
+    <div id="terminal-container" style="flex:1;overflow:hidden;padding:4px"></div>
+  </div>
+</div>
 
 </body>
 </html>
