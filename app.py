@@ -1285,7 +1285,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: rgba(0,0,0,0.025); border: 1px solid var(--border); border-radius: 6px;
     padding: 6px 10px; margin-top: 8px; white-space: pre-wrap; word-break: break-word;
   }
-  .checkon-summary .checkon-inline-spinner { display: inline-flex; vertical-align: middle; margin-left: 4px; }
+  .checkon-summary .checkon-inline-spinner { display: inline-flex; vertical-align: baseline; margin-left: 6px; position: relative; top: 2px; }
+  .checkon-header { font-size: 0.72rem; font-weight: 600; color: var(--subtle); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; padding-bottom: 3px; border-bottom: 1px solid var(--border); }
+  .checkon-footer { font-size: 0.72rem; font-weight: 600; color: var(--subtle); text-transform: uppercase; letter-spacing: 0.05em; margin-top: 4px; padding-top: 3px; border-top: 1px solid var(--border); }
   .checkon-summary.has-content { display: block; }
   body.simple-mode .checkon-summary { display: none; }
   body.simple-mode .todo-item.item-toggled .checkon-summary.has-content { display: block; }
@@ -1304,13 +1306,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .ea-update-btn.running:hover { background: rgba(79,110,247,0.06); transform: none; box-shadow: none; }
   .ea-update-btn.running #ea-update-timer { display: none; }
   .ea-update-btn.running:hover #ea-update-timer { display: inline; }
-  /* Large hero spinner shown below header during update */
-  .ea-hero-spinner {
-    display: flex; justify-content: center; padding: 14px 0 10px;
-    position: sticky; top: var(--section-offset, 0px);
-    z-index: 101; background: transparent;
-    height: 0; overflow: visible;
-  }
   /* ml4-style scale transition for Update button */
   .ea-btn-wrap { position: relative; display: inline-flex; align-items: center; justify-content: center; height: 18px; min-width: 3.5em; }
   .ea-lbl, .ea-running { position: absolute; inset: 0; white-space: nowrap; display: flex; align-items: center; justify-content: center; gap: 5px; transform-origin: center; }
@@ -1979,14 +1974,12 @@ function render() {
   const activeSections = sectionsOrder.filter(s => s);
   const collapsedCount = activeSections.filter(s => collapsedSections.has(s)).length;
   const allCollapsed = activeSections.length > 0 && collapsedCount === activeSections.length;
-  const collapseAllCls = activeSections.length === 0 ? ' style="display:none"' : (collapsedCount > 0 ? (allCollapsed ? ' class="header-toggle active"' : ' class="header-toggle partial"') : ' class="header-toggle"');
-  const collapseAllBtn = `<button ${collapseAllCls} onclick="toggleCollapseAll()" title="Collapse/expand all sections">${allCollapsed ? '&#9654;' : '&#9660;'}</button>`;
+  const collapseAllBtn = activeSections.length === 0 ? '' : `<button class="collapse-btn${allCollapsed ? ' collapsed' : ''}" onclick="toggleCollapseAll()" title="Collapse/expand all sections">&#9660;</button>`;
   const modeGroup = `<span class="btn-group">${simpleBtn}${previewBtn}${sessionsBtn}</span>`;
   const headerBtns = '<div class="active-header-btns">' + collapseAllBtn + '<h2>Active' + (filteredActive.length ? ' (' + filteredActive.length + ')' : '') + '</h2>' + filterBtns + modeGroup + '</div>' + eaBtn;
-  const heroSpinnerHtml = '<div id="ea-update-hero-spinner" class="ea-hero-spinner" style="display:none"><l-mirage size="60" speed="2.5" color="' + getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() + '"></l-mirage></div>';
   activeEl.innerHTML = filteredActive.length
-    ? '<div class="active-header">' + headerBtns + '</div>' + heroSpinnerHtml + activeHtml
-    : '<div class="active-header">' + headerBtns + '</div>' + heroSpinnerHtml + '<div class="empty-state">All done! &#127881;</div>';
+    ? '<div class="active-header">' + headerBtns + '</div>' + activeHtml
+    : '<div class="active-header">' + headerBtns + '</div><div class="empty-state">All done! &#127881;</div>';
 
   const isCompletedCollapsed = !searching && collapsedSections.has('__completed__');
   if (filteredCompleted.length) {
@@ -2872,6 +2865,7 @@ let _jobsState = {};          // jobId -> job metadata (from server)
 let _clientJobLines = {};     // todoId -> string[] of parsed display lines
 let _clientJobSummary = {};   // todoId -> string[] of message-only lines (no tool calls)
 let _clientJobIds = {};       // todoId -> jobId that populated _clientJobLines
+let _clientJobStartTime = {}; // todoId -> Date when checkon started
 let _itemStreamSources = {};  // todoId -> EventSource
 let _eaUpdateTimerInterval = null;
 let _eaWasRunning = false;
@@ -2912,9 +2906,14 @@ function _openItemStream(todoId, jobId) {
     _clientJobLines[todoId] = [];
     _clientJobSummary[todoId] = [];
     _clientJobIds[todoId] = jobId;
+    _clientJobStartTime[todoId] = new Date();
     // Clear summary div and add spinner
     const sumEl = document.getElementById('checkon-summary-' + todoId);
-    if (sumEl) { sumEl.innerHTML = '<l-bouncy class="checkon-inline-spinner" size="20" speed="1.75" color="var(--accent)"></l-bouncy>'; sumEl.classList.add('has-content'); }
+    if (sumEl) {
+      const timeStr = _clientJobStartTime[todoId].toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+      sumEl.innerHTML = '<div class="checkon-header">Status check — ' + timeStr + '</div><div class="checkon-body"></div><l-bouncy class="checkon-inline-spinner" size="20" speed="1.75" color="var(--muted)"></l-bouncy>';
+      sumEl.classList.add('has-content');
+    }
   }
   if (!_clientJobLines[todoId]) _clientJobLines[todoId] = [];
   if (!_clientJobSummary[todoId]) _clientJobSummary[todoId] = [];
@@ -2930,9 +2929,18 @@ function _openItemStream(todoId, jobId) {
       // Mark bubble as done so hover no longer shows it
       const bubble = document.getElementById('checkon-bubble-' + todoId);
       if (bubble) bubble.classList.add('done');
-      // Remove inline spinner from summary
-      const sumSpinner = document.querySelector('#checkon-summary-' + todoId + ' .checkon-inline-spinner');
-      if (sumSpinner) sumSpinner.remove();
+      // Remove spinner and add completion footer
+      const sumDone = document.getElementById('checkon-summary-' + todoId);
+      if (sumDone) {
+        const spinner = sumDone.querySelector('.checkon-inline-spinner');
+        if (spinner) spinner.remove();
+        const now = new Date();
+        const timeStr = now.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+        const footer = document.createElement('div');
+        footer.className = 'checkon-footer';
+        footer.textContent = 'Complete — ' + timeStr;
+        sumDone.appendChild(footer);
+      }
       pollJobs();
       return;
     }
@@ -2954,13 +2962,12 @@ function _openItemStream(todoId, jobId) {
     }
     // Summary: only message lines (no tool calls)
     if (!line.startsWith('▶') && !line.startsWith('✓')) {
-      _clientJobSummary[todoId].push(line);
+      _clientJobSummary[todoId].push('⏺ ' + line);
       const sumEl = document.getElementById('checkon-summary-' + todoId);
       if (sumEl) {
         sumEl.classList.add('has-content');
-        const spinnerEl = sumEl.querySelector('.checkon-inline-spinner');
-        sumEl.textContent = _clientJobSummary[todoId].join('\n');
-        if (spinnerEl) sumEl.appendChild(spinnerEl);
+        const bodyEl = sumEl.querySelector('.checkon-body');
+        if (bodyEl) bodyEl.textContent = _clientJobSummary[todoId].join('\n');
       }
     }
   };
@@ -3033,8 +3040,29 @@ function _restoreJobOutputs() {
     if (!lines.length) continue;
     const sumEl = document.getElementById('checkon-summary-' + todoId);
     if (sumEl) {
+      sumEl.innerHTML = '';
       sumEl.classList.add('has-content');
-      sumEl.textContent = lines.join('\n');
+      const startTime = _clientJobStartTime[todoId];
+      const isStreaming = !!_itemStreamSources[todoId];
+      if (startTime) {
+        const timeStr = startTime.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+        const header = document.createElement('div');
+        header.className = 'checkon-header';
+        header.textContent = 'Status check \u2014 ' + timeStr;
+        sumEl.appendChild(header);
+      }
+      const body = document.createElement('div');
+      body.className = 'checkon-body';
+      body.textContent = lines.join('\n');
+      sumEl.appendChild(body);
+      if (isStreaming) {
+        const spinner = document.createElement('l-bouncy');
+        spinner.className = 'checkon-inline-spinner';
+        spinner.setAttribute('size', '20');
+        spinner.setAttribute('speed', '1.75');
+        spinner.setAttribute('color', 'var(--muted)');
+        sumEl.appendChild(spinner);
+      }
     }
   }
 }
@@ -3092,11 +3120,8 @@ function _updateEaUpdateBtn() {
     _transitionEaBtn(isRunning);
   }
 
-  const hero = document.getElementById('ea-update-hero-spinner');
-
   if (isRunning) {
     btn.classList.add('running');
-    if (hero) hero.style.display = 'flex';
     if (_eaUpdateTimerInterval) clearInterval(_eaUpdateTimerInterval);
     const tick = () => {
       const timer = document.getElementById('ea-update-timer');
@@ -3110,7 +3135,6 @@ function _updateEaUpdateBtn() {
     _eaUpdateTimerInterval = setInterval(tick, 1000);
   } else {
     btn.classList.remove('running');
-    if (hero) hero.style.display = 'none';
     if (_eaUpdateTimerInterval) { clearInterval(_eaUpdateTimerInterval); _eaUpdateTimerInterval = null; }
   }
 }
