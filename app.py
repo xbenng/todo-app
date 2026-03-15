@@ -894,6 +894,8 @@ def open_terminal(todo_id):
     # Let the window resize to match the latest attached client
     subprocess.run([tmux, "set-option", "-t", tmux_name, "aggressive-resize", "on"],
                    capture_output=True)
+    subprocess.run([tmux, "set-option", "-g", "window-size", "latest"],
+                   capture_output=True)
 
     _pty_sessions[session_id] = {
         "id": session_id,
@@ -1031,8 +1033,15 @@ def _terminal_io_loop(ws, master_fd, proc, tmux_target=None):
                         cols = int(ctrl.get("cols", 80))
                         _pty_set_winsize(master_fd, rows, cols)
                         if tmux_target:
+                            tmux = _tmux_bin()
+                            # Force tmux to adopt the new size
                             subprocess.run(
-                                [_tmux_bin(), "resize-window", "-t", tmux_target,
+                                [tmux, "resize-window", "-t", tmux_target,
+                                 "-x", str(cols), "-y", str(rows)],
+                                capture_output=True,
+                            )
+                            subprocess.run(
+                                [tmux, "resize-pane", "-t", tmux_target,
                                  "-x", str(cols), "-y", str(rows)],
                                 capture_output=True,
                             )
@@ -2709,14 +2718,22 @@ function _showTerminalOverlay(todoId) {
 
   // Resize observer + window resize for horizontal/vertical reflow
   if (!_termResizeObserver) {
+    let _fitTimer = null;
     const doFit = () => {
-      if (!_activeTermTodoId || !_termSessions[_activeTermTodoId]) return;
-      const s = _termSessions[_activeTermTodoId];
-      s.fitAddon.fit();
-      if (s.ws && s.ws.readyState === WebSocket.OPEN) {
-        const dims = s.fitAddon.proposeDimensions();
-        if (dims) s.ws.send(JSON.stringify({ type: 'resize', rows: dims.rows, cols: dims.cols }));
-      }
+      if (_fitTimer) clearTimeout(_fitTimer);
+      _fitTimer = setTimeout(() => {
+        if (!_activeTermTodoId || !_termSessions[_activeTermTodoId]) return;
+        const s = _termSessions[_activeTermTodoId];
+        if (!s.fitAddon) return;
+        s.fitAddon.fit();
+        if (s.ws && s.ws.readyState === WebSocket.OPEN) {
+          const dims = s.fitAddon.proposeDimensions();
+          if (dims) {
+            console.log('[terminal] resize:', dims.cols, 'x', dims.rows);
+            s.ws.send(JSON.stringify({ type: 'resize', rows: dims.rows, cols: dims.cols }));
+          }
+        }
+      }, 50);
     };
     _termResizeObserver = new ResizeObserver(doFit);
     window.addEventListener('resize', doFit);
