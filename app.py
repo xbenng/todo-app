@@ -17,6 +17,8 @@ import uuid
 import copy
 import shutil
 import subprocess
+import threading
+import time
 from collections import deque
 from datetime import datetime
 from flask import Flask, request, jsonify, Response
@@ -26,6 +28,9 @@ TODO_FILE = "todos.md"
 
 # Undo stack: each entry is (active_todos_list, completed_todos_list)
 _undo_stack: deque[tuple[list[dict], list[dict]]] = deque(maxlen=30)
+
+# job_id -> {id, label, job_key, status, output_lines, proc, created_at}
+_jobs: dict[str, dict] = {}
 
 
 def _completed_file_path(path: str) -> str:
@@ -583,184 +588,90 @@ def undo():
     return jsonify({"ok": True})
 
 
+def _run_claude_job(job_id: str, prompt: str, cwd: str):
+    """Thread target: run claude headless and capture streaming output."""
+    claude_bin = shutil.which("claude") or "/opt/homebrew/bin/claude"
+    cmd = [claude_bin, "-p", prompt, "--dangerously-skip-permissions",
+           "--output-format", "stream-json", "--verbose"]
+    proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True)
+    _jobs[job_id]["proc"] = proc
+    _jobs[job_id]["status"] = "running"
+    for line in proc.stdout:
+        _jobs[job_id]["output_lines"].append(line.rstrip())
+    proc.wait()
+    _jobs[job_id]["status"] = "done" if proc.returncode == 0 else "error"
+
+
+def _start_claude_job(label: str, job_key: str, prompt: str, cwd: str) -> str:
+    """Start a headless Claude job; return job_id. Deduplicates by job_key."""
+    for j in _jobs.values():
+        if j["job_key"] == job_key and j["status"] == "running":
+            return j["id"]
+    job_id = str(uuid.uuid4())[:8]
+    _jobs[job_id] = {
+        "id": job_id,
+        "label": label,
+        "job_key": job_key,
+        "status": "pending",
+        "output_lines": [],
+        "proc": None,
+        "created_at": time.time(),
+    }
+    t = threading.Thread(target=_run_claude_job, args=(job_id, prompt, cwd), daemon=True)
+    t.start()
+    return job_id
+
+
 @app.route("/api/todos/<todo_id>/start", methods=["POST"])
 def start_in_tmux(todo_id):
-    """Launch a Claude Code session in tmux working on the given todo."""
+    """Launch a headless Claude Code session working on the given todo."""
     todos = _parse_todo_file(TODO_FILE)
     todo = next((t for t in todos if t["id"] == todo_id), None)
     if not todo:
         return jsonify({"error": "Todo not found"}), 404
 
-    # Sanitize title for tmux window name
-    raw_title = todo.get("title", todo_id)
-    window_name = re.sub(r"[^a-zA-Z0-9_-]", "-", raw_title)[:30].strip("-")
-    if not window_name:
-        window_name = "task"
-
-    tmux_bin = shutil.which("tmux") or "/opt/homebrew/bin/tmux"
-    tmux_session = "0"
-    try:
-        # Ensure session exists
-        result = subprocess.run(
-            [tmux_bin, "has-session", "-t", tmux_session],
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            subprocess.run(
-                [tmux_bin, "new-session", "-d", "-s", tmux_session],
-                check=True,
-                capture_output=True,
-            )
-
-        # Create new window and launch claude
-        subprocess.run(
-            [tmux_bin, "new-window", "-t", f"{tmux_session}:", "-n", window_name],
-            check=True,
-            capture_output=True,
-        )
-        todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
-        subprocess.run(
-            [
-                tmux_bin,
-                "send-keys",
-                "-t",
-                f"{tmux_session}:{window_name}",
-                f"cd {todo_dir} && claude --dangerously-skip-permissions",
-                "Enter",
-            ],
-            check=True,
-            capture_output=True,
-        )
-
-        # Send /ea workon after a delay (background so we don't block the response)
-        workon_cmd = f"/ea workon {todo_id}"
-        subprocess.Popen(
-            f'sleep 3 && {tmux_bin} send-keys -t "{tmux_session}:{window_name}" "{workon_cmd}" Enter',
-            shell=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-        return jsonify({"status": "started", "window": window_name})
-    except FileNotFoundError:
-        return jsonify({"error": "tmux is not installed"}), 500
-    except subprocess.CalledProcessError as exc:
-        return jsonify({"error": f"tmux error: {exc.stderr.decode().strip()}"}), 500
-
-
-def _tmux_window_exists(tmux_bin, session, window_name):
-    """Check if a tmux window with the given name exists."""
-    result = subprocess.run(
-        [tmux_bin, "list-panes", "-t", f"{session}:={window_name}"],
-        capture_output=True,
-    )
-    return result.returncode == 0
+    todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
+    job_id = _start_claude_job(todo.get("title", todo_id), f"workon-{todo_id}",
+                               f"/ea workon {todo_id}", todo_dir)
+    return jsonify({"status": "started", "job_id": job_id})
 
 
 @app.route("/api/ea-update", methods=["POST"])
 def ea_update():
-    """Run /ea update in a tmux window."""
+    """Run /ea update as a headless Claude job."""
     data = request.json or {}
     force = data.get("force", False)
-    tmux_bin = shutil.which("tmux") or "/opt/homebrew/bin/tmux"
-    tmux_session = "0"
-    window_name = "ea-update"
-    try:
-        result = subprocess.run(
-            [tmux_bin, "has-session", "-t", tmux_session],
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            subprocess.run(
-                [tmux_bin, "new-session", "-d", "-s", tmux_session],
-                check=True,
-                capture_output=True,
-            )
 
-        if _tmux_window_exists(tmux_bin, tmux_session, window_name):
-            if not force:
-                return jsonify({"status": "already_running", "window": window_name})
-            subprocess.run(
-                [tmux_bin, "kill-window", "-t", f"{tmux_session}:={window_name}"],
-                capture_output=True,
-            )
+    # Check for existing running job
+    existing = next((j for j in _jobs.values()
+                     if j["job_key"] == "ea-update" and j["status"] == "running"), None)
+    if existing and not force:
+        return jsonify({"status": "already_running", "job_id": existing["id"]})
 
-        subprocess.run(
-            [tmux_bin, "new-window", "-t", f"{tmux_session}:", "-n", window_name],
-            check=True,
-            capture_output=True,
-        )
-        todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
-        subprocess.run(
-            [
-                tmux_bin, "send-keys",
-                "-t", f"{tmux_session}:={window_name}",
-                f"cd {todo_dir} && claude --dangerously-skip-permissions '/ea update'",
-                "Enter",
-            ],
-            check=True,
-            capture_output=True,
-        )
-
-        return jsonify({"status": "started", "window": window_name})
-    except FileNotFoundError:
-        return jsonify({"error": "tmux is not installed"}), 500
-    except subprocess.CalledProcessError as exc:
-        return jsonify({"error": f"tmux error: {exc.stderr.decode().strip()}"}), 500
+    todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
+    job_id = _start_claude_job("EA Update", "ea-update", "/ea update", todo_dir)
+    return jsonify({"status": "started", "job_id": job_id})
 
 
 @app.route("/api/ea-update-item", methods=["POST"])
 def ea_update_item():
-    """Run /ea checkon <item_id> in a tmux window."""
+    """Run /ea checkon <item_id> as a headless Claude job."""
     data = request.json
     item_id = (data.get("id") or "").strip()
     force = data.get("force", False)
     if not item_id:
         return jsonify({"error": "id required"}), 400
-    tmux_bin = shutil.which("tmux") or "/opt/homebrew/bin/tmux"
-    tmux_session = "0"
-    window_name = f"ea-{item_id}"
-    try:
-        result = subprocess.run(
-            [tmux_bin, "has-session", "-t", tmux_session],
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            subprocess.run(
-                [tmux_bin, "new-session", "-d", "-s", tmux_session],
-                check=True,
-                capture_output=True,
-            )
 
-        if _tmux_window_exists(tmux_bin, tmux_session, window_name):
-            if not force:
-                return jsonify({"status": "already_running", "window": window_name})
-            subprocess.run(
-                [tmux_bin, "kill-window", "-t", f"{tmux_session}:={window_name}"],
-                capture_output=True,
-            )
+    job_key = f"ea-{item_id}"
+    existing = next((j for j in _jobs.values()
+                     if j["job_key"] == job_key and j["status"] == "running"), None)
+    if existing and not force:
+        return jsonify({"status": "already_running", "job_id": existing["id"]})
 
-        subprocess.run(
-            [tmux_bin, "new-window", "-t", f"{tmux_session}:", "-n", window_name],
-            check=True,
-            capture_output=True,
-        )
-        todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
-        subprocess.run(
-            [
-                tmux_bin, "send-keys",
-                "-t", f"{tmux_session}:={window_name}",
-                f"cd {todo_dir} && claude --dangerously-skip-permissions '/ea checkon {item_id}'",
-                "Enter",
-            ],
-            check=True,
-            capture_output=True,
-        )
-        return jsonify({"status": "started", "window": window_name})
-    except FileNotFoundError:
-        return jsonify({"error": "tmux is not installed"}), 500
-    except subprocess.CalledProcessError as exc:
-        return jsonify({"error": f"tmux error: {exc.stderr.decode().strip()}"}), 500
+    todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
+    job_id = _start_claude_job(f"Check: {item_id}", job_key, f"/ea checkon {item_id}", todo_dir)
+    return jsonify({"status": "started", "job_id": job_id})
 
 
 @app.route("/api/resume-conv", methods=["POST"])
@@ -808,6 +719,55 @@ def resume_conv():
         return jsonify({"error": "tmux is not installed"}), 500
     except subprocess.CalledProcessError as exc:
         return jsonify({"error": f"tmux error: {exc.stderr.decode().strip()}"}), 500
+
+
+@app.route("/api/jobs")
+def list_jobs():
+    """List all jobs, purging completed/killed entries older than 30 minutes."""
+    cutoff = time.time() - 1800
+    stale = [jid for jid, j in _jobs.items()
+             if j["status"] in ("done", "error", "killed") and j["created_at"] < cutoff]
+    for jid in stale:
+        del _jobs[jid]
+    return jsonify([{
+        "id": j["id"], "label": j["label"], "status": j["status"],
+        "line_count": len(j["output_lines"]), "created_at": j["created_at"]
+    } for j in _jobs.values()])
+
+
+@app.route("/api/jobs/<job_id>/stream")
+def stream_job(job_id):
+    """SSE stream of raw output lines for a job."""
+    job = _jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "not found"}), 404
+
+    def generate():
+        sent = 0
+        while True:
+            while sent < len(job["output_lines"]):
+                yield f"data: {json.dumps(job['output_lines'][sent])}\n\n"
+                sent += 1
+            if job["status"] in ("done", "error", "killed"):
+                yield f"data: {json.dumps({'__done__': True, 'status': job['status']})}\n\n"
+                break
+            time.sleep(0.05)
+
+    return Response(generate(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.route("/api/jobs/<job_id>/kill", methods=["POST"])
+def kill_job(job_id):
+    """Terminate a running job."""
+    job = _jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "not found"}), 404
+    proc = job.get("proc")
+    if proc and proc.poll() is None:
+        proc.terminate()
+    job["status"] = "killed"
+    return jsonify({"ok": True})
 
 
 # ---------------------------------------------------------------------------
@@ -1030,7 +990,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     transition: opacity 0.1s;
   }
   .section-header-row::after {
-    content: ''; position: absolute; left: 0; right: 0; top: 100%;
+    content: ''; position: absolute; left: -4px; right: -4px; top: 100%;
     height: 24px; background: linear-gradient(to bottom, var(--bg), transparent);
     pointer-events: none;
   }
@@ -1094,9 +1054,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   /* Edit mode */
   .edit-title {
-    font-size: 1.02rem; font-weight: 600; width: 100%; padding: 8px 12px;
-    border: 1px solid var(--border); border-radius: 8px; margin-bottom: 6px;
+    font-size: 1rem; width: 100%; padding: 10px 14px;
+    border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px;
     background: var(--bg); transition: border-color 0.15s, box-shadow 0.15s;
+    font-family: inherit; color: var(--text);
   }
   .edit-title:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-light); }
   .edit-desc {
@@ -1108,16 +1069,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .edit-desc:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-light); }
   .edit-desc-cm { width: 100%; }
   .edit-desc-cm .cm-editor {
-    font-size: 80%; border: 1px solid var(--border); border-radius: 8px;
+    font-size: 0.8rem; border: 1px solid var(--border); border-radius: 8px;
     background: var(--bg); transition: border-color 0.15s, box-shadow 0.15s;
   }
   .edit-desc-cm .cm-editor.cm-focused {
     outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-light);
   }
-  .edit-desc-cm .cm-content { min-height: 44px; padding: 8px 12px; font-family: inherit; }
+  .edit-desc-cm .cm-content { min-height: 56px; padding: 10px 14px; font-family: inherit; }
   .edit-desc-cm .cm-scroller { overflow: auto; }
   .edit-desc-cm .cm-line { line-height: 1.6; }
-  .edit-actions { display: flex; gap: 6px; margin-top: 8px; }
+  .edit-select {
+    width: 100%; padding: 10px 14px; border: 1px solid var(--border); border-radius: 8px;
+    font-size: 0.85rem; font-family: inherit; margin-bottom: 10px;
+    background: var(--bg); transition: border-color 0.15s, box-shadow 0.15s; color: var(--text);
+  }
+  .edit-select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-light); }
+  .edit-actions { display: flex; gap: 8px; margin-top: 10px; align-items: center; }
 
   /* Section headers */
   .section-header {
@@ -1134,6 +1101,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .section-header-row.kb-selected {
     box-shadow: 0 0 0 2px var(--accent);
     border-radius: var(--radius);
+    z-index: 101;
   }
 
   /* Context menu */
@@ -1227,6 +1195,51 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .swiping .swipe-content { transition: none; }
   .snap-back .swipe-content { transition: transform 0.25s cubic-bezier(0.2,0.8,0.4,1); transform: translateX(0) !important; }
   .snap-complete .swipe-content { transition: transform 0.2s ease-in; }
+
+  /* Jobs panel */
+  .jobs-panel {
+    position: fixed; bottom: 0; right: 24px; width: 380px;
+    max-height: 60vh; background: var(--card); border: 1px solid var(--border);
+    border-bottom: none; border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+    box-shadow: var(--shadow-lg); z-index: 1000;
+    display: flex; flex-direction: column;
+    animation: slideUp 0.2s ease-out;
+  }
+  @keyframes slideUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
+  .jobs-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 14px; border-bottom: 1px solid var(--border);
+    font-size: 0.85rem; font-weight: 600; flex-shrink: 0;
+  }
+  .jobs-header button { background: none; border: none; cursor: pointer; font-size: 1rem; color: var(--muted); padding: 0 4px; }
+  .jobs-header button:hover { color: var(--text); }
+  #jobs-list { overflow-y: auto; flex: 1; }
+  .job-item {
+    padding: 8px 14px; border-bottom: 1px solid var(--border);
+    cursor: pointer; transition: background 0.1s;
+  }
+  .job-item:last-child { border-bottom: none; }
+  .job-item:hover { background: var(--bg); }
+  .job-item.expanded { background: var(--bg); }
+  .job-row { display: flex; align-items: center; gap: 8px; }
+  .job-icon { font-size: 0.9rem; flex-shrink: 0; }
+  .job-label { flex: 1; font-size: 0.82rem; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .job-kill { font-size: 0.7rem; padding: 2px 6px; border-radius: 4px; border: 1px solid var(--border); background: none; color: var(--muted); cursor: pointer; flex-shrink: 0; }
+  .job-kill:hover { background: var(--danger); color: #fff; border-color: var(--danger); }
+  .job-output {
+    font-family: monospace; font-size: 0.72rem; line-height: 1.5;
+    overflow-y: auto; max-height: 200px; margin-top: 6px;
+    background: rgba(0,0,0,0.02); border-radius: 6px;
+    padding: 6px 8px; color: var(--muted); white-space: pre-wrap; word-break: break-all;
+  }
+  .job-done-line { color: var(--accent); font-weight: 600; }
+  .jobs-badge {
+    display: inline-flex; align-items: center; justify-content: center;
+    background: var(--danger); color: #fff; border-radius: 99px;
+    font-size: 0.65rem; font-weight: 700; min-width: 16px; height: 16px;
+    padding: 0 4px; margin-left: 4px; vertical-align: middle;
+  }
+  .jobs-btn { position: relative; }
 </style>
 </head>
 <body class="simple-mode">
@@ -1439,7 +1452,7 @@ function render() {
     if (section) {
       activeHtml += `<div class="section-header-row" data-section="${esc(section)}" draggable="true">`
         + `<button class="collapse-btn${isCollapsed ? ' collapsed' : ''}" onclick="toggleSectionCollapse('${escSection}')" title="${isCollapsed ? 'Expand' : 'Collapse'}">&#9660;</button>`
-        + `<h3 ondblclick="startSectionRename('${escSection}')">${esc(section)}</h3>`
+        + `<h3 onclick="toggleSectionCollapse('${escSection}')" ondblclick="startSectionRename('${escSection}')">${esc(section)}</h3>`
         + `<span class="section-count">${items.length}</span>`
         + `<button class="sort-priority-btn" onclick="sortByPriority('${escSection}')" title="Sort by priority (high first)">&#9650; Priority</button>`
         + `</div>`;
@@ -1456,7 +1469,10 @@ function render() {
   // visibleIds includes todo IDs + section markers for collapsed sections
   visibleIds = [...visibleActiveIds, ...filteredCompleted.map(t => t.id)];
 
-  const eaBtn = '<button class="btn btn-sm ea-update-btn" onclick="eaUpdate()" title="Run /ea update in tmux">Update</button>';
+  const eaBtn = '<button class="btn btn-sm ea-update-btn" onclick="eaUpdate()" title="Run /ea update">Update</button>';
+  const runningCount = Object.values(_jobsState || {}).filter(j => j.status === 'running').length;
+  const badge = runningCount > 0 ? `<span class="jobs-badge">${runningCount}</span>` : '';
+  const jobsBtn = `<button class="btn btn-sm jobs-btn" onclick="toggleJobsPanel()" title="View Claude jobs" style="border:1px solid var(--border);margin-left:4px">Jobs${badge}</button>`;
   const simpleCls = simpleMode ? (toggledItems.size > 0 ? ' partial' : ' active') : (toggledItems.size > 0 ? ' partial' : '');
   const simpleBtn = `<button class="header-toggle simple-toggle-btn${simpleCls}" onclick="toggleSimpleMode()" title="Toggle simple mode (a)">Simple</button>`;
   const pColors = {high:'#b91c1c',medium:'#a16207',low:'#15803d',none:'#9ca3af'};
@@ -1473,7 +1489,7 @@ function render() {
     return `<button class="header-toggle" style="${style}" onclick="cycleFilter('${p}')" title="Filter ${p}">${label}</button>`;
   }).join('');
   const previewBtn = `<button class="header-toggle preview-toggle-btn${previewMode ? ' active' : ''}" onclick="togglePreviewMode()" title="Preview mode: auto-expand selected (v)">Preview</button>`;
-  const headerBtns = filterBtns + simpleBtn + previewBtn + eaBtn;
+  const headerBtns = filterBtns + simpleBtn + previewBtn + eaBtn + jobsBtn;
   activeEl.innerHTML = filteredActive.length
     ? '<div class="active-header"><h2>Active (' + filteredActive.length + ')</h2>' + headerBtns + '</div>' + activeHtml
     : '<div class="active-header"><h2>Active</h2>' + headerBtns + '</div><div class="empty-state">All done! &#127881;</div>';
@@ -1552,14 +1568,14 @@ function renderTodo(t) {
       <div class="todo-body">
         <input class="edit-title" id="edit-title-${t.id}" value="${esc(t.title)}">
         <div class="edit-desc-cm" id="edit-desc-${t.id}"></div>
-        <select id="edit-section-${t.id}" style="font-size:0.85rem; font-weight:400; margin-bottom:4px; width:100%; padding:4px 8px; border:1px solid var(--border); border-radius:4px;">
+        <select id="edit-section-${t.id}" class="edit-select">
           <option value="">No section</option>
           ${allSectionsForEdit().map(s => `<option value="${esc(s)}" ${(t.section||'')===s?'selected':''}>${esc(s)}</option>`).join('')}
           <option value="__custom__">Other...</option>
         </select>
-        <input class="edit-title" id="edit-section-custom-${t.id}" placeholder="New section name" style="font-size:0.85rem; font-weight:400; margin-bottom:4px; display:none;">
+        <input class="edit-title" id="edit-section-custom-${t.id}" placeholder="New section name" style="display:none;">
         <div class="edit-actions">
-          <select id="edit-priority-${t.id}">
+          <select id="edit-priority-${t.id}" class="edit-select" style="width:auto;margin-bottom:0">
             ${['high','medium','low','none'].map(p =>
               `<option value="${p}" ${p===t.priority?'selected':''}>${p}</option>`
             ).join('')}
@@ -2041,24 +2057,18 @@ function copyTodoId(id) {
 async function startInTmux(id) {
   const todo = allTodos.find(t => t.id === id);
   const title = todo ? todo.title : id;
-  function showToast(msg, isError) {
-    const toast = document.createElement('div');
-    toast.textContent = msg;
-    toast.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:' + (isError ? 'var(--danger)' : 'var(--text)') + ';color:var(--card);padding:8px 16px;border-radius:8px;font-size:0.85rem;z-index:2000;box-shadow:var(--shadow-lg);opacity:0;transition:opacity .15s';
-    document.body.appendChild(toast);
-    requestAnimationFrame(() => { toast.style.opacity = '1'; });
-    setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 150); }, 2000);
-  }
   try {
     const res = await fetch(API + '/' + id + '/start', { method: 'POST' });
     const data = await res.json();
     if (res.ok) {
-      showToast('Started in tmux: ' + title, false);
+      showToast('Started: ' + title, false);
+      openJobsPanel();
+      if (data.job_id) expandJob(data.job_id);
     } else {
       showToast(data.error || 'Failed to start', true);
     }
   } catch (e) {
-    showToast('Failed to start in tmux', true);
+    showToast('Failed to start', true);
   }
 }
 
@@ -2070,14 +2080,6 @@ function hideShortcuts() {
 }
 
 async function resumeConv(convId) {
-  function showToast(msg, isError) {
-    const toast = document.createElement('div');
-    toast.textContent = msg;
-    toast.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:' + (isError ? 'var(--danger)' : 'var(--text)') + ';color:var(--card);padding:8px 16px;border-radius:8px;font-size:0.85rem;z-index:2000;box-shadow:var(--shadow-lg);opacity:0;transition:opacity .15s';
-    document.body.appendChild(toast);
-    requestAnimationFrame(() => { toast.style.opacity = '1'; });
-    setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 150); }, 2000);
-  }
   try {
     const res = await fetch('/api/resume-conv', {
       method: 'POST',
@@ -2096,22 +2098,17 @@ async function resumeConv(convId) {
 }
 
 async function eaUpdate(force) {
-  function showToast(msg, isError, onClick) {
-    const toast = document.createElement('div');
-    toast.textContent = msg;
-    toast.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:' + (isError ? 'var(--danger)' : 'var(--text)') + ';color:var(--card);padding:8px 16px;border-radius:8px;font-size:0.85rem;z-index:2000;box-shadow:var(--shadow-lg);opacity:0;transition:opacity .15s' + (onClick ? ';cursor:pointer' : '');
-    if (onClick) toast.addEventListener('click', () => { toast.remove(); onClick(); });
-    document.body.appendChild(toast);
-    requestAnimationFrame(() => { toast.style.opacity = '1'; });
-    setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 150); }, 2000);
-  }
   try {
     const res = await fetch('/api/ea-update', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({force: !!force}) });
     const data = await res.json();
     if (res.ok && data.status === 'already_running') {
       showToast('Already running — click to restart', false, () => eaUpdate(true));
+      openJobsPanel();
+      if (data.job_id) expandJob(data.job_id);
     } else if (res.ok) {
-      showToast('EA update started in tmux', false);
+      showToast('EA update started', false);
+      openJobsPanel();
+      if (data.job_id) expandJob(data.job_id);
     } else {
       showToast(data.error || 'Failed to start EA update', true);
     }
@@ -2121,15 +2118,6 @@ async function eaUpdate(force) {
 }
 
 async function eaUpdateItem(id, force) {
-  function showToast(msg, isError, onClick) {
-    const toast = document.createElement('div');
-    toast.textContent = msg;
-    toast.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:' + (isError ? 'var(--danger)' : 'var(--text)') + ';color:var(--card);padding:8px 16px;border-radius:8px;font-size:0.85rem;z-index:2000;box-shadow:var(--shadow-lg);opacity:0;transition:opacity .15s' + (onClick ? ';cursor:pointer' : '');
-    if (onClick) toast.addEventListener('click', () => { toast.remove(); onClick(); });
-    document.body.appendChild(toast);
-    requestAnimationFrame(() => { toast.style.opacity = '1'; });
-    setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 150); }, 2000);
-  }
   try {
     const res = await fetch('/api/ea-update-item', {
       method: 'POST',
@@ -2139,14 +2127,152 @@ async function eaUpdateItem(id, force) {
     const data = await res.json();
     if (res.ok && data.status === 'already_running') {
       showToast('Already running — click to restart', false, () => eaUpdateItem(id, true));
+      openJobsPanel();
+      if (data.job_id) expandJob(data.job_id);
     } else if (res.ok) {
-      showToast(`Checking on ${id} in tmux`, false);
+      showToast(`Checking ${id}...`, false);
+      openJobsPanel();
+      if (data.job_id) expandJob(data.job_id);
     } else {
       showToast(data.error || 'Failed', true);
     }
   } catch (e) {
     // silent
   }
+}
+
+// ---- Shared toast helper ----
+function showToast(msg, isError, onClick) {
+  const toast = document.createElement('div');
+  toast.textContent = msg;
+  toast.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:' + (isError ? 'var(--danger)' : 'var(--text)') + ';color:var(--card);padding:8px 16px;border-radius:8px;font-size:0.85rem;z-index:2000;box-shadow:var(--shadow-lg);opacity:0;transition:opacity .15s' + (onClick ? ';cursor:pointer' : '');
+  if (onClick) toast.addEventListener('click', () => { toast.remove(); onClick(); });
+  document.body.appendChild(toast);
+  requestAnimationFrame(() => { toast.style.opacity = '1'; });
+  setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 150); }, 2000);
+}
+
+// ---- Jobs panel ----
+let _jobsOpen = false;
+let _jobsPollTimer = null;
+let _jobsStreamSource = null;
+let _expandedJobId = null;
+let _jobsState = {};
+
+function openJobsPanel() {
+  _jobsOpen = true;
+  document.getElementById('jobs-panel').style.display = 'flex';
+  pollJobs();
+}
+
+function toggleJobsPanel() {
+  if (_jobsOpen) {
+    _jobsOpen = false;
+    document.getElementById('jobs-panel').style.display = 'none';
+    clearTimeout(_jobsPollTimer);
+    if (_jobsStreamSource) { _jobsStreamSource.close(); _jobsStreamSource = null; }
+  } else {
+    openJobsPanel();
+  }
+}
+
+function parseStreamLine(raw) {
+  try {
+    const obj = JSON.parse(raw);
+    if (obj.__done__) return null; // sentinel handled elsewhere
+    if (obj.type === 'assistant' && obj.message) {
+      const texts = (obj.message.content || [])
+        .filter(b => b.type === 'text').map(b => b.text).join('');
+      return texts || null;
+    }
+    if (obj.type === 'tool_use') {
+      const preview = JSON.stringify(obj.input || {}).slice(0, 80);
+      return `▶ ${obj.name}(${preview})`;
+    }
+    if (obj.type === 'tool_result') {
+      const content = Array.isArray(obj.content)
+        ? obj.content.filter(b => b.type === 'text').map(b => b.text).join('').slice(0, 100)
+        : String(obj.content || '').slice(0, 100);
+      return content ? `◀ ${content}` : null;
+    }
+    if (obj.type === 'result') {
+      return `✓ Done: ${(obj.result || '').slice(0, 120)}`;
+    }
+    return null;
+  } catch {
+    return raw.slice(0, 120);
+  }
+}
+
+function renderJobs(jobs) {
+  _jobsState = {};
+  jobs.forEach(j => { _jobsState[j.id] = j; });
+  const list = document.getElementById('jobs-list');
+  if (!list) return;
+  if (!jobs.length) { list.innerHTML = '<div style="padding:14px;color:var(--subtle);font-size:0.82rem;text-align:center">No jobs yet</div>'; return; }
+  const icons = { running: '⏳', done: '✓', error: '✗', killed: '⊘', pending: '·' };
+  list.innerHTML = jobs.map(j => {
+    const icon = icons[j.status] || '·';
+    const isExpanded = j.id === _expandedJobId;
+    const killBtn = j.status === 'running' ? `<button class="job-kill" onclick="event.stopPropagation();killJob('${j.id}')">kill</button>` : '';
+    return `<div class="job-item${isExpanded ? ' expanded' : ''}" onclick="expandJob('${j.id}')" id="ji-${j.id}">
+      <div class="job-row">
+        <span class="job-icon">${icon}</span>
+        <span class="job-label">${j.label}</span>
+        ${killBtn}
+      </div>
+      ${isExpanded ? `<div class="job-output" id="jo-${j.id}"></div>` : ''}
+    </div>`;
+  }).join('');
+  if (_expandedJobId && _jobsState[_expandedJobId]) {
+    // output div already in DOM; stream will fill it
+  }
+}
+
+function expandJob(jobId) {
+  if (_jobsStreamSource) { _jobsStreamSource.close(); _jobsStreamSource = null; }
+  _expandedJobId = jobId;
+  // Re-render to show/hide output divs
+  const jobs = Object.values(_jobsState);
+  renderJobs(jobs);
+  const outEl = document.getElementById('jo-' + jobId);
+  if (!outEl) return;
+  const src = new EventSource('/api/jobs/' + jobId + '/stream');
+  _jobsStreamSource = src;
+  src.onmessage = (e) => {
+    let raw;
+    try { raw = JSON.parse(e.data); } catch { return; }
+    if (typeof raw === 'object' && raw.__done__) {
+      src.close(); _jobsStreamSource = null;
+      pollJobs(); // refresh status
+      return;
+    }
+    const line = parseStreamLine(e.data);
+    if (!line) return;
+    const div = document.createElement('div');
+    if (line.startsWith('✓ Done:')) div.className = 'job-done-line';
+    div.textContent = line;
+    outEl.appendChild(div);
+    outEl.scrollTop = outEl.scrollHeight;
+  };
+  src.onerror = () => { src.close(); _jobsStreamSource = null; };
+}
+
+async function killJob(jobId) {
+  await fetch('/api/jobs/' + jobId + '/kill', { method: 'POST' });
+  pollJobs();
+}
+
+async function pollJobs() {
+  clearTimeout(_jobsPollTimer);
+  if (!_jobsOpen) return;
+  try {
+    const res = await fetch('/api/jobs');
+    const jobs = await res.json();
+    renderJobs(jobs);
+    renderTodos(); // refresh badge
+  } catch {}
+  if (_jobsOpen) _jobsPollTimer = setTimeout(pollJobs, 2000);
 }
 
 function fallbackCopy(text) {
@@ -3396,6 +3522,14 @@ window.addEventListener('scroll', () => {
   }
 }, { passive: true });
 </script>
+
+<div id="jobs-panel" class="jobs-panel" style="display:none">
+  <div class="jobs-header">
+    <span>Jobs</span>
+    <button onclick="toggleJobsPanel()">&#x2715;</button>
+  </div>
+  <div id="jobs-list"></div>
+</div>
 
 </body>
 </html>
