@@ -1243,22 +1243,34 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .ea-update-btn.running:hover { background: rgba(79,110,247,0.06); transform: none; box-shadow: none; }
   .ea-update-btn.running #ea-update-timer { display: none; }
   .ea-update-btn.running:hover #ea-update-timer { display: inline; }
-  /* SpinKit rotating double-bounce loader for the Update button */
+  /* Dot Stream (mirage) loader for the Update button */
   .ea-loader {
-    width: 14px; height: 14px; position: relative; flex-shrink: 0; margin-right: 4px;
-    animation: ea-sk-rotate 2s infinite linear;
+    --uib-size: 28px;
+    --uib-color: var(--accent);
+    --uib-speed: 2.6s;
+    --uib-dot-size: calc(var(--uib-size) * 0.23);
+    position: relative; display: flex; align-items: center; justify-content: space-between;
+    width: var(--uib-size); height: var(--uib-dot-size); flex-shrink: 0;
+    filter: url('#uib-jelly-ooze');
   }
-  .ea-loader .dot1, .ea-loader .dot2 {
-    width: 60%; height: 60%; display: inline-block; position: absolute;
-    top: 0; background-color: var(--accent); border-radius: 100%;
-    animation: ea-sk-bounce 2s infinite ease-in-out;
-    transition: background-color 0.15s;
+  .ea-loader .dot {
+    position: absolute; top: calc(50% - var(--uib-dot-size) / 2);
+    left: calc(0px - var(--uib-dot-size) / 2);
+    display: block; height: var(--uib-dot-size); width: var(--uib-dot-size);
+    border-radius: 50%; background-color: var(--uib-color);
+    animation: ea-dot-stream var(--uib-speed) linear infinite both;
+    transition: background-color 0.3s ease;
   }
-  .ea-loader .dot2 { top: auto; bottom: 0; animation-delay: -1s; }
-  @keyframes ea-sk-rotate { 100% { transform: rotate(360deg); } }
-  @keyframes ea-sk-bounce { 0%, 100% { transform: scale(0); } 50% { transform: scale(1); } }
-  .ea-update-btn.running:hover .ea-loader .dot1,
-  .ea-update-btn.running:hover .ea-loader .dot2 { background-color: var(--danger); }
+  .ea-loader .dot:nth-child(2) { animation-delay: calc(var(--uib-speed) * -0.2); }
+  .ea-loader .dot:nth-child(3) { animation-delay: calc(var(--uib-speed) * -0.4); }
+  .ea-loader .dot:nth-child(4) { animation-delay: calc(var(--uib-speed) * -0.6); }
+  .ea-loader .dot:nth-child(5) { animation-delay: calc(var(--uib-speed) * -0.8); }
+  @keyframes ea-dot-stream {
+    0%, 100% { transform: translateX(0) scale(0); }
+    50% { transform: translateX(calc(var(--uib-size) * 0.5)) scale(1); }
+    99.999% { transform: translateX(var(--uib-size)) scale(0); }
+  }
+  .ea-update-btn.running:hover .ea-loader { --uib-color: var(--danger); }
   /* ml4-style scale transition for Update button */
   .ea-btn-wrap { position: relative; display: inline-flex; align-items: center; justify-content: center; height: 18px; min-width: 3.5em; }
   .ea-lbl, .ea-running { position: absolute; inset: 0; white-space: nowrap; display: flex; align-items: center; justify-content: center; gap: 5px; transform-origin: center; }
@@ -1903,7 +1915,7 @@ function render() {
   // visibleIds includes todo IDs + section markers for collapsed sections
   visibleIds = [...visibleActiveIds, ...filteredCompleted.map(t => t.id)];
 
-  const eaBtn = '<div class="ea-update-wrap"><button id="ea-update-btn" class="btn btn-sm ea-update-btn" onclick="eaUpdateToggle()" title="Run /ea update"><span class="ea-btn-wrap"><span id="ea-update-label" class="ea-lbl" style="opacity:1">Update</span><span id="ea-update-running" class="ea-running" style="opacity:0"><span id="ea-update-spinner" class="ea-loader"><span class="dot1"></span><span class="dot2"></span></span><span id="ea-update-timer">0:00</span></span></span></button><div id="ea-update-bubble" class="ea-update-bubble"></div></div>';
+  const eaBtn = '<div class="ea-update-wrap"><button id="ea-update-btn" class="btn btn-sm ea-update-btn" onclick="eaUpdateToggle()" title="Run /ea update"><span class="ea-btn-wrap"><span id="ea-update-label" class="ea-lbl" style="opacity:1">Update</span><span id="ea-update-running" class="ea-running" style="opacity:0"><span id="ea-update-spinner" class="ea-loader"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="dot"></span></span><span id="ea-update-timer">0:00</span></span></span></button><div id="ea-update-bubble" class="ea-update-bubble"></div></div>';
   const simpleCls = simpleMode ? (toggledItems.size > 0 ? ' partial' : ' active') : (toggledItems.size > 0 ? ' partial' : '');
   const simpleBtn = `<button class="header-toggle simple-toggle-btn${simpleCls}" onclick="toggleSimpleMode()" title="Toggle simple mode (a)">Simple</button>`;
   const pColors = {high:'#b91c1c',medium:'#a16207',low:'#15803d',none:'#9ca3af'};
@@ -4338,6 +4350,9 @@ window.addEventListener('scroll', () => {
 }, { passive: true });
 </script>
 
+
+<!-- SVG filter for dot-stream loader -->
+<svg width="0" height="0" style="position:absolute"><defs><filter id="uib-jelly-ooze"><feGaussianBlur in="SourceGraphic" stdDeviation="3" result="blur"/><feColorMatrix in="blur" mode="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 18 -7" result="ooze"/><feBlend in="SourceGraphic" in2="ooze"/></filter></defs></svg>
 
 <!-- Terminal overlay -->
 <div id="terminal-overlay" onclick="if(event.target===this)minimizeTerminal()" style="display:none;position:fixed;inset:0;z-index:4000;background:rgba(0,0,0,0.5);flex-direction:column;justify-content:flex-end">
