@@ -1199,6 +1199,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <link rel="icon" type="image/png" sizes="16x16" href="/static/favicon-16x16.png">
 <link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png">
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script type="module" src="https://cdn.jsdelivr.net/npm/ldrs/dist/auto/mirage.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"></script>
@@ -1253,9 +1254,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .add-form.visible { display: block; }
   .add-form.kb-selected { box-shadow: 0 0 0 2px var(--accent), var(--shadow-md); }
-  .active-header { display: flex; align-items: center; gap: 10px; position: sticky; top: 0; z-index: 101; background: var(--bg); padding: 4px 0; }
+  .active-header { display: grid; grid-template-columns: 1fr auto; align-items: start; gap: 4px 10px; position: sticky; top: 0; z-index: 101; background: var(--bg); padding: 4px 0; }
+  .active-header-btns { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; grid-column: 1; row-gap: 6px; }
   .active-header h2 { margin: 0; }
-  .ea-update-wrap { margin-left: auto; display: inline-flex; align-items: center; gap: 4px; position: relative; }
+  .active-header .btn-group { display: inline-flex; gap: 4px; white-space: nowrap; margin-left: 6px; }
+  .ea-update-wrap { display: inline-flex; align-items: center; gap: 4px; position: relative; grid-column: 2; grid-row: 1; }
   .ea-update-bubble {
     display: none; position: absolute; top: 100%; right: 0; margin-top: 6px;
     width: 340px; max-height: 250px; overflow-y: auto;
@@ -1298,34 +1301,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .ea-update-btn.running:hover { background: rgba(79,110,247,0.06); transform: none; box-shadow: none; }
   .ea-update-btn.running #ea-update-timer { display: none; }
   .ea-update-btn.running:hover #ea-update-timer { display: inline; }
-  /* Dot Stream (mirage) loader for the Update button */
-  .ea-loader {
-    --uib-size: 28px;
-    --uib-color: var(--accent);
-    --uib-speed: 2.6s;
-    --uib-dot-size: calc(var(--uib-size) * 0.23);
-    position: relative; display: flex; align-items: center; justify-content: space-between;
-    width: var(--uib-size); height: var(--uib-dot-size); flex-shrink: 0;
-    filter: url('#uib-jelly-ooze');
+  /* Large hero spinner shown below header during update */
+  .ea-hero-spinner {
+    display: flex; justify-content: center; padding: 14px 0 10px;
+    position: sticky; top: var(--section-offset, 0px);
+    z-index: 101; background: transparent;
+    height: 0; overflow: visible;
   }
-  .ea-loader .dot {
-    position: absolute; top: calc(50% - var(--uib-dot-size) / 2);
-    left: calc(0px - var(--uib-dot-size) / 2);
-    display: block; height: var(--uib-dot-size); width: var(--uib-dot-size);
-    border-radius: 50%; background-color: var(--uib-color);
-    animation: ea-dot-stream var(--uib-speed) linear infinite both;
-    transition: background-color 0.3s ease;
-  }
-  .ea-loader .dot:nth-child(2) { animation-delay: calc(var(--uib-speed) * -0.2); }
-  .ea-loader .dot:nth-child(3) { animation-delay: calc(var(--uib-speed) * -0.4); }
-  .ea-loader .dot:nth-child(4) { animation-delay: calc(var(--uib-speed) * -0.6); }
-  .ea-loader .dot:nth-child(5) { animation-delay: calc(var(--uib-speed) * -0.8); }
-  @keyframes ea-dot-stream {
-    0%, 100% { transform: translateX(0) scale(0); }
-    50% { transform: translateX(calc(var(--uib-size) * 0.5)) scale(1); }
-    99.999% { transform: translateX(var(--uib-size)) scale(0); }
-  }
-  .ea-update-btn.running:hover .ea-loader { --uib-color: var(--danger); }
   /* ml4-style scale transition for Update button */
   .ea-btn-wrap { position: relative; display: inline-flex; align-items: center; justify-content: center; height: 18px; min-width: 3.5em; }
   .ea-lbl, .ea-running { position: absolute; inset: 0; white-space: nowrap; display: flex; align-items: center; justify-content: center; gap: 5px; transform-origin: center; }
@@ -1377,7 +1359,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .search-bar input::placeholder { color: var(--subtle); }
   .sticky-header {
     position: sticky; top: 0; z-index: 102;
-    background: var(--bg); padding-top: 10px;
+    background: var(--bg); padding-top: 10px; padding-bottom: 6px;
   }
   .active-header {
     top: var(--sticky-offset, 0px);
@@ -1797,6 +1779,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <tr><td><kbd>&#8984;&#8593;</kbd></td><td>Previous section</td></tr>
       <tr><td><kbd>&#8592;</kbd></td><td>Collapse section</td></tr>
       <tr><td><kbd>&#8594;</kbd></td><td>Expand section</td></tr>
+      <tr><td><kbd>Alt+&#9166;</kbd></td><td>Collapse/expand all</td></tr>
       <tr><td colspan="2" class="shortcut-section">Actions</td></tr>
       <tr><td><kbd>n</kbd></td><td>New todo</td></tr>
       <tr><td><kbd>e</kbd></td><td>Edit selected</td></tr>
@@ -1928,15 +1911,10 @@ function render() {
   const filteredCompleted = afterSessions(afterPriority(afterSearch(completed)));
 
 
-  if (filteredActive.length === 0 && filteredCompleted.length === 0) {
-    if (searching) {
-      activeEl.innerHTML = '<div class="empty-state">No matching todos</div>';
-    } else {
-      activeEl.innerHTML = '<div class="empty-state">No todos yet. Press <strong>n</strong> to add one!</div>';
-    }
+  if (filteredActive.length === 0 && filteredCompleted.length === 0 && !searching && allTodos.length === 0) {
+    activeEl.innerHTML = '<div class="empty-state">No todos yet. Press <strong>n</strong> to add one!</div>';
     completedEl.innerHTML = '';
     visibleIds = [];
-    // Restore form state if it was visible
     if (formWasVisible) _restoreInlineForm(form, formTitle, formDesc, formPriority, formSection, formSectionCustom);
     applySelection();
     return;
@@ -1977,7 +1955,7 @@ function render() {
   // visibleIds includes todo IDs + section markers for collapsed sections
   visibleIds = [...visibleActiveIds, ...filteredCompleted.map(t => t.id)];
 
-  const eaBtn = '<div class="ea-update-wrap"><button id="ea-update-btn" class="btn btn-sm ea-update-btn" onclick="eaUpdateToggle()" title="Run /ea update"><span class="ea-btn-wrap"><span id="ea-update-label" class="ea-lbl" style="opacity:1">Update</span><span id="ea-update-running" class="ea-running" style="opacity:0"><span id="ea-update-spinner" class="ea-loader"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="dot"></span></span><span id="ea-update-timer">0:00</span></span></span></button><div id="ea-update-bubble" class="ea-update-bubble"></div></div>';
+  const eaBtn = '<div class="ea-update-wrap"><button id="ea-update-btn" class="btn btn-sm ea-update-btn" onclick="eaUpdateToggle()" title="Run /ea update"><span class="ea-btn-wrap"><span id="ea-update-label" class="ea-lbl" style="opacity:1">Update</span><span id="ea-update-running" class="ea-running" style="opacity:0"><l-mirage size="28" speed="2.5" color="' + getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() + '"></l-mirage><span id="ea-update-timer">0:00</span></span></span></button><div id="ea-update-bubble" class="ea-update-bubble"></div></div>';
   const simpleCls = simpleMode ? (toggledItems.size > 0 ? ' partial' : ' active') : (toggledItems.size > 0 ? ' partial' : '');
   const simpleBtn = `<button class="header-toggle simple-toggle-btn${simpleCls}" onclick="toggleSimpleMode()" title="Toggle simple mode (a)">Simple</button>`;
   const pColors = {high:'#b91c1c',medium:'#a16207',low:'#15803d',none:'#9ca3af'};
@@ -1995,10 +1973,17 @@ function render() {
   }).join('');
   const previewBtn = `<button class="header-toggle preview-toggle-btn${previewMode ? ' active' : ''}" onclick="togglePreviewMode()" title="Preview mode: auto-expand selected (v)">Preview</button>`;
   const sessionsBtn = `<button class="header-toggle${filterActiveSessions ? ' active' : ''}" onclick="toggleFilterSessions()" title="Filter by active sessions (Ctrl+S)" style="${filterActiveSessions ? '' : 'color:var(--subtle)'}">Sessions</button>`;
-  const headerBtns = filterBtns + simpleBtn + previewBtn + sessionsBtn + eaBtn;
+  const activeSections = sectionsOrder.filter(s => s);
+  const collapsedCount = activeSections.filter(s => collapsedSections.has(s)).length;
+  const allCollapsed = activeSections.length > 0 && collapsedCount === activeSections.length;
+  const collapseAllCls = activeSections.length === 0 ? ' style="display:none"' : (collapsedCount > 0 ? (allCollapsed ? ' class="header-toggle active"' : ' class="header-toggle partial"') : ' class="header-toggle"');
+  const collapseAllBtn = `<button ${collapseAllCls} onclick="toggleCollapseAll()" title="Collapse/expand all sections">${allCollapsed ? '&#9654;' : '&#9660;'}</button>`;
+  const modeGroup = `<span class="btn-group">${simpleBtn}${previewBtn}${sessionsBtn}</span>`;
+  const headerBtns = '<div class="active-header-btns">' + collapseAllBtn + '<h2>Active' + (filteredActive.length ? ' (' + filteredActive.length + ')' : '') + '</h2>' + filterBtns + modeGroup + '</div>' + eaBtn;
+  const heroSpinnerHtml = '<div id="ea-update-hero-spinner" class="ea-hero-spinner" style="display:none"><l-mirage size="60" speed="2.5" color="' + getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() + '"></l-mirage></div>';
   activeEl.innerHTML = filteredActive.length
-    ? '<div class="active-header"><h2>Active (' + filteredActive.length + ')</h2>' + headerBtns + '</div>' + activeHtml
-    : '<div class="active-header"><h2>Active</h2>' + headerBtns + '</div><div class="empty-state">All done! &#127881;</div>';
+    ? '<div class="active-header">' + headerBtns + '</div>' + heroSpinnerHtml + activeHtml
+    : '<div class="active-header">' + headerBtns + '</div>' + heroSpinnerHtml + '<div class="empty-state">All done! &#127881;</div>';
 
   const isCompletedCollapsed = !searching && collapsedSections.has('__completed__');
   if (filteredCompleted.length) {
@@ -2032,7 +2017,7 @@ function render() {
   // Clamp selectedIdx if items disappeared (e.g. section collapsed)
   if (selectedIdx > visibleIds.length) selectedIdx = visibleIds.length > 0 ? visibleIds.length : -1;
 
-  // Set sticky offsets for stacking: search bar → active header → section headers
+  // Set sticky offsets for stacking: search bar → active header → section headers + hero spinner
   const stickyEl = document.querySelector('.sticky-header');
   const activeHeaderEl = document.querySelector('.active-header');
   const searchH = stickyEl ? stickyEl.offsetHeight : 0;
@@ -2044,6 +2029,7 @@ function render() {
   _restoreJobOutputs();
   _restoreEaUpdateBubble();
 }
+
 
 function _restoreInlineForm(form, title, desc, priority, section, sectionCustom) {
   if (insertBeforeId) {
@@ -2118,7 +2104,7 @@ function renderTodo(t) {
       <div class="todo-actions">
         ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();eaUpdateItem('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Refresh via /ea checkon" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#8635;</button>` : ''}
         ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();startInTmux('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Open terminal (s)" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#9654;</button>` : ''}
-        <button onclick="event.stopPropagation();deleteTodo('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 6px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Delete" onmouseover="this.style.color='var(--danger)'" onmouseout="this.style.color='var(--subtle)'">&#10005;</button>
+
       </div>
       ${priorityBadge}
     </div>
@@ -2347,6 +2333,17 @@ function toggleItemDesc(id) {
 function toggleSectionCollapse(section) {
   if (collapsedSections.has(section)) collapsedSections.delete(section);
   else collapsedSections.add(section);
+  render();
+}
+
+function toggleCollapseAll() {
+  const secs = sectionsOrder.filter(s => s);
+  const allCollapsed = secs.length > 0 && secs.every(s => collapsedSections.has(s));
+  if (allCollapsed) {
+    secs.forEach(s => collapsedSections.delete(s));
+  } else {
+    secs.forEach(s => collapsedSections.add(s));
+  }
   render();
 }
 
@@ -2731,6 +2728,24 @@ function termSendCommand(cmd) {
   session.term.focus();
 }
 
+function copyTmuxAttach() {
+  if (!_activeTermTodoId) return;
+  const session = _termSessions[_activeTermTodoId];
+  if (!session) return;
+  const cmd = 'tmux attach -t t-' + session.sessionId;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(cmd).then(() => showToast('Copied: ' + cmd)).catch(() => { _fallbackCopy(cmd); showToast('Copied: ' + cmd); });
+  } else {
+    _fallbackCopy(cmd); showToast('Copied: ' + cmd);
+  }
+}
+function _fallbackCopy(text) {
+  const ta = document.createElement('textarea');
+  ta.value = text; ta.style.cssText = 'position:fixed;opacity:0';
+  document.body.appendChild(ta); ta.select();
+  document.execCommand('copy'); ta.remove();
+}
+
 function minimizeTerminal() {
   const overlay = document.getElementById('terminal-overlay');
   overlay.classList.remove('visible');
@@ -2841,7 +2856,7 @@ async function eaUpdateItem(id, force) {
 function showToast(msg, isError, onClick) {
   const toast = document.createElement('div');
   toast.textContent = msg;
-  toast.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:' + (isError ? 'var(--danger)' : 'var(--text)') + ';color:var(--card);padding:8px 16px;border-radius:8px;font-size:0.85rem;z-index:2000;box-shadow:var(--shadow-lg);opacity:0;transition:opacity .15s' + (onClick ? ';cursor:pointer' : '');
+  toast.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:' + (isError ? 'var(--danger)' : 'var(--text)') + ';color:var(--card);padding:8px 16px;border-radius:8px;font-size:0.85rem;z-index:5000;box-shadow:var(--shadow-lg);opacity:0;transition:opacity .15s' + (onClick ? ';cursor:pointer' : '');
   if (onClick) toast.addEventListener('click', () => { toast.remove(); onClick(); });
   document.body.appendChild(toast);
   requestAnimationFrame(() => { toast.style.opacity = '1'; });
@@ -3069,8 +3084,11 @@ function _updateEaUpdateBtn() {
     _transitionEaBtn(isRunning);
   }
 
+  const hero = document.getElementById('ea-update-hero-spinner');
+
   if (isRunning) {
     btn.classList.add('running');
+    if (hero) hero.style.display = 'flex';
     if (_eaUpdateTimerInterval) clearInterval(_eaUpdateTimerInterval);
     const tick = () => {
       const timer = document.getElementById('ea-update-timer');
@@ -3084,6 +3102,7 @@ function _updateEaUpdateBtn() {
     _eaUpdateTimerInterval = setInterval(tick, 1000);
   } else {
     btn.classList.remove('running');
+    if (hero) hero.style.display = 'none';
     if (_eaUpdateTimerInterval) { clearInterval(_eaUpdateTimerInterval); _eaUpdateTimerInterval = null; }
   }
 }
@@ -3906,6 +3925,12 @@ document.addEventListener('keydown', e => {
     return;
   }
 
+  if (e.altKey && e.key === 'Enter' && !e.metaKey && !e.ctrlKey && !e.shiftKey) {
+    e.preventDefault();
+    toggleCollapseAll();
+    return;
+  }
+
   const tag = (e.target.tagName || '').toLowerCase();
 
   // When inside the add-form inputs, handle Escape to close form, Cmd+Enter to add
@@ -4464,8 +4489,6 @@ window.addEventListener('scroll', () => {
 </script>
 
 
-<!-- SVG filter for dot-stream loader -->
-<svg width="0" height="0" style="position:absolute"><defs><filter id="uib-jelly-ooze"><feGaussianBlur in="SourceGraphic" stdDeviation="3" result="blur"/><feColorMatrix in="blur" mode="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 18 -7" result="ooze"/><feBlend in="SourceGraphic" in2="ooze"/></filter></defs></svg>
 
 <!-- Terminal overlay -->
 <div id="terminal-overlay" onclick="if(event.target===this)minimizeTerminal()" style="display:none;position:fixed;inset:0;z-index:4000;background:rgba(0,0,0,0.5);flex-direction:column;justify-content:flex-end">
@@ -4474,6 +4497,7 @@ window.addEventListener('scroll', () => {
     <div id="terminal-titlebar" style="display:flex;align-items:center;padding:6px 14px 10px;gap:10px;border-bottom:1px solid rgba(255,255,255,0.1);flex-shrink:0;cursor:ns-resize" onmousedown="_startTermResize(event)">
       <span id="terminal-title" style="color:#e2e8f0;font-size:0.85rem;font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
       <button onclick="termSendCommand('/ea sync')" style="background:rgba(255,255,255,0.1);border:none;color:#e2e8f0;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem">Log Status</button>
+      <button onclick="copyTmuxAttach()" style="background:rgba(255,255,255,0.1);border:none;color:#e2e8f0;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem">Attach</button>
       <button onclick="killTerminal(_activeTermTodoId)" style="background:rgba(239,68,68,0.2);border:1px solid rgba(239,68,68,0.4);color:#fca5a5;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem">Kill</button>
     </div>
     <div id="terminal-container" style="flex:1;overflow:hidden;padding:4px"></div>
