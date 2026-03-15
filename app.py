@@ -16,7 +16,10 @@ import json
 import uuid
 import copy
 import shutil
+import signal
 import subprocess
+import threading
+import time
 from collections import deque
 from datetime import datetime
 from flask import Flask, request, jsonify, Response
@@ -26,6 +29,9 @@ TODO_FILE = "todos.md"
 
 # Undo stack: each entry is (active_todos_list, completed_todos_list)
 _undo_stack: deque[tuple[list[dict], list[dict]]] = deque(maxlen=30)
+
+# job_id -> {id, label, job_key, status, output_lines, proc, created_at}
+_jobs: dict[str, dict] = {}
 
 
 def _completed_file_path(path: str) -> str:
@@ -583,184 +589,218 @@ def undo():
     return jsonify({"ok": True})
 
 
+def _run_claude_job(job_id: str, prompt: str, cwd: str):
+    """Thread target: run claude -p as a subprocess and parse stream-json output."""
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+
+    candidates = [
+        shutil.which("claude", path=env.get("PATH", os.defpath)),
+        os.path.expanduser("~/.local/bin/claude"),
+        "/opt/homebrew/bin/claude",
+        "/usr/local/bin/claude",
+    ]
+    claude_bin = next((c for c in candidates if c and os.path.isfile(c)), None)
+    if not claude_bin:
+        _jobs[job_id]["output_lines"].append("error: claude binary not found")
+        _jobs[job_id]["status"] = "error"
+        return
+
+    cmd = [claude_bin, "-p", prompt, "--dangerously-skip-permissions",
+           "--output-format", "stream-json", "--verbose",
+           "--effort", "low", "--include-partial-messages"]
+    _jobs[job_id]["status"] = "running"
+
+    def emit(line: str) -> None:
+        if line.strip():
+            _jobs[job_id]["output_lines"].append(line)
+
+    try:
+        proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, env=env,
+                                start_new_session=True)
+        _jobs[job_id]["proc"] = proc
+
+        text_buf = ""       # accumulates text_delta fragments until a newline or block end
+        got_streaming = False  # True if we receive content_block_delta events
+
+        for raw_line in proc.stdout:
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            try:
+                data = json.loads(raw_line)
+            except json.JSONDecodeError:
+                emit(raw_line[:200])
+                continue
+
+            t = data.get("type", "")
+
+            if t == "content_block_start":
+                block = data.get("content_block", {})
+                if block.get("type") == "tool_use":
+                    if text_buf.strip():
+                        emit(text_buf.strip())
+                        text_buf = ""
+                    emit(f"▶ {block.get('name', '?')}...")
+                elif block.get("type") == "text" and text_buf.strip():
+                    emit(text_buf.strip())
+                    text_buf = ""
+
+            elif t == "content_block_delta":
+                got_streaming = True
+                delta = data.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    text_buf += delta.get("text", "")
+                    while "\n" in text_buf:
+                        line, text_buf = text_buf.split("\n", 1)
+                        emit(line)
+
+            elif t == "content_block_stop":
+                if text_buf.strip():
+                    emit(text_buf.strip())
+                    text_buf = ""
+
+            elif t == "assistant" and not got_streaming:
+                # Fallback: no streaming events, parse the complete assistant message
+                parts = []
+                for block in data.get("message", {}).get("content", []):
+                    if block.get("type") == "text":
+                        text = block["text"].strip()
+                        if text:
+                            parts.append(text)
+                    elif block.get("type") == "tool_use":
+                        name = block.get("name", "?")
+                        inp = json.dumps(block.get("input", {}))[:80]
+                        parts.append(f"▶ {name}({inp})")
+                for part in parts:
+                    for line in part.splitlines():
+                        emit(line)
+
+            elif t == "result":
+                result = data.get("result", "").strip()
+                cost = data.get("cost_usd")
+                cost_str = f" — ${cost:.4f}" if cost else ""
+                emit(f"✓ Done{cost_str}" + (f": {result}" if result else ""))
+
+            # Skip: user, tool_result, system, debug, rate_limit_event
+
+        if text_buf.strip():
+            emit(text_buf.strip())
+
+        proc.wait()
+        if _jobs[job_id]["status"] != "killed":
+            _jobs[job_id]["status"] = "done" if proc.returncode == 0 else "error"
+    except Exception as exc:
+        _jobs[job_id]["output_lines"].append(f"error: {exc}")
+        _jobs[job_id]["status"] = "error"
+
+
+def _kill_process_tree(pid: int) -> None:
+    """Send SIGTERM to a process and all its descendants.
+
+    Reads the full process tree snapshot first so children that create their
+    own sessions (like claude subagents) are still caught before reparenting.
+    """
+    try:
+        result = subprocess.run(["ps", "-o", "pid,ppid", "-ax"],
+                                capture_output=True, text=True)
+        children: dict[int, list[int]] = {}
+        for line in result.stdout.strip().splitlines()[1:]:
+            parts = line.split()
+            if len(parts) >= 2:
+                p, pp = int(parts[0]), int(parts[1])
+                children.setdefault(pp, []).append(p)
+
+        # BFS from root to collect descendants
+        to_kill: list[int] = []
+        queue = [pid]
+        while queue:
+            p = queue.pop()
+            to_kill.append(p)
+            queue.extend(children.get(p, []))
+
+        # Kill leaves first so parents don't spawn replacements
+        for p in reversed(to_kill):
+            try:
+                os.kill(p, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+    except Exception:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def _start_claude_job(label: str, job_key: str, prompt: str, cwd: str) -> str:
+    """Start a headless Claude job; return job_id. Deduplicates by job_key."""
+    for j in _jobs.values():
+        if j["job_key"] == job_key and j["status"] == "running":
+            return j["id"]
+    job_id = str(uuid.uuid4())[:8]
+    _jobs[job_id] = {
+        "id": job_id,
+        "label": label,
+        "job_key": job_key,
+        "status": "pending",
+        "output_lines": [],
+        "proc": None,
+        "created_at": time.time(),
+    }
+    t = threading.Thread(target=_run_claude_job, args=(job_id, prompt, cwd), daemon=True)
+    t.start()
+    return job_id
+
+
 @app.route("/api/todos/<todo_id>/start", methods=["POST"])
 def start_in_tmux(todo_id):
-    """Launch a Claude Code session in tmux working on the given todo."""
+    """Launch a headless Claude Code session working on the given todo."""
     todos = _parse_todo_file(TODO_FILE)
     todo = next((t for t in todos if t["id"] == todo_id), None)
     if not todo:
         return jsonify({"error": "Todo not found"}), 404
 
-    # Sanitize title for tmux window name
-    raw_title = todo.get("title", todo_id)
-    window_name = re.sub(r"[^a-zA-Z0-9_-]", "-", raw_title)[:30].strip("-")
-    if not window_name:
-        window_name = "task"
-
-    tmux_bin = shutil.which("tmux") or "/opt/homebrew/bin/tmux"
-    tmux_session = "0"
-    try:
-        # Ensure session exists
-        result = subprocess.run(
-            [tmux_bin, "has-session", "-t", tmux_session],
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            subprocess.run(
-                [tmux_bin, "new-session", "-d", "-s", tmux_session],
-                check=True,
-                capture_output=True,
-            )
-
-        # Create new window and launch claude
-        subprocess.run(
-            [tmux_bin, "new-window", "-t", f"{tmux_session}:", "-n", window_name],
-            check=True,
-            capture_output=True,
-        )
-        todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
-        subprocess.run(
-            [
-                tmux_bin,
-                "send-keys",
-                "-t",
-                f"{tmux_session}:{window_name}",
-                f"cd {todo_dir} && claude --dangerously-skip-permissions",
-                "Enter",
-            ],
-            check=True,
-            capture_output=True,
-        )
-
-        # Send /ea workon after a delay (background so we don't block the response)
-        workon_cmd = f"/ea workon {todo_id}"
-        subprocess.Popen(
-            f'sleep 3 && {tmux_bin} send-keys -t "{tmux_session}:{window_name}" "{workon_cmd}" Enter',
-            shell=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-        return jsonify({"status": "started", "window": window_name})
-    except FileNotFoundError:
-        return jsonify({"error": "tmux is not installed"}), 500
-    except subprocess.CalledProcessError as exc:
-        return jsonify({"error": f"tmux error: {exc.stderr.decode().strip()}"}), 500
-
-
-def _tmux_window_exists(tmux_bin, session, window_name):
-    """Check if a tmux window with the given name exists."""
-    result = subprocess.run(
-        [tmux_bin, "list-panes", "-t", f"{session}:={window_name}"],
-        capture_output=True,
-    )
-    return result.returncode == 0
+    todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
+    job_id = _start_claude_job(todo.get("title", todo_id), f"workon-{todo_id}",
+                               f"/ea workon {todo_id}", todo_dir)
+    return jsonify({"status": "started", "job_id": job_id})
 
 
 @app.route("/api/ea-update", methods=["POST"])
 def ea_update():
-    """Run /ea update in a tmux window."""
+    """Run /ea update as a headless Claude job."""
     data = request.json or {}
     force = data.get("force", False)
-    tmux_bin = shutil.which("tmux") or "/opt/homebrew/bin/tmux"
-    tmux_session = "0"
-    window_name = "ea-update"
-    try:
-        result = subprocess.run(
-            [tmux_bin, "has-session", "-t", tmux_session],
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            subprocess.run(
-                [tmux_bin, "new-session", "-d", "-s", tmux_session],
-                check=True,
-                capture_output=True,
-            )
 
-        if _tmux_window_exists(tmux_bin, tmux_session, window_name):
-            if not force:
-                return jsonify({"status": "already_running", "window": window_name})
-            subprocess.run(
-                [tmux_bin, "kill-window", "-t", f"{tmux_session}:={window_name}"],
-                capture_output=True,
-            )
+    # Check for existing running job
+    existing = next((j for j in _jobs.values()
+                     if j["job_key"] == "ea-update" and j["status"] == "running"), None)
+    if existing and not force:
+        return jsonify({"status": "already_running", "job_id": existing["id"]})
 
-        subprocess.run(
-            [tmux_bin, "new-window", "-t", f"{tmux_session}:", "-n", window_name],
-            check=True,
-            capture_output=True,
-        )
-        todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
-        subprocess.run(
-            [
-                tmux_bin, "send-keys",
-                "-t", f"{tmux_session}:={window_name}",
-                f"cd {todo_dir} && claude --dangerously-skip-permissions '/ea update'",
-                "Enter",
-            ],
-            check=True,
-            capture_output=True,
-        )
-
-        return jsonify({"status": "started", "window": window_name})
-    except FileNotFoundError:
-        return jsonify({"error": "tmux is not installed"}), 500
-    except subprocess.CalledProcessError as exc:
-        return jsonify({"error": f"tmux error: {exc.stderr.decode().strip()}"}), 500
+    todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
+    job_id = _start_claude_job("EA Update", "ea-update", "/ea update", todo_dir)
+    return jsonify({"status": "started", "job_id": job_id})
 
 
 @app.route("/api/ea-update-item", methods=["POST"])
 def ea_update_item():
-    """Run /ea checkon <item_id> in a tmux window."""
+    """Run /ea checkon <item_id> as a headless Claude job."""
     data = request.json
     item_id = (data.get("id") or "").strip()
     force = data.get("force", False)
     if not item_id:
         return jsonify({"error": "id required"}), 400
-    tmux_bin = shutil.which("tmux") or "/opt/homebrew/bin/tmux"
-    tmux_session = "0"
-    window_name = f"ea-{item_id}"
-    try:
-        result = subprocess.run(
-            [tmux_bin, "has-session", "-t", tmux_session],
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            subprocess.run(
-                [tmux_bin, "new-session", "-d", "-s", tmux_session],
-                check=True,
-                capture_output=True,
-            )
 
-        if _tmux_window_exists(tmux_bin, tmux_session, window_name):
-            if not force:
-                return jsonify({"status": "already_running", "window": window_name})
-            subprocess.run(
-                [tmux_bin, "kill-window", "-t", f"{tmux_session}:={window_name}"],
-                capture_output=True,
-            )
+    job_key = f"ea-{item_id}"
+    existing = next((j for j in _jobs.values()
+                     if j["job_key"] == job_key and j["status"] == "running"), None)
+    if existing and not force:
+        return jsonify({"status": "already_running", "job_id": existing["id"]})
 
-        subprocess.run(
-            [tmux_bin, "new-window", "-t", f"{tmux_session}:", "-n", window_name],
-            check=True,
-            capture_output=True,
-        )
-        todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
-        subprocess.run(
-            [
-                tmux_bin, "send-keys",
-                "-t", f"{tmux_session}:={window_name}",
-                f"cd {todo_dir} && claude --dangerously-skip-permissions '/ea checkon {item_id}'",
-                "Enter",
-            ],
-            check=True,
-            capture_output=True,
-        )
-        return jsonify({"status": "started", "window": window_name})
-    except FileNotFoundError:
-        return jsonify({"error": "tmux is not installed"}), 500
-    except subprocess.CalledProcessError as exc:
-        return jsonify({"error": f"tmux error: {exc.stderr.decode().strip()}"}), 500
+    todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
+    job_id = _start_claude_job(f"Check: {item_id}", job_key, f"/ea checkon {item_id}", todo_dir)
+    return jsonify({"status": "started", "job_id": job_id})
 
 
 @app.route("/api/resume-conv", methods=["POST"])
@@ -808,6 +848,55 @@ def resume_conv():
         return jsonify({"error": "tmux is not installed"}), 500
     except subprocess.CalledProcessError as exc:
         return jsonify({"error": f"tmux error: {exc.stderr.decode().strip()}"}), 500
+
+
+@app.route("/api/jobs")
+def list_jobs():
+    """List all jobs, purging completed/killed entries older than 30 minutes."""
+    cutoff = time.time() - 1800
+    stale = [jid for jid, j in _jobs.items()
+             if j["status"] in ("done", "error", "killed") and j["created_at"] < cutoff]
+    for jid in stale:
+        del _jobs[jid]
+    return jsonify([{
+        "id": j["id"], "label": j["label"], "job_key": j["job_key"],
+        "status": j["status"], "line_count": len(j["output_lines"]), "created_at": j["created_at"]
+    } for j in _jobs.values()])
+
+
+@app.route("/api/jobs/<job_id>/stream")
+def stream_job(job_id):
+    """SSE stream of raw output lines for a job."""
+    job = _jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "not found"}), 404
+
+    def generate():
+        sent = 0
+        while True:
+            while sent < len(job["output_lines"]):
+                yield f"data: {json.dumps(job['output_lines'][sent])}\n\n"
+                sent += 1
+            if job["status"] in ("done", "error", "killed"):
+                yield f"data: {json.dumps({'__done__': True, 'status': job['status']})}\n\n"
+                break
+            time.sleep(0.05)
+
+    return Response(generate(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.route("/api/jobs/<job_id>/kill", methods=["POST"])
+def kill_job(job_id):
+    """Cancel a running job."""
+    job = _jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "not found"}), 404
+    proc = job.get("proc")
+    if proc and proc.poll() is None:
+        _kill_process_tree(proc.pid)
+    job["status"] = "killed"
+    return jsonify({"ok": True})
 
 
 # ---------------------------------------------------------------------------
@@ -878,7 +967,32 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .add-form.kb-selected { box-shadow: 0 0 0 2px var(--accent), var(--shadow-md); }
   .active-header { display: flex; align-items: center; gap: 10px; position: sticky; top: 0; z-index: 101; background: var(--bg); padding: 4px 0; }
   .active-header h2 { margin: 0; }
-  .ea-update-btn { margin-left: auto; border: 1px solid var(--border); font-size: 0.75rem; padding: 5px 10px; }
+  .ea-update-wrap { margin-left: auto; display: inline-flex; align-items: center; gap: 4px; }
+  .ea-update-btn { border: 1px solid var(--border); font-size: 0.75rem; padding: 5px 10px; min-width: 72px; display: flex; align-items: center; gap: 5px; }
+  .ea-update-btn.running { border-color: var(--accent); color: var(--accent); }
+  /* SpinKit rotating double-bounce loader for the Update button */
+  .ea-loader {
+    width: 14px; height: 14px; position: relative; flex-shrink: 0; margin-right: 4px;
+    animation: ea-sk-rotate 2s infinite linear;
+  }
+  .ea-loader .dot1, .ea-loader .dot2 {
+    width: 60%; height: 60%; display: inline-block; position: absolute;
+    top: 0; background-color: var(--accent); border-radius: 100%;
+    animation: ea-sk-bounce 2s infinite ease-in-out;
+    transition: background-color 0.15s;
+  }
+  .ea-loader .dot2 { top: auto; bottom: 0; animation-delay: -1s; }
+  @keyframes ea-sk-rotate { 100% { transform: rotate(360deg); } }
+  @keyframes ea-sk-bounce { 0%, 100% { transform: scale(0); } 50% { transform: scale(1); } }
+  .ea-update-btn.running:hover .ea-loader .dot1,
+  .ea-update-btn.running:hover .ea-loader .dot2 { background-color: var(--danger); }
+  /* ml4-style scale transition for Update button */
+  .ea-btn-wrap { position: relative; display: inline-flex; align-items: center; justify-content: center; height: 18px; min-width: 3.5em; }
+  .ea-lbl, .ea-running { position: absolute; inset: 0; white-space: nowrap; display: flex; align-items: center; justify-content: center; gap: 5px; transform-origin: center; }
+  @keyframes ea-btn-scale-in { from { opacity: 0; transform: scale(0.2); } to { opacity: 1; transform: scale(1); } }
+  @keyframes ea-btn-scale-out { from { opacity: 1; transform: scale(1); } to { opacity: 0; transform: scale(3); } }
+  .ea-lbl.anim-in, .ea-running.anim-in { animation: ea-btn-scale-in 350ms ease forwards; }
+  .ea-lbl.anim-out, .ea-running.anim-out { animation: ea-btn-scale-out 250ms cubic-bezier(0.95,0.05,0.795,0.035) forwards; }
   .header-toggle {
     font-size: 0.7rem; padding: 3px 8px; border-radius: 12px;
     border: 1px solid var(--border); background: var(--card); color: var(--subtle);
@@ -931,17 +1045,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .section-header-row {
     top: var(--section-offset, 0px);
   }
-  .add-form input, .add-form textarea, .add-form select {
+  .add-form input, .add-form textarea {
     width: 100%; padding: 10px 14px; border: 1px solid var(--border); border-radius: 8px;
     font-size: 1rem; font-family: inherit; margin-bottom: 10px;
     background: var(--bg); transition: border-color 0.15s, box-shadow 0.15s; color: var(--text);
   }
-  .add-form input:focus, .add-form textarea:focus, .add-form select:focus {
+  .add-form input:focus, .add-form textarea:focus {
     outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-light);
   }
   .add-form textarea { resize: vertical; min-height: 56px; }
   .add-form .row { display: flex; gap: 8px; align-items: center; }
-  .add-form .row select { width: auto; margin-bottom: 0; }
   .btn {
     padding: 9px 18px; border: none; border-radius: 8px; font-size: 0.9rem;
     font-weight: 600; cursor: pointer; transition: all 0.15s; letter-spacing: -0.01em;
@@ -963,7 +1076,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     position: relative; overflow: hidden;
   }
   .todo-header {
-    display: flex; align-items: flex-start; gap: 12px; width: 100%;
+    display: flex; align-items: center; gap: 12px; width: 100%;
   }
   .todo-item:hover { box-shadow: var(--shadow-md); transform: translateY(-1px); }
   .todo-item.status-completed {
@@ -1030,7 +1143,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     transition: opacity 0.1s;
   }
   .section-header-row::after {
-    content: ''; position: absolute; left: 0; right: 0; top: 100%;
+    content: ''; position: absolute; left: -4px; right: -4px; top: 100%;
     height: 24px; background: linear-gradient(to bottom, var(--bg), transparent);
     pointer-events: none;
   }
@@ -1124,6 +1237,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .edit-desc-cm .cm-content { min-height: 56px; padding: 10px 14px; font-family: inherit; }
   .edit-desc-cm .cm-scroller { overflow: auto; }
   .edit-desc-cm .cm-line { line-height: 1.6; }
+  .edit-select {
+    width: 100%; padding: 10px 14px; border: 1px solid var(--border); border-radius: 8px;
+    font-size: 0.85rem; font-family: inherit; margin-bottom: 10px;
+    background: var(--bg); transition: border-color 0.15s, box-shadow 0.15s; color: var(--text);
+  }
+  .edit-select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-light); }
   .edit-actions { display: flex; gap: 8px; margin-top: 10px; align-items: center; }
 
   /* Section headers */
@@ -1235,6 +1354,38 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .swiping .swipe-content { transition: none; }
   .snap-back .swipe-content { transition: transform 0.25s cubic-bezier(0.2,0.8,0.4,1); transform: translateX(0) !important; }
   .snap-complete .swipe-content { transition: transform 0.2s ease-in; }
+
+  /* Inline job spinner — SpinKit double bounce, morphs to ✕ on hover */
+  .job-spinner {
+    display: inline-block; width: 13px; height: 13px; flex-shrink: 0;
+    vertical-align: middle; margin-right: 5px; position: relative; cursor: pointer;
+  }
+  .job-spinner .sk-child {
+    width: 100%; height: 100%; border-radius: 50%;
+    background: var(--accent); opacity: 0.6;
+    position: absolute; top: 0; left: 0;
+    animation: sk-doubleBounce 2s infinite ease-in-out;
+    transition: opacity 0.15s;
+  }
+  .job-spinner .sk-bounce2 { animation-delay: -1s; }
+  @keyframes sk-doubleBounce { 0%, 100% { transform: scale(0); } 50% { transform: scale(1); } }
+  .job-spinner::after {
+    content: '✕'; position: absolute; top: 50%; left: 50%;
+    transform: translate(-50%, -50%); font-size: 9px;
+    color: var(--danger); opacity: 0; transition: opacity 0.15s; pointer-events: none;
+  }
+  .job-spinner:hover .sk-child { opacity: 0 !important; }
+  .job-spinner:hover::after { opacity: 1; }
+  /* Inline job output — only visible when item is expanded */
+  .item-job-output {
+    display: none; font-family: monospace; font-size: 0.72rem; line-height: 1.5;
+    color: var(--muted); white-space: pre-wrap; word-break: break-all;
+    background: rgba(0,0,0,0.025); border-radius: 6px;
+    padding: 6px 10px; margin-top: 8px; max-height: 200px; overflow-y: auto;
+    border: 1px solid var(--border);
+  }
+  .todo-item.item-toggled .item-job-output { display: block; }
+  .job-done-line { color: var(--accent); font-weight: 600; }
 </style>
 </head>
 <body class="simple-mode">
@@ -1254,20 +1405,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </div>
 
 <div class="add-form" id="add-form">
-  <input type="text" id="new-title" placeholder="What needs to be done?">
+  <input class="edit-title" type="text" id="new-title" placeholder="What needs to be done?">
   <textarea id="new-desc" placeholder="Description (optional)"></textarea>
-  <select id="new-section" style="font-size:0.85rem; width:100%; margin-bottom:8px;">
+  <select class="edit-select" id="new-section">
     <option value="">No section</option>
   </select>
-  <input type="text" id="new-section-custom" placeholder="New section name" style="font-size:0.85rem; display:none;">
+  <input class="edit-title" type="text" id="new-section-custom" placeholder="New section name" style="display:none;">
   <div class="row">
-    <select id="new-priority">
+    <select class="edit-select" id="new-priority" style="width:auto;margin-bottom:0">
       <option value="high">High</option>
       <option value="medium" selected>Medium</option>
       <option value="low">Low</option>
       <option value="none">None</option>
     </select>
-    <button class="btn btn-primary" onclick="addTodo()">Add Todo</button>
+    <button class="btn btn-primary btn-sm" onclick="addTodo()">Add Todo</button>
     <button class="btn btn-sm" onclick="hideAddForm()" style="border:1px solid var(--border)">Cancel <span style="opacity:0.6;font-weight:400">Esc</span></button>
   </div>
 </div>
@@ -1464,7 +1615,7 @@ function render() {
   // visibleIds includes todo IDs + section markers for collapsed sections
   visibleIds = [...visibleActiveIds, ...filteredCompleted.map(t => t.id)];
 
-  const eaBtn = '<button class="btn btn-sm ea-update-btn" onclick="eaUpdate()" title="Run /ea update in tmux">Update</button>';
+  const eaBtn = '<div class="ea-update-wrap"><button id="ea-update-btn" class="btn btn-sm ea-update-btn" onclick="eaUpdateToggle()" title="Run /ea update"><span class="ea-btn-wrap"><span id="ea-update-label" class="ea-lbl" style="opacity:1">Update</span><span id="ea-update-running" class="ea-running" style="opacity:0"><span id="ea-update-spinner" class="ea-loader"><span class="dot1"></span><span class="dot2"></span></span><span id="ea-update-timer">0:00</span></span></span></button></div>';
   const simpleCls = simpleMode ? (toggledItems.size > 0 ? ' partial' : ' active') : (toggledItems.size > 0 ? ' partial' : '');
   const simpleBtn = `<button class="header-toggle simple-toggle-btn${simpleCls}" onclick="toggleSimpleMode()" title="Toggle simple mode (a)">Simple</button>`;
   const pColors = {high:'#b91c1c',medium:'#a16207',low:'#15803d',none:'#9ca3af'};
@@ -1527,6 +1678,7 @@ function render() {
   document.documentElement.style.setProperty('--section-offset', (searchH + activeH) + 'px');
 
   applySelection();
+  _restoreJobOutputs();
 }
 
 function _restoreInlineForm(form, title, desc, priority, section, sectionCustom) {
@@ -1583,6 +1735,11 @@ function renderTodo(t) {
   const desc = descHtml ? `<div class="todo-desc">${descHtml}</div>` : '';
   const priorityBadge = `<span class="priority-badge priority-${t.priority || 'medium'}">${t.priority || 'medium'}</span>`;
 
+  const activeJob = _getActiveJobForTodo(t.id);
+  const isRunning = activeJob && activeJob.status === 'running';
+  const spinner = isRunning ? `<span class="job-spinner" title="Stop job" onclick="event.stopPropagation();killJob('${activeJob.id}')"><span class="sk-child"></span><span class="sk-child sk-bounce2"></span></span>` : '';
+  const jobOutputDiv = activeJob ? `<div class="item-job-output" id="job-out-${t.id}"></div>` : '';
+
   const draggable = t.status !== 'completed' ? 'draggable="true"' : '';
   const itemToggled = toggledItems.has(t.id) ? ' item-toggled' : '';
   const isCompleted = t.status === 'completed';
@@ -1592,7 +1749,7 @@ function renderTodo(t) {
     <div class="${swipeRevealClass}"><span class="swipe-reveal-icon">${swipeIcon}</span></div>
     <div class="swipe-content">
     <div class="todo-header">
-      <div class="todo-title" style="flex:1;min-width:0" onclick="event.stopPropagation();selectTodo('${t.id}');toggleItemDesc('${t.id}')">${esc(t.title)}</div>
+      <div class="todo-title" style="flex:1;min-width:0;display:flex;align-items:center;gap:2px" onclick="event.stopPropagation();selectTodo('${t.id}');toggleItemDesc('${t.id}')">${spinner}${esc(t.title)}</div>
       ${priorityBadge}
       <div class="todo-actions">
         ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();eaUpdateItem('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Refresh via /ea checkon" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#8635;</button>` : ''}
@@ -1601,7 +1758,7 @@ function renderTodo(t) {
         <button onclick="event.stopPropagation();deleteTodo('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 6px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Delete" onmouseover="this.style.color='var(--danger)'" onmouseout="this.style.color='var(--subtle)'">&#10005;</button>
       </div>
     </div>
-    ${desc}
+    ${desc}${jobOutputDiv}
     </div>
   </div>`;
 }
@@ -2049,24 +2206,17 @@ function copyTodoId(id) {
 async function startInTmux(id) {
   const todo = allTodos.find(t => t.id === id);
   const title = todo ? todo.title : id;
-  function showToast(msg, isError) {
-    const toast = document.createElement('div');
-    toast.textContent = msg;
-    toast.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:' + (isError ? 'var(--danger)' : 'var(--text)') + ';color:var(--card);padding:8px 16px;border-radius:8px;font-size:0.85rem;z-index:2000;box-shadow:var(--shadow-lg);opacity:0;transition:opacity .15s';
-    document.body.appendChild(toast);
-    requestAnimationFrame(() => { toast.style.opacity = '1'; });
-    setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 150); }, 2000);
-  }
   try {
     const res = await fetch(API + '/' + id + '/start', { method: 'POST' });
     const data = await res.json();
     if (res.ok) {
-      showToast('Started in tmux: ' + title, false);
+      showToast('Started: ' + title, false);
+      if (data.job_id) { await pollJobs(); _openItemStream(id, data.job_id); }
     } else {
       showToast(data.error || 'Failed to start', true);
     }
   } catch (e) {
-    showToast('Failed to start in tmux', true);
+    showToast('Failed to start', true);
   }
 }
 
@@ -2078,14 +2228,6 @@ function hideShortcuts() {
 }
 
 async function resumeConv(convId) {
-  function showToast(msg, isError) {
-    const toast = document.createElement('div');
-    toast.textContent = msg;
-    toast.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:' + (isError ? 'var(--danger)' : 'var(--text)') + ';color:var(--card);padding:8px 16px;border-radius:8px;font-size:0.85rem;z-index:2000;box-shadow:var(--shadow-lg);opacity:0;transition:opacity .15s';
-    document.body.appendChild(toast);
-    requestAnimationFrame(() => { toast.style.opacity = '1'; });
-    setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 150); }, 2000);
-  }
   try {
     const res = await fetch('/api/resume-conv', {
       method: 'POST',
@@ -2103,23 +2245,28 @@ async function resumeConv(convId) {
   }
 }
 
+async function eaUpdateToggle() {
+  const isRunning = Object.values(_jobsState).some(
+    j => j.job_key === 'ea-update' && (j.status === 'running' || j.status === 'pending')
+  );
+  if (isRunning) await cancelEaUpdate(); else await eaUpdate();
+}
+
 async function eaUpdate(force) {
-  function showToast(msg, isError, onClick) {
-    const toast = document.createElement('div');
-    toast.textContent = msg;
-    toast.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:' + (isError ? 'var(--danger)' : 'var(--text)') + ';color:var(--card);padding:8px 16px;border-radius:8px;font-size:0.85rem;z-index:2000;box-shadow:var(--shadow-lg);opacity:0;transition:opacity .15s' + (onClick ? ';cursor:pointer' : '');
-    if (onClick) toast.addEventListener('click', () => { toast.remove(); onClick(); });
-    document.body.appendChild(toast);
-    requestAnimationFrame(() => { toast.style.opacity = '1'; });
-    setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 150); }, 2000);
-  }
   try {
     const res = await fetch('/api/ea-update', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({force: !!force}) });
     const data = await res.json();
     if (res.ok && data.status === 'already_running') {
       showToast('Already running — click to restart', false, () => eaUpdate(true));
     } else if (res.ok) {
-      showToast('EA update started in tmux', false);
+      showToast('EA update started', false);
+      if (data.job_id) {
+        // Animate immediately — don't wait for pollJobs round trip
+        if (!_eaWasRunning) { _eaWasRunning = true; _transitionEaBtn(true); }
+        const btn = document.getElementById('ea-update-btn');
+        if (btn) btn.classList.add('running');
+        pollJobs();
+      }
     } else {
       showToast(data.error || 'Failed to start EA update', true);
     }
@@ -2129,15 +2276,6 @@ async function eaUpdate(force) {
 }
 
 async function eaUpdateItem(id, force) {
-  function showToast(msg, isError, onClick) {
-    const toast = document.createElement('div');
-    toast.textContent = msg;
-    toast.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:' + (isError ? 'var(--danger)' : 'var(--text)') + ';color:var(--card);padding:8px 16px;border-radius:8px;font-size:0.85rem;z-index:2000;box-shadow:var(--shadow-lg);opacity:0;transition:opacity .15s' + (onClick ? ';cursor:pointer' : '');
-    if (onClick) toast.addEventListener('click', () => { toast.remove(); onClick(); });
-    document.body.appendChild(toast);
-    requestAnimationFrame(() => { toast.style.opacity = '1'; });
-    setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 150); }, 2000);
-  }
   try {
     const res = await fetch('/api/ea-update-item', {
       method: 'POST',
@@ -2148,13 +2286,246 @@ async function eaUpdateItem(id, force) {
     if (res.ok && data.status === 'already_running') {
       showToast('Already running — click to restart', false, () => eaUpdateItem(id, true));
     } else if (res.ok) {
-      showToast(`Checking on ${id} in tmux`, false);
+      showToast(`Checking ${id}...`, false);
+      if (data.job_id) { await pollJobs(); _openItemStream(id, data.job_id); }
     } else {
       showToast(data.error || 'Failed', true);
     }
   } catch (e) {
     // silent
   }
+}
+
+// ---- Shared toast helper ----
+function showToast(msg, isError, onClick) {
+  const toast = document.createElement('div');
+  toast.textContent = msg;
+  toast.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:' + (isError ? 'var(--danger)' : 'var(--text)') + ';color:var(--card);padding:8px 16px;border-radius:8px;font-size:0.85rem;z-index:2000;box-shadow:var(--shadow-lg);opacity:0;transition:opacity .15s' + (onClick ? ';cursor:pointer' : '');
+  if (onClick) toast.addEventListener('click', () => { toast.remove(); onClick(); });
+  document.body.appendChild(toast);
+  requestAnimationFrame(() => { toast.style.opacity = '1'; });
+  setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 150); }, 2000);
+}
+
+// ---- Inline job streaming ----
+let _jobsPollTimer = null;
+let _jobsState = {};          // jobId -> job metadata (from server)
+let _clientJobLines = {};     // todoId -> string[] of parsed display lines
+let _clientJobIds = {};       // todoId -> jobId that populated _clientJobLines
+let _itemStreamSources = {};  // todoId -> EventSource
+let _eaUpdateTimerInterval = null;
+let _eaWasRunning = false;
+let _eaTransitionTimer = null;
+
+function _todoIdForJob(job) {
+  if (!job || !job.job_key) return null;
+  const key = job.job_key;
+  if (key.startsWith('workon-')) return key.slice(7);
+  if (key.startsWith('ea-') && key !== 'ea-update') return key.slice(3);
+  return null;
+}
+
+function _getActiveJobForTodo(todoId) {
+  let fallback = null;
+  for (const j of Object.values(_jobsState)) {
+    if (_todoIdForJob(j) !== todoId || j.status === 'killed') continue;
+    if (j.status === 'running' || j.status === 'pending') return j;
+    if (!fallback) fallback = j;
+  }
+  return fallback;
+}
+
+function _openItemStream(todoId, jobId) {
+  if (_itemStreamSources[todoId]) {
+    _itemStreamSources[todoId].close();
+    delete _itemStreamSources[todoId];
+  }
+  // New job for this todo — start fresh output
+  if (_clientJobIds[todoId] !== jobId) {
+    _clientJobLines[todoId] = [];
+    _clientJobIds[todoId] = jobId;
+  }
+  if (!_clientJobLines[todoId]) _clientJobLines[todoId] = [];
+  const existingCount = _clientJobLines[todoId].length;
+  let parsedCount = 0;
+  const src = new EventSource('/api/jobs/' + jobId + '/stream');
+  _itemStreamSources[todoId] = src;
+  src.onmessage = (e) => {
+    let raw;
+    try { raw = JSON.parse(e.data); } catch { return; }
+    if (typeof raw === 'object' && raw.__done__) {
+      src.close(); delete _itemStreamSources[todoId];
+      pollJobs();
+      return;
+    }
+    const line = parseStreamLine(raw);
+    if (!line) return;
+    if (parsedCount < existingCount) { parsedCount++; return; } // skip already-buffered
+    console.log(`[job:${jobId}]`, line);
+    _clientJobLines[todoId].push(line);
+    parsedCount++;
+    const outEl = document.getElementById('job-out-' + todoId);
+    if (outEl) {
+      const div = document.createElement('div');
+      if (line.startsWith('✓')) div.className = 'job-done-line';
+      div.textContent = line;
+      outEl.appendChild(div);
+      outEl.scrollTop = outEl.scrollHeight;
+    }
+  };
+  src.onerror = () => { src.close(); delete _itemStreamSources[todoId]; };
+}
+
+function _updateSpinnersInPlace() {
+  document.querySelectorAll('.todo-item[data-todo-id]').forEach(el => {
+    const todoId = el.dataset.todoId;
+    const job = _getActiveJobForTodo(todoId);
+    const titleEl = el.querySelector('.todo-title');
+    if (!titleEl) return;
+    const existingSpinner = titleEl.querySelector('.job-spinner');
+    if (job && job.status === 'running') {
+      if (!existingSpinner) {
+        const s = document.createElement('span');
+        s.className = 'job-spinner'; s.title = 'Stop job';
+        s.innerHTML = '<span class="sk-child"></span><span class="sk-child sk-bounce2"></span>';
+        s.onclick = e => { e.stopPropagation(); killJob(job.id); };
+        titleEl.insertBefore(s, titleEl.firstChild);
+      } else {
+        existingSpinner.onclick = e => { e.stopPropagation(); killJob(job.id); };
+      }
+      // Ensure output div exists for this item
+      if (!el.querySelector('.item-job-output')) {
+        const swipe = el.querySelector('.swipe-content');
+        if (swipe) {
+          const div = document.createElement('div');
+          div.className = 'item-job-output'; div.id = 'job-out-' + todoId;
+          swipe.appendChild(div);
+        }
+      }
+    } else {
+      if (existingSpinner) existingSpinner.remove();
+    }
+  });
+}
+
+function _restoreJobOutputs() {
+  for (const [todoId, lines] of Object.entries(_clientJobLines)) {
+    if (!lines.length) continue;
+    const outEl = document.getElementById('job-out-' + todoId);
+    if (!outEl) continue;
+    outEl.innerHTML = lines.map(l => {
+      const cls = l.startsWith('✓') ? ' class="job-done-line"' : '';
+      const d = document.createElement('div'); d.textContent = l;
+      return `<div${cls}>${d.innerHTML}</div>`;
+    }).join('');
+    outEl.scrollTop = outEl.scrollHeight;
+  }
+}
+
+function parseStreamLine(raw) {
+  // Server pre-formats lines via the Claude Agent SDK; raw is already a display string.
+  if (typeof raw !== 'string') return null;
+  return raw.trim() || null;
+}
+
+async function killJob(jobId) {
+  await fetch('/api/jobs/' + jobId + '/kill', { method: 'POST' });
+  pollJobs();
+}
+
+function _transitionEaBtn(toRunning) {
+  if (_eaTransitionTimer) { clearTimeout(_eaTransitionTimer); _eaTransitionTimer = null; }
+  const lbl = document.getElementById('ea-update-label');
+  const run = document.getElementById('ea-update-running');
+  if (!lbl || !run) return;
+
+  lbl.classList.remove('anim-in', 'anim-out');
+  run.classList.remove('anim-in', 'anim-out');
+  void lbl.offsetWidth; // force reflow
+
+  const outEl = toRunning ? lbl : run;
+  const inEl  = toRunning ? run : lbl;
+
+  // Ensure outgoing starts at opacity:1, incoming at opacity:0
+  outEl.style.opacity = '1';
+  inEl.style.opacity = '0';
+  void inEl.offsetWidth;
+
+  outEl.classList.add('anim-out');
+  inEl.classList.add('anim-in');
+
+  _eaTransitionTimer = setTimeout(() => {
+    outEl.classList.remove('anim-out'); outEl.style.opacity = '0';
+    inEl.classList.remove('anim-in');   inEl.style.opacity = '1';
+    _eaTransitionTimer = null;
+  }, 400);
+}
+
+function _updateEaUpdateBtn() {
+  const btn = document.getElementById('ea-update-btn');
+  if (!btn) return;
+
+  const job = Object.values(_jobsState).find(
+    j => j.job_key === 'ea-update' && (j.status === 'running' || j.status === 'pending')
+  );
+  const isRunning = !!job;
+
+  if (isRunning !== _eaWasRunning) {
+    _eaWasRunning = isRunning;
+    _transitionEaBtn(isRunning);
+  }
+
+  if (isRunning) {
+    btn.classList.add('running');
+    if (_eaUpdateTimerInterval) clearInterval(_eaUpdateTimerInterval);
+    const tick = () => {
+      const timer = document.getElementById('ea-update-timer');
+      if (!timer) return;
+      const elapsed = Math.floor(Date.now() / 1000 - job.created_at);
+      const m = Math.floor(elapsed / 60);
+      const s = String(elapsed % 60).padStart(2, '0');
+      timer.textContent = m > 0 ? `${m}:${s}` : `0:${s}`;
+    };
+    tick();
+    _eaUpdateTimerInterval = setInterval(tick, 1000);
+  } else {
+    btn.classList.remove('running');
+    if (_eaUpdateTimerInterval) { clearInterval(_eaUpdateTimerInterval); _eaUpdateTimerInterval = null; }
+  }
+}
+
+async function cancelEaUpdate() {
+  const job = Object.values(_jobsState).find(
+    j => j.job_key === 'ea-update' && (j.status === 'running' || j.status === 'pending')
+  );
+  if (job) await killJob(job.id);
+}
+
+async function pollJobs() {
+  clearTimeout(_jobsPollTimer);
+  try {
+    const res = await fetch('/api/jobs');
+    const jobs = await res.json();
+    const prevState = _jobsState;
+    _jobsState = {};
+    jobs.forEach(j => { _jobsState[j.id] = j; });
+    // Open streams for running jobs that don't have one yet
+    for (const j of jobs) {
+      if (j.status !== 'running') continue;
+      const todoId = _todoIdForJob(j);
+      if (todoId && !_itemStreamSources[todoId]) _openItemStream(todoId, j.id);
+    }
+    // Clear client lines for jobs that are gone
+    for (const todoId of Object.keys(_clientJobLines)) {
+      const stillActive = jobs.some(j => _todoIdForJob(j) === todoId && j.status !== 'killed');
+      if (!stillActive) delete _clientJobLines[todoId];
+    }
+    _updateSpinnersInPlace();
+    _restoreJobOutputs();
+    _updateEaUpdateBtn();
+  } catch {}
+  const hasActive = Object.values(_jobsState).some(j => j.status === 'running' || j.status === 'pending');
+  _jobsPollTimer = setTimeout(pollJobs, hasActive ? 2000 : 5000);
 }
 
 function fallbackCopy(text) {
@@ -3380,6 +3751,7 @@ async function saveSectionRename(oldName, newName) {
 
 loadTodos();
 startPolling();
+pollJobs();
 
 // Fade section headers and items behind them as they get covered by the next sticky header
 window.addEventListener('scroll', () => {
@@ -3404,6 +3776,7 @@ window.addEventListener('scroll', () => {
   }
 }, { passive: true });
 </script>
+
 
 </body>
 </html>
