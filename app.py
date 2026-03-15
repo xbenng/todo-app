@@ -1209,9 +1209,40 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .add-form.kb-selected { box-shadow: 0 0 0 2px var(--accent), var(--shadow-md); }
   .active-header { display: flex; align-items: center; gap: 10px; position: sticky; top: 0; z-index: 101; background: var(--bg); padding: 4px 0; }
   .active-header h2 { margin: 0; }
-  .ea-update-wrap { margin-left: auto; display: inline-flex; align-items: center; gap: 4px; }
-  .ea-update-btn { border: 1px solid var(--border); font-size: 0.75rem; padding: 5px 10px; min-width: 72px; display: flex; align-items: center; gap: 5px; }
-  .ea-update-btn.running { border-color: var(--accent); color: var(--accent); }
+  .ea-update-wrap { margin-left: auto; display: inline-flex; align-items: center; gap: 4px; position: relative; }
+  .ea-update-bubble {
+    display: none; position: absolute; top: 100%; right: 0; margin-top: 6px;
+    width: 340px; max-height: 250px; overflow-y: auto;
+    background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+    box-shadow: var(--shadow-lg); padding: 8px 10px; z-index: 200;
+    font-family: monospace; font-size: 0.72rem; line-height: 1.5;
+    color: var(--muted); white-space: pre-wrap; word-break: break-all;
+  }
+  .ea-update-wrap:hover .ea-update-bubble.has-content { display: block; }
+  /* Per-item checkon output bubble */
+  .checkon-bubble {
+    display: none; position: absolute; left: 18px; bottom: 100%; margin-bottom: 4px;
+    width: 340px; max-height: 200px; overflow-y: auto;
+    background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+    box-shadow: var(--shadow-lg); padding: 8px 10px; z-index: 200;
+    font-family: monospace; font-size: 0.72rem; line-height: 1.5;
+    color: var(--muted); white-space: pre-wrap; word-break: break-all;
+  }
+  .todo-item:hover .checkon-bubble.has-content { display: block; }
+  .todo-item:has(.checkon-bubble.has-content):hover { z-index: 200; overflow: visible; }
+  .ea-update-btn {
+    border: none; font-size: 0.72rem; font-weight: 600; letter-spacing: 0.02em;
+    padding: 6px 14px; min-width: 72px; display: flex; align-items: center; justify-content: center; gap: 5px;
+    background: var(--accent); color: #fff; border-radius: 20px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.12); cursor: pointer;
+    transition: background 0.15s, box-shadow 0.15s, transform 0.1s;
+  }
+  .ea-update-btn:hover { background: #3a5bd9; box-shadow: 0 2px 8px rgba(79,110,247,0.35); transform: translateY(-1px); }
+  .ea-update-btn:active { transform: translateY(0); box-shadow: 0 1px 2px rgba(0,0,0,0.1); }
+  .ea-update-btn.running { background: transparent; border: 1px solid var(--accent); color: var(--accent); box-shadow: none; min-width: auto; }
+  .ea-update-btn.running:hover { background: rgba(79,110,247,0.06); transform: none; box-shadow: none; }
+  .ea-update-btn.running #ea-update-timer { display: none; }
+  .ea-update-btn.running:hover #ea-update-timer { display: inline; }
   /* SpinKit rotating double-bounce loader for the Update button */
   .ea-loader {
     width: 14px; height: 14px; position: relative; flex-shrink: 0; margin-right: 4px;
@@ -1318,7 +1349,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     position: relative; overflow: hidden;
   }
   .todo-header {
-    display: flex; align-items: center; gap: 12px; width: 100%;
+    display: flex; align-items: center; gap: 12px; width: 100%; position: relative;
   }
   .todo-item:hover { box-shadow: var(--shadow-md); transform: translateY(-1px); }
   .todo-item.status-completed {
@@ -1366,8 +1397,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .todo-desc blockquote { border-left: 3px solid var(--border); margin: 0.3em 0; padding-left: 10px; color: var(--muted); }
   .todo-meta { display: flex; align-items: center; gap: 8px; margin-top: 6px; flex-wrap: wrap; }
   .priority-badge {
-    font-size: 0.68rem; font-weight: 700; text-transform: uppercase; padding: 2px 7px;
-    border-radius: 12px; letter-spacing: 0.04em; flex-shrink: 0; align-self: flex-start; margin-top: 3px;
+    font-size: 0.68rem; font-weight: 700; text-transform: uppercase; padding: 2px 0;
+    border-radius: 12px; letter-spacing: 0.04em; flex-shrink: 0;
+    width: 58px; text-align: center; display: inline-block;
   }
   .priority-high { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; }
   .priority-medium { background: #fffbeb; color: #a16207; border: 1px solid #fde68a; }
@@ -1418,9 +1450,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .sort-priority-btn:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
 
+  .todo-item { --item-bg: var(--card); }
+  .todo-item.priority-high-item { --item-bg: #fef8f8; }
+  .todo-item.priority-none-item { --item-bg: #f3f4f6; }
+  .todo-item.status-completed { --item-bg: var(--completed-bg); }
   .todo-actions {
-    display: flex; gap: 2px; flex-shrink: 0; align-items: flex-start;
-    opacity: 0; transition: opacity 0.15s;
+    display: flex; gap: 2px; align-items: center; justify-content: flex-end;
+    position: absolute; right: 70px; top: 0; bottom: 0;
+    padding-left: 24px; opacity: 0; transition: opacity 0.15s;
+    background: linear-gradient(to right, transparent, var(--item-bg) 20px);
   }
   .todo-item:hover .todo-actions { opacity: 1; }
   .todo-actions select { font-size: 0.75rem; padding: 2px 6px; border-radius: 4px; border: 1px solid var(--border); background: #fafafa; }
@@ -1864,7 +1902,7 @@ function render() {
   // visibleIds includes todo IDs + section markers for collapsed sections
   visibleIds = [...visibleActiveIds, ...filteredCompleted.map(t => t.id)];
 
-  const eaBtn = '<div class="ea-update-wrap"><button id="ea-update-btn" class="btn btn-sm ea-update-btn" onclick="eaUpdateToggle()" title="Run /ea update"><span class="ea-btn-wrap"><span id="ea-update-label" class="ea-lbl" style="opacity:1">Update</span><span id="ea-update-running" class="ea-running" style="opacity:0"><span id="ea-update-spinner" class="ea-loader"><span class="dot1"></span><span class="dot2"></span></span><span id="ea-update-timer">0:00</span></span></span></button></div>';
+  const eaBtn = '<div class="ea-update-wrap"><button id="ea-update-btn" class="btn btn-sm ea-update-btn" onclick="eaUpdateToggle()" title="Run /ea update"><span class="ea-btn-wrap"><span id="ea-update-label" class="ea-lbl" style="opacity:1">Update</span><span id="ea-update-running" class="ea-running" style="opacity:0"><span id="ea-update-spinner" class="ea-loader"><span class="dot1"></span><span class="dot2"></span></span><span id="ea-update-timer">0:00</span></span></span></button><div id="ea-update-bubble" class="ea-update-bubble"></div></div>';
   const simpleCls = simpleMode ? (toggledItems.size > 0 ? ' partial' : ' active') : (toggledItems.size > 0 ? ' partial' : '');
   const simpleBtn = `<button class="header-toggle simple-toggle-btn${simpleCls}" onclick="toggleSimpleMode()" title="Toggle simple mode (a)">Simple</button>`;
   const pColors = {high:'#b91c1c',medium:'#a16207',low:'#15803d',none:'#9ca3af'};
@@ -1928,6 +1966,7 @@ function render() {
 
   applySelection();
   _restoreJobOutputs();
+  _restoreEaUpdateBubble();
 }
 
 function _restoreInlineForm(form, title, desc, priority, section, sectionCustom) {
@@ -1987,7 +2026,7 @@ function renderTodo(t) {
   const activeJob = _getActiveJobForTodo(t.id);
   const isRunning = activeJob && activeJob.status === 'running';
   const spinner = isRunning ? `<span class="job-spinner" title="Stop job" onclick="event.stopPropagation();killJob('${activeJob.id}')"><span class="sk-child"></span><span class="sk-child sk-bounce2"></span></span>` : '';
-  const jobOutputDiv = activeJob ? `<div class="item-job-output" id="job-out-${t.id}"></div>` : '';
+  const jobBubble = `<div class="checkon-bubble" id="checkon-bubble-${t.id}"></div>`;
 
   const draggable = t.status !== 'completed' ? 'draggable="true"' : '';
   const itemToggled = toggledItems.has(t.id) ? ' item-toggled' : '';
@@ -1999,15 +2038,14 @@ function renderTodo(t) {
     <div class="swipe-content">
     <div class="todo-header">
       <div class="todo-title" style="flex:1;min-width:0;display:flex;align-items:center;gap:2px" onclick="event.stopPropagation();selectTodo('${t.id}');toggleItemDesc('${t.id}')">${spinner}${esc(t.title)}</div>
-      ${priorityBadge}
       <div class="todo-actions">
         ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();eaUpdateItem('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Refresh via /ea checkon" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#8635;</button>` : ''}
         ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();startInTmux('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Start in tmux (s)" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#9654;</button>` : ''}
-        ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();bringToTop('${t.id}')" style="border:none;background:transparent;font-size:1rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Bring to top" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#x2912;</button>` : ''}
         <button onclick="event.stopPropagation();deleteTodo('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 6px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Delete" onmouseover="this.style.color='var(--danger)'" onmouseout="this.style.color='var(--subtle)'">&#10005;</button>
       </div>
+      ${priorityBadge}
     </div>
-    ${desc}${jobOutputDiv}
+    ${desc}${jobBubble}
     </div>
   </div>`;
 }
@@ -2687,6 +2725,7 @@ async function eaUpdate(force) {
         if (!_eaWasRunning) { _eaWasRunning = true; _transitionEaBtn(true); }
         const btn = document.getElementById('ea-update-btn');
         if (btn) btn.classList.add('running');
+        _openEaUpdateStream(data.job_id);
         pollJobs();
       }
     } else {
@@ -2737,6 +2776,8 @@ let _clientJobIds = {};       // todoId -> jobId that populated _clientJobLines
 let _itemStreamSources = {};  // todoId -> EventSource
 let _eaUpdateTimerInterval = null;
 let _eaWasRunning = false;
+let _eaUpdateBubbleLines = [];
+let _eaUpdateBubbleStream = null; // EventSource for ea-update output
 
 // Interactive terminal sessions
 let _termSessions = {};       // todoId -> {sessionId, term, fitAddon, ws, alive}
@@ -2791,10 +2832,11 @@ function _openItemStream(todoId, jobId) {
     console.log(`[job:${jobId}]`, line);
     _clientJobLines[todoId].push(line);
     parsedCount++;
-    const outEl = document.getElementById('job-out-' + todoId);
+    const outEl = document.getElementById('checkon-bubble-' + todoId);
     if (outEl) {
+      outEl.classList.add('has-content');
       const div = document.createElement('div');
-      if (line.startsWith('✓')) div.className = 'job-done-line';
+      if (line.startsWith('✓')) div.style.color = 'var(--accent)';
       div.textContent = line;
       outEl.appendChild(div);
       outEl.scrollTop = outEl.scrollHeight;
@@ -2841,15 +2883,6 @@ function _updateSpinnersInPlace() {
       } else {
         existingJobSpinner.onclick = e => { e.stopPropagation(); killJob(job.id); };
       }
-      // Ensure output div exists
-      if (!el.querySelector('.item-job-output')) {
-        const swipe = el.querySelector('.swipe-content');
-        if (swipe) {
-          const div = document.createElement('div');
-          div.className = 'item-job-output'; div.id = 'job-out-' + todoId;
-          swipe.appendChild(div);
-        }
-      }
     } else {
       if (existingJobSpinner) existingJobSpinner.remove();
     }
@@ -2859,12 +2892,13 @@ function _updateSpinnersInPlace() {
 function _restoreJobOutputs() {
   for (const [todoId, lines] of Object.entries(_clientJobLines)) {
     if (!lines.length) continue;
-    const outEl = document.getElementById('job-out-' + todoId);
+    const outEl = document.getElementById('checkon-bubble-' + todoId);
     if (!outEl) continue;
+    outEl.classList.add('has-content');
     outEl.innerHTML = lines.map(l => {
-      const cls = l.startsWith('✓') ? ' class="job-done-line"' : '';
+      const style = l.startsWith('✓') ? ' style="color:var(--accent)"' : '';
       const d = document.createElement('div'); d.textContent = l;
-      return `<div${cls}>${d.innerHTML}</div>`;
+      return `<div${style}>${d.innerHTML}</div>`;
     }).join('');
     outEl.scrollTop = outEl.scrollHeight;
   }
@@ -2949,6 +2983,54 @@ async function cancelEaUpdate() {
   if (job) await killJob(job.id);
 }
 
+function _restoreEaUpdateBubble() {
+  const bubble = document.getElementById('ea-update-bubble');
+  if (!bubble || !_eaUpdateBubbleLines.length) return;
+  bubble.innerHTML = '';
+  bubble.classList.add('has-content');
+  for (const line of _eaUpdateBubbleLines) {
+    const div = document.createElement('div');
+    if (line.startsWith('✓')) div.style.color = 'var(--accent)';
+    div.textContent = line;
+    bubble.appendChild(div);
+  }
+  bubble.scrollTop = bubble.scrollHeight;
+}
+
+function _appendEaUpdateBubbleLine(line) {
+  _eaUpdateBubbleLines.push(line);
+  const bubble = document.getElementById('ea-update-bubble');
+  if (!bubble) return;
+  bubble.classList.add('has-content');
+  const div = document.createElement('div');
+  if (line.startsWith('✓')) div.style.color = 'var(--accent)';
+  div.textContent = line;
+  bubble.appendChild(div);
+  bubble.scrollTop = bubble.scrollHeight;
+}
+
+function _openEaUpdateStream(jobId) {
+  if (_eaUpdateBubbleStream) { _eaUpdateBubbleStream.close(); _eaUpdateBubbleStream = null; }
+  _eaUpdateBubbleLines = [];
+  const bubble = document.getElementById('ea-update-bubble');
+  if (bubble) { bubble.textContent = ''; bubble.classList.remove('has-content'); }
+
+  const src = new EventSource('/api/jobs/' + jobId + '/stream');
+  _eaUpdateBubbleStream = src;
+  src.onmessage = (e) => {
+    let raw;
+    try { raw = JSON.parse(e.data); } catch { return; }
+    if (typeof raw === 'object' && raw.__done__) {
+      src.close(); _eaUpdateBubbleStream = null;
+      return;
+    }
+    const line = parseStreamLine(raw);
+    if (!line) return;
+    _appendEaUpdateBubbleLine(line);
+  };
+  src.onerror = () => { src.close(); _eaUpdateBubbleStream = null; };
+}
+
 async function pollJobs() {
   clearTimeout(_jobsPollTimer);
   try {
@@ -2960,6 +3042,9 @@ async function pollJobs() {
     // Open streams for running jobs that don't have one yet
     for (const j of jobs) {
       if (j.status !== 'running') continue;
+      if (j.job_key === 'ea-update' && !_eaUpdateBubbleStream) {
+        _openEaUpdateStream(j.id);
+      }
       const todoId = _todoIdForJob(j);
       if (todoId && !_itemStreamSources[todoId]) _openItemStream(todoId, j.id);
     }
@@ -3830,6 +3915,11 @@ document.addEventListener('keydown', e => {
     if (selectedIdx >= 1 && selectedIdx <= visibleIds.length && !selectedIsSection()) {
       e.preventDefault();
       startInTmux(visibleIds[selectedIdx - 1]);
+    }
+  } else if (e.key === 'h') {
+    if (selectedIdx >= 1 && selectedIdx <= visibleIds.length && !selectedIsSection()) {
+      e.preventDefault();
+      eaUpdateItem(visibleIds[selectedIdx - 1]);
     }
   } else if (e.key === '0' || e.key === '1' || e.key === '2' || e.key === '3') {
     if (selectedIdx >= 1 && selectedIdx <= visibleIds.length && !selectedIsSection()) {
