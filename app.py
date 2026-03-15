@@ -1094,30 +1094,37 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   /* Edit mode */
   .edit-title {
-    font-size: 1.02rem; font-weight: 600; width: 100%; padding: 8px 12px;
-    border: 1px solid var(--border); border-radius: 8px; margin-bottom: 6px;
+    font-size: 1rem; width: 100%; padding: 10px 14px;
+    border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px;
     background: var(--bg); transition: border-color 0.15s, box-shadow 0.15s;
+    font-family: inherit; color: var(--text);
   }
   .edit-title:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-light); }
   .edit-desc {
-    font-size: 0.9rem; width: 100%; padding: 8px 12px;
+    font-size: 0.9rem; width: 100%; padding: 10px 14px;
     border: 1px solid var(--border); border-radius: 8px; resize: vertical;
-    min-height: 44px; font-family: inherit; overflow: hidden;
+    min-height: 56px; font-family: inherit; overflow: hidden;
     background: var(--bg); transition: border-color 0.15s, box-shadow 0.15s;
   }
   .edit-desc:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-light); }
+  .edit-select {
+    width: 100%; padding: 10px 14px; border: 1px solid var(--border); border-radius: 8px;
+    font-size: 0.85rem; font-family: inherit; margin-bottom: 10px;
+    background: var(--bg); transition: border-color 0.15s, box-shadow 0.15s; color: var(--text);
+  }
+  .edit-select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-light); }
   .edit-desc-cm { width: 100%; }
   .edit-desc-cm .cm-editor {
-    font-size: 80%; border: 1px solid var(--border); border-radius: 8px;
+    font-size: 0.8rem; border: 1px solid var(--border); border-radius: 8px;
     background: var(--bg); transition: border-color 0.15s, box-shadow 0.15s;
   }
   .edit-desc-cm .cm-editor.cm-focused {
     outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-light);
   }
-  .edit-desc-cm .cm-content { min-height: 44px; padding: 8px 12px; font-family: inherit; }
+  .edit-desc-cm .cm-content { min-height: 56px; padding: 10px 14px; font-family: inherit; }
   .edit-desc-cm .cm-scroller { overflow: auto; }
   .edit-desc-cm .cm-line { line-height: 1.6; }
-  .edit-actions { display: flex; gap: 6px; margin-top: 8px; }
+  .edit-actions { display: flex; gap: 8px; margin-top: 10px; align-items: center; }
 
   /* Section headers */
   .section-header {
@@ -1134,6 +1141,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .section-header-row.kb-selected {
     box-shadow: 0 0 0 2px var(--accent);
     border-radius: var(--radius);
+    z-index: 101;
   }
 
   /* Context menu */
@@ -1439,7 +1447,7 @@ function render() {
     if (section) {
       activeHtml += `<div class="section-header-row" data-section="${esc(section)}" draggable="true">`
         + `<button class="collapse-btn${isCollapsed ? ' collapsed' : ''}" onclick="toggleSectionCollapse('${escSection}')" title="${isCollapsed ? 'Expand' : 'Collapse'}">&#9660;</button>`
-        + `<h3 ondblclick="startSectionRename('${escSection}')">${esc(section)}</h3>`
+        + `<h3 onclick="toggleSectionCollapse('${escSection}')" ondblclick="startSectionRename('${escSection}')">${esc(section)}</h3>`
         + `<span class="section-count">${items.length}</span>`
         + `<button class="sort-priority-btn" onclick="sortByPriority('${escSection}')" title="Sort by priority (high first)">&#9650; Priority</button>`
         + `</div>`;
@@ -1552,14 +1560,14 @@ function renderTodo(t) {
       <div class="todo-body">
         <input class="edit-title" id="edit-title-${t.id}" value="${esc(t.title)}">
         <div class="edit-desc-cm" id="edit-desc-${t.id}"></div>
-        <select id="edit-section-${t.id}" style="font-size:0.85rem; font-weight:400; margin-bottom:4px; width:100%; padding:4px 8px; border:1px solid var(--border); border-radius:4px;">
+        <select id="edit-section-${t.id}" class="edit-select">
           <option value="">No section</option>
           ${allSectionsForEdit().map(s => `<option value="${esc(s)}" ${(t.section||'')===s?'selected':''}>${esc(s)}</option>`).join('')}
           <option value="__custom__">Other...</option>
         </select>
-        <input class="edit-title" id="edit-section-custom-${t.id}" placeholder="New section name" style="font-size:0.85rem; font-weight:400; margin-bottom:4px; display:none;">
+        <input class="edit-title" id="edit-section-custom-${t.id}" placeholder="New section name" style="display:none;">
         <div class="edit-actions">
-          <select id="edit-priority-${t.id}">
+          <select id="edit-priority-${t.id}" class="edit-select" style="width:auto;margin-bottom:0">
             ${['high','medium','low','none'].map(p =>
               `<option value="${p}" ${p===t.priority?'selected':''}>${p}</option>`
             ).join('')}
