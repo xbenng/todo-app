@@ -41,7 +41,6 @@ _undo_stack: deque[tuple[list[dict], list[dict]]] = deque(maxlen=30)
 _jobs: dict[str, dict] = {}
 # session_id -> {id, todo_id, title, tmux_target, alive, created_at, needs_auto_send, resume_id}
 _pty_sessions: dict[str, dict] = {}
-TMUX_SESSION = "todo-app"
 
 
 def _completed_file_path(path: str) -> str:
@@ -746,48 +745,35 @@ def _tmux_bin():
     return shutil.which("tmux") or "/opt/homebrew/bin/tmux"
 
 
-def _tmux_ensure_session():
-    """Ensure the todo-app tmux session exists."""
-    tmux = _tmux_bin()
-    result = subprocess.run([tmux, "has-session", "-t", TMUX_SESSION],
-                            capture_output=True)
-    if result.returncode != 0:
-        subprocess.run([tmux, "new-session", "-d", "-s", TMUX_SESSION],
-                       capture_output=True)
-
-
-def _tmux_window_exists(target: str) -> bool:
-    """Check if a tmux window/target exists."""
-    tmux = _tmux_bin()
-    result = subprocess.run([tmux, "has-session", "-t", target],
+def _tmux_session_exists(name: str) -> bool:
+    """Check if a tmux session exists."""
+    result = subprocess.run([_tmux_bin(), "has-session", "-t", name],
                             capture_output=True)
     return result.returncode == 0
 
 
-def _tmux_list_windows() -> list[str]:
-    """List window names in the todo-app tmux session."""
-    tmux = _tmux_bin()
+def _tmux_list_sessions() -> list[str]:
+    """List tmux session names matching our prefix."""
     result = subprocess.run(
-        [tmux, "list-windows", "-t", TMUX_SESSION, "-F", "#{window_name}"],
+        [_tmux_bin(), "list-sessions", "-F", "#{session_name}"],
         capture_output=True, text=True)
     if result.returncode != 0:
         return []
-    return [w.strip() for w in result.stdout.strip().splitlines() if w.strip()]
+    return [s.strip() for s in result.stdout.strip().splitlines()
+            if s.strip().startswith("t-")]
 
 
 def _tmux_recover_sessions():
-    """On startup, recover existing tmux windows into _pty_sessions."""
-    for wname in _tmux_list_windows():
-        if not wname.startswith("t-"):
-            continue
-        session_id = wname[2:]
+    """On startup, recover existing tmux sessions into _pty_sessions."""
+    for sname in _tmux_list_sessions():
+        session_id = sname[2:]
         if session_id in _pty_sessions:
             continue
         _pty_sessions[session_id] = {
             "id": session_id,
-            "todo_id": None,  # unknown after restart
+            "todo_id": None,
             "title": f"Recovered: {session_id}",
-            "tmux_target": f"{TMUX_SESSION}:{wname}",
+            "tmux_target": sname,
             "alive": True,
             "needs_auto_send": False,
             "resume_id": None,
@@ -890,32 +876,30 @@ def open_terminal(todo_id):
         return jsonify({"error": "claude binary not found"}), 500
 
     session_id = str(uuid.uuid4())[:8]
-    tmux_target = f"{TMUX_SESSION}:t-{session_id}"
+    tmux_name = f"t-{session_id}"
     todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
 
-    # Create tmux window running claude
-    _tmux_ensure_session()
+    # Create a dedicated tmux session (one window, no switching possible)
     tmux = _tmux_bin()
     cmd_parts = [claude_bin, "--dangerously-skip-permissions"]
     if resume_id:
         cmd_parts.extend(["--resume", resume_id])
-    shell_cmd = f"cd {todo_dir} && {' '.join(cmd_parts)}"
-
-    # Set env vars in tmux before creating window
-    for k, v in env.items():
-        subprocess.run([tmux, "set-environment", "-t", TMUX_SESSION, k, v],
-                       capture_output=True)
+    inner_cmd = " ".join(cmd_parts)
 
     subprocess.run(
-        [tmux, "new-window", "-t", f"{TMUX_SESSION}:", "-n", f"t-{session_id}", shell_cmd],
+        [tmux, "new-session", "-d", "-s", tmux_name, "-x", "80", "-y", "24",
+         "zsh", "-l", "-c", f"unset CLAUDECODE; cd {todo_dir} && {inner_cmd}"],
         capture_output=True, check=True,
     )
+    # Let the window resize to match the latest attached client
+    subprocess.run([tmux, "set-option", "-t", tmux_name, "aggressive-resize", "on"],
+                   capture_output=True)
 
     _pty_sessions[session_id] = {
         "id": session_id,
         "todo_id": todo_id,
         "title": todo.get("title", todo_id),
-        "tmux_target": tmux_target,
+        "tmux_target": tmux_name,
         "alive": True,
         "needs_auto_send": not resume_id,
         "resume_id": resume_id,
@@ -928,7 +912,7 @@ def open_terminal(todo_id):
             time.sleep(1.5)
             if _pty_sessions.get(session_id, {}).get("alive"):
                 subprocess.run(
-                    [tmux, "send-keys", "-t", tmux_target, f"/ea workon {todo_id}", "Enter"],
+                    [tmux, "send-keys", "-t", tmux_name, f"/ea workon {todo_id}", "Enter"],
                     capture_output=True,
                 )
         threading.Thread(target=_auto_send, daemon=True).start()
@@ -939,11 +923,10 @@ def open_terminal(todo_id):
 @app.route("/api/terminal/sessions")
 def list_terminal_sessions():
     """List terminal sessions, syncing alive state with tmux."""
-    live_windows = set(_tmux_list_windows())
+    live_sessions = set(_tmux_list_sessions())
     # Sync alive state with tmux reality
     for s in _pty_sessions.values():
-        wname = f"t-{s['id']}"
-        s["alive"] = wname in live_windows
+        s["alive"] = f"t-{s['id']}" in live_sessions
     # Purge dead sessions older than 5 min
     cutoff = time.time() - 300
     stale = [sid for sid, s in _pty_sessions.items()
@@ -959,13 +942,13 @@ def list_terminal_sessions():
 
 @app.route("/api/terminal/<session_id>/kill", methods=["POST"])
 def kill_terminal(session_id):
-    """Kill a terminal session by destroying its tmux window."""
+    """Kill a terminal session by destroying its tmux session."""
     session = _pty_sessions.get(session_id)
     if not session:
         return jsonify({"error": "not found"}), 404
     session["alive"] = False
-    tmux_target = session.get("tmux_target", f"{TMUX_SESSION}:t-{session_id}")
-    subprocess.run([_tmux_bin(), "kill-window", "-t", tmux_target], capture_output=True)
+    tmux_name = f"t-{session_id}"
+    subprocess.run([_tmux_bin(), "kill-session", "-t", tmux_name], capture_output=True)
     return jsonify({"ok": True})
 
 
@@ -977,33 +960,36 @@ def terminal_ws(ws, session_id):
         ws.close()
         return
 
-    tmux_target = session.get("tmux_target", f"{TMUX_SESSION}:t-{session_id}")
+    tmux_name = f"t-{session_id}"
 
-    # Verify tmux window still exists
-    if not _tmux_window_exists(tmux_target):
+    # Verify tmux session still exists
+    if not _tmux_session_exists(tmux_name):
         ws.send(json.dumps({"type": "error", "msg": "tmux session not found"}))
         ws.close()
         session["alive"] = False
         return
 
-    # Create a PTY and spawn `tmux attach` into it
+    # Attach to the dedicated tmux session (single window, no switching)
+    tmux = _tmux_bin()
+    attach_env = os.environ.copy()
+    attach_env["TERM"] = "xterm-256color"
+
     master_fd, slave_fd = pty.openpty()
     _pty_set_winsize(master_fd, 24, 80)
 
-    tmux = _tmux_bin()
-    print(f"[terminal] Attaching to {tmux_target}", flush=True)
+    print(f"[terminal] Attaching to session {tmux_name}", flush=True)
     proc = subprocess.Popen(
-        [tmux, "attach-session", "-t", tmux_target],
+        [tmux, "attach-session", "-t", tmux_name],
         stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
-        start_new_session=True, close_fds=True,
+        env=attach_env, close_fds=True,
     )
     os.close(slave_fd)
 
     # Bridge PTY ↔ WS (transient per connection — session persists in tmux)
-    _terminal_io_loop(ws, master_fd, proc)
+    _terminal_io_loop(ws, master_fd, proc, tmux_target=tmux_name)
 
 
-def _terminal_io_loop(ws, master_fd, proc):
+def _terminal_io_loop(ws, master_fd, proc, tmux_target=None):
     """Bridge PTY master fd ↔ WebSocket in a single-threaded poll loop."""
     # Make master_fd non-blocking so we can poll it alongside WS
     flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
@@ -1044,6 +1030,12 @@ def _terminal_io_loop(ws, master_fd, proc):
                         rows = int(ctrl.get("rows", 24))
                         cols = int(ctrl.get("cols", 80))
                         _pty_set_winsize(master_fd, rows, cols)
+                        if tmux_target:
+                            subprocess.run(
+                                [_tmux_bin(), "resize-window", "-t", tmux_target,
+                                 "-x", str(cols), "-y", str(rows)],
+                                capture_output=True,
+                            )
                     elif ctrl.get("type") == "close":
                         break
                     elif ctrl.get("type") == "input":
@@ -1269,21 +1261,30 @@ HTML_PAGE = r"""<!DOCTYPE html>
     width: 340px; max-height: 250px; overflow-y: auto;
     background: var(--card); border: 1px solid var(--border); border-radius: 8px;
     box-shadow: var(--shadow-lg); padding: 8px 10px; z-index: 200;
-    font-family: monospace; font-size: 0.72rem; line-height: 1.5;
+    font-family: monospace; font-size: 0.82rem; line-height: 1.5;
     color: var(--muted); white-space: pre-wrap; word-break: break-all;
   }
-  .ea-update-wrap:hover .ea-update-bubble.has-content { display: block; }
+  .ea-update-btn.running:hover + .ea-update-bubble.has-content { display: block; }
   /* Per-item checkon output bubble */
   .checkon-bubble {
     display: none; position: absolute; left: 18px; bottom: 100%; margin-bottom: 4px;
     width: 340px; max-height: 200px; overflow-y: auto;
     background: var(--card); border: 1px solid var(--border); border-radius: 8px;
     box-shadow: var(--shadow-lg); padding: 8px 10px; z-index: 200;
-    font-family: monospace; font-size: 0.72rem; line-height: 1.5;
+    font-family: monospace; font-size: 0.82rem; line-height: 1.5;
     color: var(--muted); white-space: pre-wrap; word-break: break-all;
   }
-  .todo-item:hover .checkon-bubble.has-content { display: block; }
-  .todo-item:has(.checkon-bubble.has-content):hover { z-index: 200; overflow: visible; }
+  .todo-item:has(.job-spinner:not(.term-spinner):hover) .checkon-bubble:not(.done) { display: block; }
+  .checkon-summary {
+    display: none; font-family: monospace; font-size: 0.82rem; line-height: 1.5; color: var(--muted);
+    background: rgba(0,0,0,0.025); border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 10px; margin-top: 8px; white-space: pre-wrap; word-break: break-word;
+  }
+  .checkon-summary.has-content { display: block; }
+  body.simple-mode .checkon-summary { display: none; }
+  body.simple-mode .todo-item.item-toggled .checkon-summary.has-content { display: block; }
+  body:not(.simple-mode) .todo-item.item-toggled .checkon-summary { display: none; }
+  .todo-item:has(.job-spinner:not(.term-spinner):hover) { z-index: 200; overflow: visible; }
   .ea-update-btn {
     border: none; font-size: 0.72rem; font-weight: 600; letter-spacing: 0.02em;
     padding: 6px 14px; min-width: 72px; display: flex; align-items: center; justify-content: center; gap: 5px;
@@ -1875,6 +1876,8 @@ async function pollForChanges() {
       }
     }
   } catch(e) {}
+  // Also poll jobs and terminal sessions
+  await pollJobs();
 }
 
 function startPolling() {
@@ -2100,6 +2103,7 @@ function renderTodo(t) {
   const isRunning = activeJob && activeJob.status === 'running';
   const spinner = isRunning ? `<span class="job-spinner" title="Stop job" onclick="event.stopPropagation();killJob('${activeJob.id}')"><span class="sk-child"></span><span class="sk-child sk-bounce2"></span></span>` : '';
   const jobBubble = `<div class="checkon-bubble" id="checkon-bubble-${t.id}"></div>`;
+  const jobSummary = `<div class="checkon-summary" id="checkon-summary-${t.id}"></div>`;
 
   const draggable = t.status !== 'completed' ? 'draggable="true"' : '';
   const itemToggled = toggledItems.has(t.id) ? ' item-toggled' : '';
@@ -2118,7 +2122,7 @@ function renderTodo(t) {
       </div>
       ${priorityBadge}
     </div>
-    ${desc}${jobBubble}
+    ${desc}${jobSummary}${jobBubble}
     </div>
   </div>`;
 }
@@ -2600,7 +2604,7 @@ async function openTerminal(todoId, resumeId) {
     theme: { background: '#1a1b1e', foreground: '#e2e8f0', cursor: '#4f6ef7',
              selectionBackground: 'rgba(79,110,247,0.3)' },
     fontFamily: 'Menlo, Monaco, "Cascadia Code", monospace',
-    fontSize: 13, lineHeight: 1.4, cursorBlink: true,
+    fontSize: 11, lineHeight: 1.3, cursorBlink: true,
   });
   const fitAddon = new FitAddon.FitAddon();
   term.loadAddon(fitAddon);
@@ -2821,7 +2825,7 @@ async function eaUpdateItem(id, force) {
       showToast(`Checking ${id}...`, false);
       if (data.job_id) {
         // Show spinner immediately — don't wait for pollJobs round trip
-        _jobsState[data.job_id] = { id: data.job_id, job_key: 'ea-' + id, status: 'running', created_at: Date.now()/1000 };
+        _jobsState[data.job_id] = { id: data.job_id, job_key: 'ea-' + id, status: 'running', created_at: Date.now()/1000, _optimistic: true };
         _updateSpinnersInPlace();
         _openItemStream(id, data.job_id);
       }
@@ -2848,6 +2852,7 @@ function showToast(msg, isError, onClick) {
 let _jobsPollTimer = null;
 let _jobsState = {};          // jobId -> job metadata (from server)
 let _clientJobLines = {};     // todoId -> string[] of parsed display lines
+let _clientJobSummary = {};   // todoId -> string[] of message-only lines (no tool calls)
 let _clientJobIds = {};       // todoId -> jobId that populated _clientJobLines
 let _itemStreamSources = {};  // todoId -> EventSource
 let _eaUpdateTimerInterval = null;
@@ -2887,9 +2892,14 @@ function _openItemStream(todoId, jobId) {
   // New job for this todo — start fresh output
   if (_clientJobIds[todoId] !== jobId) {
     _clientJobLines[todoId] = [];
+    _clientJobSummary[todoId] = [];
     _clientJobIds[todoId] = jobId;
+    // Clear summary div
+    const sumEl = document.getElementById('checkon-summary-' + todoId);
+    if (sumEl) { sumEl.innerHTML = ''; sumEl.classList.remove('has-content'); }
   }
   if (!_clientJobLines[todoId]) _clientJobLines[todoId] = [];
+  if (!_clientJobSummary[todoId]) _clientJobSummary[todoId] = [];
   const existingCount = _clientJobLines[todoId].length;
   let parsedCount = 0;
   const src = new EventSource('/api/jobs/' + jobId + '/stream');
@@ -2899,15 +2909,19 @@ function _openItemStream(todoId, jobId) {
     try { raw = JSON.parse(e.data); } catch { return; }
     if (typeof raw === 'object' && raw.__done__) {
       src.close(); delete _itemStreamSources[todoId];
+      // Mark bubble as done so hover no longer shows it
+      const bubble = document.getElementById('checkon-bubble-' + todoId);
+      if (bubble) bubble.classList.add('done');
       pollJobs();
       return;
     }
     const line = parseStreamLine(raw);
     if (!line) return;
-    if (parsedCount < existingCount) { parsedCount++; return; } // skip already-buffered
+    if (parsedCount < existingCount) { parsedCount++; return; }
     console.log(`[job:${jobId}]`, line);
     _clientJobLines[todoId].push(line);
     parsedCount++;
+    // Bubble: all lines (live feedback while running)
     const outEl = document.getElementById('checkon-bubble-' + todoId);
     if (outEl) {
       outEl.classList.add('has-content');
@@ -2916,6 +2930,15 @@ function _openItemStream(todoId, jobId) {
       div.textContent = line;
       outEl.appendChild(div);
       outEl.scrollTop = outEl.scrollHeight;
+    }
+    // Summary: only message lines (no tool calls)
+    if (!line.startsWith('▶') && !line.startsWith('✓')) {
+      _clientJobSummary[todoId].push(line);
+      const sumEl = document.getElementById('checkon-summary-' + todoId);
+      if (sumEl) {
+        sumEl.classList.add('has-content');
+        sumEl.textContent = _clientJobSummary[todoId].join('\n');
+      }
     }
   };
   src.onerror = () => { src.close(); delete _itemStreamSources[todoId]; };
@@ -2969,14 +2992,27 @@ function _restoreJobOutputs() {
   for (const [todoId, lines] of Object.entries(_clientJobLines)) {
     if (!lines.length) continue;
     const outEl = document.getElementById('checkon-bubble-' + todoId);
-    if (!outEl) continue;
-    outEl.classList.add('has-content');
-    outEl.innerHTML = lines.map(l => {
-      const style = l.startsWith('✓') ? ' style="color:var(--accent)"' : '';
-      const d = document.createElement('div'); d.textContent = l;
-      return `<div${style}>${d.innerHTML}</div>`;
-    }).join('');
-    outEl.scrollTop = outEl.scrollHeight;
+    if (outEl) {
+      // If job is done (no active stream), mark bubble as done so hover won't show it
+      const isDone = !_itemStreamSources[todoId];
+      outEl.classList.add('has-content');
+      if (isDone) outEl.classList.add('done');
+      outEl.innerHTML = lines.map(l => {
+        const style = l.startsWith('✓') ? ' style="color:var(--accent)"' : '';
+        const d = document.createElement('div'); d.textContent = l;
+        return `<div${style}>${d.innerHTML}</div>`;
+      }).join('');
+      outEl.scrollTop = outEl.scrollHeight;
+    }
+  }
+  // Restore summaries
+  for (const [todoId, lines] of Object.entries(_clientJobSummary)) {
+    if (!lines.length) continue;
+    const sumEl = document.getElementById('checkon-summary-' + todoId);
+    if (sumEl) {
+      sumEl.classList.add('has-content');
+      sumEl.textContent = lines.join('\n');
+    }
   }
 }
 
@@ -3112,8 +3148,16 @@ async function pollJobs() {
   try {
     const res = await fetch('/api/jobs');
     const jobs = await res.json();
-    const prevState = _jobsState;
-    _jobsState = {};
+    const serverIds = new Set(jobs.map(j => j.id));
+    // Remove entries not on server (completed/purged), keep optimistic entries for jobs server hasn't seen yet
+    for (const id of Object.keys(_jobsState)) {
+      if (!serverIds.has(id) && _jobsState[id]._optimistic) {
+        // Keep optimistic entry until server confirms
+      } else if (!serverIds.has(id)) {
+        delete _jobsState[id];
+      }
+    }
+    // Update/add from server (server is authoritative)
     jobs.forEach(j => { _jobsState[j.id] = j; });
     // Open streams for running jobs that don't have one yet
     for (const j of jobs) {
@@ -3150,9 +3194,6 @@ async function pollJobs() {
       _updateSpinnersInPlace();
     } catch {}
   } catch {}
-  const hasActive = Object.values(_jobsState).some(j => j.status === 'running' || j.status === 'pending');
-  const hasTerminals = Object.values(_termSessions).some(s => s.alive);
-  _jobsPollTimer = setTimeout(pollJobs, (hasActive || hasTerminals) ? 2000 : 5000);
 }
 
 function fallbackCopy(text) {
@@ -4433,7 +4474,6 @@ window.addEventListener('scroll', () => {
     <div id="terminal-titlebar" style="display:flex;align-items:center;padding:6px 14px 10px;gap:10px;border-bottom:1px solid rgba(255,255,255,0.1);flex-shrink:0;cursor:ns-resize" onmousedown="_startTermResize(event)">
       <span id="terminal-title" style="color:#e2e8f0;font-size:0.85rem;font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
       <button onclick="termSendCommand('/ea sync')" style="background:rgba(255,255,255,0.1);border:none;color:#e2e8f0;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem">Log Status</button>
-      <button onclick="minimizeTerminal()" style="background:rgba(255,255,255,0.1);border:none;color:#e2e8f0;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem">Minimize</button>
       <button onclick="killTerminal(_activeTermTodoId)" style="background:rgba(239,68,68,0.2);border:1px solid rgba(239,68,68,0.4);color:#fca5a5;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem">Kill</button>
     </div>
     <div id="terminal-container" style="flex:1;overflow:hidden;padding:4px"></div>
