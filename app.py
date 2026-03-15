@@ -1317,6 +1317,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .section-header-row {
     top: var(--section-offset, 0px);
+    margin-bottom: 10px;
   }
   .add-form input, .add-form textarea {
     width: 100%; padding: 10px 14px; border: 1px solid var(--border); border-radius: 8px;
@@ -2745,10 +2746,16 @@ async function eaUpdateItem(id, force) {
     });
     const data = await res.json();
     if (res.ok && data.status === 'already_running') {
-      showToast('Already running — click to restart', false, () => eaUpdateItem(id, true));
+      if (data.job_id) await killJob(data.job_id);
+      return;
     } else if (res.ok) {
       showToast(`Checking ${id}...`, false);
-      if (data.job_id) { await pollJobs(); _openItemStream(id, data.job_id); }
+      if (data.job_id) {
+        // Show spinner immediately — don't wait for pollJobs round trip
+        _jobsState[data.job_id] = { id: data.job_id, job_key: 'ea-' + id, status: 'running', created_at: Date.now()/1000 };
+        _updateSpinnersInPlace();
+        _openItemStream(id, data.job_id);
+      }
     } else {
       showToast(data.error || 'Failed', true);
     }
@@ -3903,6 +3910,9 @@ document.addEventListener('keydown', e => {
     e.preventDefault();
     if (selectedIdx === SEL_ADD && addFormVisible) {
       document.getElementById('new-title').focus();
+    } else if (selectedIdx >= 1 && selectedIdx <= visibleIds.length && selectedIsSection()) {
+      const sec = visibleIds[selectedIdx - 1].slice('__section__:'.length);
+      startSectionRename(sec);
     } else if (selectedIdx >= 1 && selectedIdx <= visibleIds.length && !selectedIsSection()) {
       startEdit(visibleIds[selectedIdx - 1]);
     }
@@ -3916,7 +3926,7 @@ document.addEventListener('keydown', e => {
       e.preventDefault();
       startInTmux(visibleIds[selectedIdx - 1]);
     }
-  } else if (e.key === 'h') {
+  } else if (e.key === 'r') {
     if (selectedIdx >= 1 && selectedIdx <= visibleIds.length && !selectedIsSection()) {
       e.preventDefault();
       eaUpdateItem(visibleIds[selectedIdx - 1]);
