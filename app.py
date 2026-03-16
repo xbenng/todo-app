@@ -2699,6 +2699,35 @@ function toggleSectionCollapse(section) {
   render();
 }
 
+function collapseStep() {
+  // First collapse all items, then collapse all sections
+  if (expandedItems.size > 0) {
+    expandedItems.clear();
+    render();
+    return;
+  }
+  const secs = sectionsOrder.filter(s => s);
+  if (secs.length > 0 && !secs.every(s => collapsedSections.has(s))) {
+    secs.forEach(s => collapsedSections.add(s));
+    render();
+  }
+}
+
+function expandStep() {
+  // First expand all sections, then expand all items
+  const secs = sectionsOrder.filter(s => s);
+  if (secs.length > 0 && secs.some(s => collapsedSections.has(s))) {
+    secs.forEach(s => collapsedSections.delete(s));
+    render();
+    return;
+  }
+  const activeTodos = allTodos.filter(t => t.status !== 'completed');
+  if (activeTodos.some(t => !expandedItems.has(t.id))) {
+    activeTodos.forEach(t => expandedItems.add(t.id));
+    render();
+  }
+}
+
 function toggleCollapseAll() {
   const secs = sectionsOrder.filter(s => s);
   const allCollapsed = secs.length > 0 && secs.every(s => collapsedSections.has(s));
@@ -4322,8 +4351,14 @@ document.getElementById('new-title').addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey && !e.metaKey && !e.ctrlKey) { e.preventDefault(); addTodo(); }
 });
 
+let _preAddSelectedIdx = -1;
+let _preAddSelectedId = null;
+
 function showAddForm() {
   addFormVisible = true;
+  // Remember selection before opening form
+  _preAddSelectedIdx = selectedIdx;
+  _preAddSelectedId = (selectedIdx >= 1 && selectedIdx <= visibleIds.length) ? visibleIds[selectedIdx - 1] : null;
   const form = document.getElementById('add-form');
   form.classList.add('visible');
   // If a todo is selected, pre-fill section, set insertion point, and move form inline
@@ -4361,8 +4396,15 @@ function hideAddForm() {
   document.getElementById('new-section').value = '';
   document.getElementById('new-section-custom').value = '';
   document.getElementById('new-section-custom').style.display = 'none';
-  // Move selection to first todo if any
-  selectedIdx = visibleIds.length > 0 ? 1 : -1;
+  // Restore previous selection
+  if (_preAddSelectedId) {
+    const idx = visibleIds.indexOf(_preAddSelectedId);
+    selectedIdx = idx >= 0 ? idx + 1 : (visibleIds.length > 0 ? 1 : -1);
+  } else {
+    selectedIdx = visibleIds.length > 0 ? 1 : -1;
+  }
+  _preAddSelectedId = null;
+  _preAddSelectedIdx = -1;
   applySelection();
 }
 
@@ -5070,9 +5112,12 @@ document.addEventListener('keydown', e => {
         }
       }
     }
-  } else if (e.key === 'a') {
+  } else if (e.key === '-') {
     e.preventDefault();
-    toggleSimpleMode();
+    collapseStep();
+  } else if (e.key === '+' || e.key === '=') {
+    e.preventDefault();
+    expandStep();
   } else if (e.key === 'v') {
     e.preventDefault();
     togglePreviewMode();
