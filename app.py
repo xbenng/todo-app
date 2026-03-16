@@ -2226,11 +2226,26 @@ function render() {
   };
   const afterSessions = f => {
     if (!filterActiveSessions) return f;
-    return f.filter(t => _termSessions[t.id] && _termSessions[t.id].alive);
+    // Sort by activity: active sessions/chats/unread first (most recent on top), rest below
+    const activityScore = t => {
+      const hasTerminal = _termSessions[t.id] && _termSessions[t.id].alive;
+      const hasChatStream = _chatSessions[t.id] && _chatSessions[t.id].streamingJobId;
+      const hasUnreadChat = _chatUnread.has(t.id);
+      const hasUpdated = _parseTitle(t.title || '').hasUpdatedTag && !_seenUpdates.has(t.id);
+      const isActive = hasTerminal || hasChatStream || hasUnreadChat || hasUpdated;
+      if (!isActive) return 0;
+      // Find most recent job for this todo
+      let latest = 0;
+      for (const j of Object.values(_jobsState)) {
+        if (_todoIdForJob(j) === t.id && j.created_at > latest) latest = j.created_at;
+      }
+      return latest || 1; // 1 = active but no job timestamp
+    };
+    return [...f].sort((a, b) => activityScore(b) - activityScore(a));
   };
   const afterUnread = f => {
     if (!filterUnread) return f;
-    return f.filter(t => _parseTitle(t.title || '').hasUpdatedTag && !_seenUpdates.has(t.id));
+    return f.filter(t => (_parseTitle(t.title || '').hasUpdatedTag && !_seenUpdates.has(t.id)) || _chatUnread.has(t.id));
   };
   const filteredActive = afterUnread(afterSessions(afterPriority(afterSearch(active))));
   const filteredCompleted = afterUnread(afterSessions(afterPriority(afterSearch(completed))));
@@ -2246,36 +2261,45 @@ function render() {
   }
 
   // Group active by section preserving order of first appearance
-  sectionsOrder = [];
-  const seenSections = new Set();
-  filteredActive.forEach(t => {
-    const s = t.section || '';
-    if (!seenSections.has(s)) { sectionsOrder.push(s); seenSections.add(s); }
-  });
-
   let activeHtml = '';
   const visibleActive = []; // track which active items are visible (not collapsed)
   const visibleActiveIds = []; // mix of todo IDs and '__section__:Name' markers for collapsed sections
-  sectionsOrder.forEach(section => {
-    const items = filteredActive.filter(t => (t.section || '') === section);
-    const isCollapsed = !searching && collapsedSections.has(section);
-    const escSection = esc(section).replace(/'/g, "\\'");
-    if (section) {
-      activeHtml += `<div class="section-header-row" data-section="${esc(section)}" draggable="true">`
-        + `<button class="collapse-btn${isCollapsed ? ' collapsed' : ''}" onclick="toggleSectionCollapse('${escSection}')" title="${isCollapsed ? 'Expand' : 'Collapse'}">&#9660;</button>`
-        + `<h3 onclick="toggleSectionCollapse('${escSection}')" ondblclick="startSectionRename('${escSection}')">${esc(section)}</h3>`
-        + `<span class="section-count">${items.length}</span>`
-        + `<button class="sort-priority-btn" onclick="sortByPriority('${escSection}')" title="Sort by priority (high first)">&#9650; Priority</button>`
-        + `</div>`;
-    }
-    if (isCollapsed) {
-      if (section) visibleActiveIds.push('__section__:' + section);
-    } else {
-      activeHtml += items.map(t => renderTodo(t)).join('');
-      visibleActive.push(...items);
-      visibleActiveIds.push(...items.map(t => t.id));
-    }
-  });
+
+  if (filterActiveSessions) {
+    // Flat list, no section grouping — sorted by activity
+    sectionsOrder = [];
+    activeHtml = filteredActive.map(t => renderTodo(t)).join('');
+    visibleActive.push(...filteredActive);
+    visibleActiveIds.push(...filteredActive.map(t => t.id));
+  } else {
+    sectionsOrder = [];
+    const seenSections = new Set();
+    filteredActive.forEach(t => {
+      const s = t.section || '';
+      if (!seenSections.has(s)) { sectionsOrder.push(s); seenSections.add(s); }
+    });
+
+    sectionsOrder.forEach(section => {
+      const items = filteredActive.filter(t => (t.section || '') === section);
+      const isCollapsed = !searching && collapsedSections.has(section);
+      const escSection = esc(section).replace(/'/g, "\\'");
+      if (section) {
+        activeHtml += `<div class="section-header-row" data-section="${esc(section)}" draggable="true">`
+          + `<button class="collapse-btn${isCollapsed ? ' collapsed' : ''}" onclick="toggleSectionCollapse('${escSection}')" title="${isCollapsed ? 'Expand' : 'Collapse'}">&#9660;</button>`
+          + `<h3 onclick="toggleSectionCollapse('${escSection}')" ondblclick="startSectionRename('${escSection}')">${esc(section)}</h3>`
+          + `<span class="section-count">${items.length}</span>`
+          + `<button class="sort-priority-btn" onclick="sortByPriority('${escSection}')" title="Sort by priority (high first)">&#9650; Priority</button>`
+          + `</div>`;
+      }
+      if (isCollapsed) {
+        if (section) visibleActiveIds.push('__section__:' + section);
+      } else {
+        activeHtml += items.map(t => renderTodo(t)).join('');
+        visibleActive.push(...items);
+        visibleActiveIds.push(...items.map(t => t.id));
+      }
+    });
+  }
 
   // visibleIds includes todo IDs + section markers for collapsed sections
   visibleIds = [...visibleActiveIds, ...filteredCompleted.map(t => t.id)];
@@ -2426,7 +2450,7 @@ function renderTodo(t) {
     <div class="${swipeRevealClass}"><span class="swipe-reveal-icon">${swipeIcon}</span></div>
     <div class="swipe-content">
     <div class="todo-header">
-      <div class="todo-title" style="flex:1;min-width:0;display:flex;align-items:center;gap:2px" onclick="event.stopPropagation();selectTodo('${t.id}');toggleItemDesc('${t.id}')">${_parseTitle(t.title || '').hasUpdatedTag && !_seenUpdates.has(t.id) ? '<span class="ea-update-dot"></span>' : ''}${spinner}${esc(_parseTitle(t.title || '').displayTitle)}</div>
+      <div class="todo-title" style="flex:1;min-width:0;display:flex;align-items:center;gap:2px" onclick="event.stopPropagation();selectTodo('${t.id}');toggleItemDesc('${t.id}')">${spinner}${esc(_parseTitle(t.title || '').displayTitle)}</div>
       <div class="todo-actions">
         ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();eaUpdateItem('${t.id}')" style="border:none;background:transparent;font-size:1rem;padding:4px 6px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Refresh via /ea checkon" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#8635;</button>` : ''}
         ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();openChat('${t.id}')" style="border:none;background:transparent;font-size:1rem;padding:4px 6px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Chat (s)" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#9654;</button>` : ''}
@@ -2665,16 +2689,6 @@ function toggleItemDesc(id) {
   } else {
     expandedItems.add(id);
     el.classList.add('item-expanded');
-    // Mark update as seen when expanding — update md file
-    if (!_seenUpdates.has(id)) {
-      const t = allTodos.find(x => x.id === id);
-      if (t && t.title && _parseTitle(t.title).hasUpdatedTag) {
-        _seenUpdates.add(id);
-        const dot = el.querySelector('.ea-update-dot');
-        if (dot) dot.remove();
-        fetch(API + '/' + id + '/mark-read', { method: 'POST' });
-      }
-    }
   }
   updateSimpleBtn();
 }
@@ -3829,9 +3843,12 @@ function _updateSpinnersInPlace() {
       if (existingJobSpinner) existingJobSpinner.remove();
     }
 
-    // Chat unread dot
+    // Unread dot — chat unread OR updated tag unseen
+    const todo = allTodos.find(x => x.id === todoId);
+    const hasUpdatedTag = todo && _parseTitle(todo.title || '').hasUpdatedTag && !_seenUpdates.has(todoId);
+    const hasUnread = _chatUnread.has(todoId) || hasUpdatedTag;
     const existingUnreadDot = titleEl.querySelector('.chat-unread-dot');
-    if (_chatUnread.has(todoId)) {
+    if (hasUnread) {
       if (!existingUnreadDot) {
         const dot = document.createElement('span');
         dot.className = 'chat-unread-dot';
@@ -4733,7 +4750,23 @@ function selectedIsSection() {
   return visibleIds[selectedIdx - 1].startsWith('__section__:');
 }
 
+function _markPreviousAsRead() {
+  // Mark the previously selected item's updated tag as read
+  if (selectedIdx >= 1 && selectedIdx <= visibleIds.length) {
+    const prevId = visibleIds[selectedIdx - 1];
+    if (prevId && !prevId.startsWith('__section__:') && !_seenUpdates.has(prevId)) {
+      const t = allTodos.find(x => x.id === prevId);
+      if (t && t.title && _parseTitle(t.title).hasUpdatedTag) {
+        _seenUpdates.add(prevId);
+        _updateSpinnersInPlace();
+        fetch(API + '/' + prevId + '/mark-read', { method: 'POST' }).catch(() => {});
+      }
+    }
+  }
+}
+
 function applySelection() {
+  _markPreviousAsRead();
   // Collapse previous preview-expanded item
   if (previewExpandedId) {
     const prevEl = document.querySelector(`.todo-item[data-todo-id="${previewExpandedId}"]`);
@@ -4865,6 +4898,12 @@ document.addEventListener('keydown', e => {
     return;
   }
 
+  if ((e.metaKey || e.ctrlKey) && e.key === 'u' && !e.shiftKey) {
+    e.preventDefault();
+    toggleFilterUnread();
+    return;
+  }
+
   // Undo: Cmd+Z / Ctrl+Z
   if ((e.metaKey || e.ctrlKey) && e.key === 'z' && !e.shiftKey) {
     e.preventDefault();
@@ -4955,6 +4994,11 @@ document.addEventListener('keydown', e => {
     if (selectedIdx >= 1 && selectedIdx <= visibleIds.length && !selectedIsSection()) {
       e.preventDefault();
       startChatBackground(visibleIds[selectedIdx - 1]);
+    }
+  } else if (e.key === 'x') {
+    if (selectedIdx >= 1 && selectedIdx <= visibleIds.length && !selectedIsSection()) {
+      e.preventDefault();
+      stopChat(visibleIds[selectedIdx - 1]);
     }
   } else if (e.key === 'r' && !e.metaKey && !e.ctrlKey) {
     if (selectedIdx >= 1 && selectedIdx <= visibleIds.length && !selectedIsSection()) {
