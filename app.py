@@ -292,6 +292,23 @@ def update_todo(todo_id):
     return jsonify({"error": "Not found"}), 404
 
 
+@app.route("/api/todos/<todo_id>/mark-read", methods=["POST"])
+def mark_read(todo_id):
+    """Replace `updated ...` tag with `read ...` and current timestamp."""
+    import re as _re
+    from datetime import datetime as _dt
+    active = _parse_todo_file(TODO_FILE)
+    completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+    todos = active + completed
+    for t in todos:
+        if t["id"] == todo_id:
+            now = _dt.now().strftime("%Y-%m-%d %H:%M")
+            t["title"] = _re.sub(r'`updated[^`]*`', f'`read {now}`', t["title"])
+            _snapshot_and_write(TODO_FILE, todos)
+            return jsonify(t)
+    return jsonify({"error": "Not found"}), 404
+
+
 @app.route("/api/todos/<todo_id>", methods=["DELETE"])
 def delete_todo(todo_id):
     active = _parse_todo_file(TODO_FILE)
@@ -1836,6 +1853,7 @@ let visibleIds = []; // ordered list of todo ids as rendered
 let sectionsOrder = []; // ordered list of section names as rendered
 let addFormVisible = false;
 let filterActiveSessions = false; // only show items with active terminal sessions
+let filterUnread = false; // only show items with unread updates
 let previewMode = false; // auto-expand selected item
 let previewExpandedId = null; // item currently auto-expanded by preview
 const expandedItems = new Set(); // items whose descriptions are expanded
@@ -1918,8 +1936,12 @@ function render() {
     if (!filterActiveSessions) return f;
     return f.filter(t => _termSessions[t.id] && _termSessions[t.id].alive);
   };
-  const filteredActive = afterSessions(afterPriority(afterSearch(active)));
-  const filteredCompleted = afterSessions(afterPriority(afterSearch(completed)));
+  const afterUnread = f => {
+    if (!filterUnread) return f;
+    return f.filter(t => _parseTitle(t.title || '').hasUpdatedTag && !_seenUpdates.has(t.id));
+  };
+  const filteredActive = afterUnread(afterSessions(afterPriority(afterSearch(active))));
+  const filteredCompleted = afterUnread(afterSessions(afterPriority(afterSearch(completed))));
 
 
   if (filteredActive.length === 0 && filteredCompleted.length === 0 && !searching && allTodos.length === 0) {
@@ -1986,11 +2008,12 @@ function render() {
   }).join('');
   const previewBtn = `<button class="header-toggle preview-toggle-btn${previewMode ? ' active' : ''}" onclick="togglePreviewMode()" title="Preview mode: auto-expand selected (v)">Preview</button>`;
   const sessionsBtn = `<button class="header-toggle${filterActiveSessions ? ' active' : ''}" onclick="toggleFilterSessions()" title="Filter by active sessions (Ctrl+S)" style="${filterActiveSessions ? '' : 'color:var(--subtle)'}">Sessions</button>`;
+  const unreadBtn = `<button class="header-toggle${filterUnread ? ' active' : ''}" onclick="toggleFilterUnread()" title="Filter by unread updates" style="${filterUnread ? 'background:#f59e0b;color:#fff;border-color:#f59e0b' : 'color:#f59e0b;border-color:#f59e0b'}">Unread</button>`;
   const activeSections = sectionsOrder.filter(s => s);
   const collapsedCount = activeSections.filter(s => collapsedSections.has(s)).length;
   const allCollapsed = activeSections.length > 0 && collapsedCount === activeSections.length;
   const collapseAllBtn = activeSections.length === 0 ? '' : `<button class="collapse-btn${allCollapsed ? ' collapsed' : ''}" onclick="toggleCollapseAll()" title="Collapse/expand all sections">&#9660;</button>`;
-  const modeGroup = `<span class="btn-group">${simpleBtn}${previewBtn}${sessionsBtn}</span>`;
+  const modeGroup = `<span class="btn-group">${simpleBtn}${previewBtn}${sessionsBtn}${unreadBtn}</span>`;
   const headerBtns = '<div class="active-header-btns">' + collapseAllBtn + '<h2>Active' + (filteredActive.length ? ' (' + filteredActive.length + ')' : '') + '</h2>' + filterBtns + modeGroup + '</div>' + eaBtn;
   activeEl.innerHTML = filteredActive.length
     ? '<div class="active-header">' + headerBtns + '</div>' + activeHtml
@@ -2071,7 +2094,7 @@ function renderTodo(t) {
   if (editingId === t.id) {
     return `<div class="todo-item ${statusClass}">
       <div class="todo-body">
-        <input class="edit-title" id="edit-title-${t.id}" value="${esc(t.title)}">
+        <input class="edit-title" id="edit-title-${t.id}" value="${esc(_parseTitle(t.title || '').displayTitle)}">
         <div class="edit-desc-cm" id="edit-desc-${t.id}"></div>
         <select id="edit-section-${t.id}" class="edit-select">
           <option value="">No section</option>
@@ -2111,14 +2134,13 @@ function renderTodo(t) {
     <div class="${swipeRevealClass}"><span class="swipe-reveal-icon">${swipeIcon}</span></div>
     <div class="swipe-content">
     <div class="todo-header">
-      <div class="todo-title" style="flex:1;min-width:0;display:flex;align-items:center;gap:2px" onclick="event.stopPropagation();selectTodo('${t.id}');toggleItemDesc('${t.id}')">${spinner}${esc(_parseTitle(t.title || '').displayTitle)}</div>
+      <div class="todo-title" style="flex:1;min-width:0;display:flex;align-items:center;gap:2px" onclick="event.stopPropagation();selectTodo('${t.id}');toggleItemDesc('${t.id}')">${_parseTitle(t.title || '').hasUpdatedTag && !_seenUpdates.has(t.id) ? '<span class="ea-update-dot"></span>' : ''}${spinner}${esc(_parseTitle(t.title || '').displayTitle)}</div>
       <div class="todo-actions">
         ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();eaUpdateItem('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Refresh via /ea checkon" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#8635;</button>` : ''}
         ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();startInTmux('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Open terminal (s)" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#9654;</button>` : ''}
 
       </div>
       ${priorityBadge}
-      ${_parseTitle(t.title || '').hasUpdatedTag && !_seenUpdates.has(t.id) ? '<span class="ea-update-dot"></span>' : ''}
     </div>
     ${desc}${jobSummary}${jobBubble}
     </div>
@@ -2128,7 +2150,8 @@ function renderTodo(t) {
 function _parseTitle(raw) {
   // Extract bold text as display title: **title text**
   const boldMatch = raw.match(/\*\*(.+?)\*\*/);
-  const displayTitle = boldMatch ? boldMatch[1] : raw.replace(/`updated[^`]*`/g, '').trim();
+  const stripped = raw.replace(/`(?:updated|read)[^`]*`/g, '').replace(/\*\*/g, '').trim();
+  const displayTitle = boldMatch ? boldMatch[1] : stripped;
   const hasUpdatedTag = /`updated\s[^`]*`/.test(raw);
   return { displayTitle, hasUpdatedTag };
 }
@@ -2294,6 +2317,11 @@ function toggleFilterSessions() {
   render();
 }
 
+function toggleFilterUnread() {
+  filterUnread = !filterUnread;
+  render();
+}
+
 function toggleSimpleMode() {
   if (expandedItems.size > 0) {
     expandedItems.clear();
@@ -2345,13 +2373,14 @@ function toggleItemDesc(id) {
   } else {
     expandedItems.add(id);
     el.classList.add('item-expanded');
-    // Mark update as seen when expanding
+    // Mark update as seen when expanding — update md file
     if (!_seenUpdates.has(id)) {
       const t = allTodos.find(x => x.id === id);
       if (t && t.title && _parseTitle(t.title).hasUpdatedTag) {
         _seenUpdates.add(id);
         const dot = el.querySelector('.ea-update-dot');
         if (dot) dot.remove();
+        fetch(API + '/' + id + '/mark-read', { method: 'POST' });
       }
     }
   }
@@ -3495,7 +3524,13 @@ function cancelEdit() {
 }
 
 async function saveEdit(id) {
-  const title = document.getElementById('edit-title-' + id).value.trim();
+  const editedTitle = document.getElementById('edit-title-' + id).value.trim();
+  // Reconstruct full title preserving metadata tags from original
+  const origTodo = allTodos.find(x => x.id === id);
+  const origRaw = origTodo ? origTodo.title || '' : '';
+  const metaMatch = origRaw.match(/`(?:updated|read)[^`]*`/);
+  const meta = metaMatch ? ' ' + metaMatch[0] : '';
+  const title = '**' + editedTitle + '**' + meta;
   const desc = cmEditor ? cmEditor.state.doc.toString().trim() : '';
   const priority = document.getElementById('edit-priority-' + id).value;
   const secSelect = document.getElementById('edit-section-' + id);
