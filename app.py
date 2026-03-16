@@ -1297,7 +1297,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .checkon-summary .checkon-inline-spinner { display: inline-flex; vertical-align: baseline; margin-left: 6px; position: relative; top: 2px; }
   .checkon-header { font-size: 0.72rem; font-weight: 600; color: var(--subtle); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; padding-bottom: 3px; border-bottom: 1px solid var(--border); }
   .checkon-footer { font-size: 0.72rem; font-weight: 600; color: var(--subtle); text-transform: uppercase; letter-spacing: 0.05em; margin-top: 4px; padding-top: 3px; border-top: 1px solid var(--border); }
-  .checkon-summary.has-content { display: block; }
   .checkon-summary { display: none; }
   .todo-item.item-expanded .checkon-summary.has-content { display: block; }
   .todo-item:has(.job-spinner:not(.term-spinner):hover) { z-index: 200; overflow: visible; }
@@ -1438,7 +1437,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
   @keyframes sk-scaleout {
     0% { transform: scale(0); } 100% { transform: scale(1.0); opacity: 0; }
   }
-  .ea-update-comment { font-weight: 400; font-size: 0.82rem; color: #f59e0b; margin-left: 4px; }
   .todo-desc { color: var(--muted); font-size: 0.9rem; margin-top: 6px; word-break: break-word; line-height: 1.5; display: none; }
   .todo-item.item-expanded .todo-desc { display: block; }
   .todo-item.item-expanded .todo-meta { display: flex; }
@@ -2113,27 +2111,26 @@ function renderTodo(t) {
     <div class="${swipeRevealClass}"><span class="swipe-reveal-icon">${swipeIcon}</span></div>
     <div class="swipe-content">
     <div class="todo-header">
-      <div class="todo-title" style="flex:1;min-width:0;display:flex;align-items:center;gap:2px" onclick="event.stopPropagation();selectTodo('${t.id}');toggleItemDesc('${t.id}')">${spinner}${_renderTitle(t)}</div>
+      <div class="todo-title" style="flex:1;min-width:0;display:flex;align-items:center;gap:2px" onclick="event.stopPropagation();selectTodo('${t.id}');toggleItemDesc('${t.id}')">${spinner}${esc(_parseTitle(t.title || '').displayTitle)}</div>
       <div class="todo-actions">
         ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();eaUpdateItem('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Refresh via /ea checkon" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#8635;</button>` : ''}
         ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();startInTmux('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Open terminal (s)" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#9654;</button>` : ''}
 
       </div>
       ${priorityBadge}
+      ${_parseTitle(t.title || '').hasUpdatedTag && !_seenUpdates.has(t.id) ? '<span class="ea-update-dot"></span>' : ''}
     </div>
     ${desc}${jobSummary}${jobBubble}
     </div>
   </div>`;
 }
 
-function _renderTitle(t) {
-  const raw = t.title || '';
-  const idx = raw.indexOf('⚡');
-  if (idx === -1) return esc(raw);
-  const title = raw.substring(0, idx).replace(/\*+$/, '').trimEnd();
-  const comment = raw.substring(idx + 1).trim();
-  const hasUpdate = !_seenUpdates.has(t.id);
-  return esc(title) + (hasUpdate ? '<span class="ea-update-dot"></span>' : '') + (comment ? '<span class="ea-update-comment">' + esc(comment) + '</span>' : '');
+function _parseTitle(raw) {
+  // Extract bold text as display title: **title text**
+  const boldMatch = raw.match(/\*\*(.+?)\*\*/);
+  const displayTitle = boldMatch ? boldMatch[1] : raw.replace(/`updated[^`]*`/g, '').trim();
+  const hasUpdatedTag = /`updated\s[^`]*`/.test(raw);
+  return { displayTitle, hasUpdatedTag };
 }
 
 function esc(s) {
@@ -2348,10 +2345,10 @@ function toggleItemDesc(id) {
   } else {
     expandedItems.add(id);
     el.classList.add('item-expanded');
-    // Mark ⚡ update as seen when expanding
+    // Mark update as seen when expanding
     if (!_seenUpdates.has(id)) {
       const t = allTodos.find(x => x.id === id);
-      if (t && t.title && t.title.includes('⚡')) {
+      if (t && t.title && _parseTitle(t.title).hasUpdatedTag) {
         _seenUpdates.add(id);
         const dot = el.querySelector('.ea-update-dot');
         if (dot) dot.remove();
