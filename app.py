@@ -4901,7 +4901,7 @@ document.addEventListener('keydown', e => {
     }
   }
 
-  // Search input: handle Escape, ArrowDown/j to navigate into results
+  // Search input: handle Escape, then let action keys fall through
   const inSearchInput = e.target.id === 'search-input';
   if (inSearchInput) {
     if (e.key === 'Escape') {
@@ -4911,26 +4911,28 @@ document.addEventListener('keydown', e => {
       e.target.classList.remove('has-query');
       e.target.blur();
       render();
-    } else if (e.key === 'ArrowDown' || (e.key === 'j' && e.ctrlKey)) {
-      e.preventDefault();
-      e.target.blur();
-      if (visibleIds.length > 0) {
-        selectedIdx = 1;
-        applySelection();
-      }
+      return;
     }
-    return; // Let normal typing work in search input
+    // Action keys that should blur search and fall through to the main handler
+    const actionKeys = new Set(['Enter', 'ArrowDown', 'ArrowUp', 'ArrowLeft', 'ArrowRight', ' ', 'Tab']);
+    if (actionKeys.has(e.key)) {
+      e.target.blur();
+    } else {
+      return; // Everything else (typing, Backspace, Delete, Home, End, etc.) stays in search
+    }
   }
 
   // `/` focuses the search input from anywhere (before the input guard)
   if (e.key === '/' && tag !== 'input' && tag !== 'textarea' && tag !== 'select' && !editingId) {
     e.preventDefault();
-    document.getElementById('search-input').focus();
+    const si = document.getElementById('search-input');
+    si.focus();
+    si.select();
     return;
   }
 
-  // Ignore when typing in other inputs or editing
-  if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+  // Ignore when typing in other inputs or editing (but not search — handled above)
+  if (!inSearchInput && (tag === 'input' || tag === 'textarea' || tag === 'select')) return;
   if (editingId) return;
 
   // Filter sessions: Ctrl+S
