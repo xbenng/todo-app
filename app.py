@@ -51,6 +51,33 @@ def _completed_file_path(path: str) -> str:
     return f"{base}-completed{ext}"
 
 
+def _chats_file_path(path: str) -> str:
+    """Derive the chats file path from the main todo file path.
+    e.g. todos.md -> todos-chats.json
+    """
+    base, _ = os.path.splitext(path)
+    return f"{base}-chats.json"
+
+
+def _load_chats() -> dict:
+    """Load chat sessions from disk."""
+    path = _chats_file_path(TODO_FILE)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_chats(data: dict) -> None:
+    """Save chat sessions to disk."""
+    path = _chats_file_path(TODO_FILE)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+
+
 # ---------------------------------------------------------------------------
 # File format parser / writer
 # ---------------------------------------------------------------------------
@@ -713,6 +740,150 @@ def _run_claude_job(job_id: str, prompt: str, cwd: str):
         _jobs[job_id]["status"] = "error"
 
 
+def _run_claude_chat_job(job_id: str, message: str, cwd: str,
+                         conversation_id: str | None = None,
+                         todo_id: str | None = None):
+    """Thread target: run claude -p for chat with optional --resume for conversation continuity."""
+    claude_bin, env = _resolve_claude_bin()
+    if not claude_bin:
+        _jobs[job_id]["output_lines"].append("error: claude binary not found")
+        _jobs[job_id]["status"] = "error"
+        return
+
+    cmd = [claude_bin, "-p", message, "--dangerously-skip-permissions",
+           "--output-format", "stream-json", "--verbose"]
+    if conversation_id:
+        cmd.extend(["--resume", conversation_id])
+    _jobs[job_id]["status"] = "running"
+
+    assistant_text_lines = []  # collect plain text lines for persistence
+
+    def emit(line: str, is_text: bool = False) -> None:
+        if line.strip():
+            _jobs[job_id]["output_lines"].append(line)
+            if is_text:
+                assistant_text_lines.append(line)
+
+    try:
+        proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, env=env,
+                                start_new_session=True)
+        _jobs[job_id]["proc"] = proc
+
+        text_buf = ""
+        got_streaming = False
+
+        for raw_line in proc.stdout:
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            try:
+                data = json.loads(raw_line)
+            except json.JSONDecodeError:
+                emit(raw_line[:200])
+                continue
+
+            t = data.get("type", "")
+
+            if t == "content_block_start":
+                block = data.get("content_block", {})
+                if block.get("type") == "tool_use":
+                    if text_buf.strip():
+                        emit(text_buf.strip(), is_text=True)
+                        text_buf = ""
+                    emit(f"▶ {block.get('name', '?')}...")
+                elif block.get("type") == "text" and text_buf.strip():
+                    emit(text_buf.strip(), is_text=True)
+                    text_buf = ""
+
+            elif t == "content_block_delta":
+                got_streaming = True
+                delta = data.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    text_buf += delta.get("text", "")
+                    while "\n" in text_buf:
+                        line, text_buf = text_buf.split("\n", 1)
+                        emit(line, is_text=True)
+
+            elif t == "content_block_stop":
+                if text_buf.strip():
+                    emit(text_buf.strip(), is_text=True)
+                    text_buf = ""
+
+            elif t == "assistant" and not got_streaming:
+                parts = []
+                for block in data.get("message", {}).get("content", []):
+                    if block.get("type") == "text":
+                        text = block["text"].strip()
+                        if text:
+                            parts.append(("text", text))
+                    elif block.get("type") == "tool_use":
+                        name = block.get("name", "?")
+                        inp = json.dumps(block.get("input", {}))[:80]
+                        parts.append(("tool", f"▶ {name}({inp})"))
+                for kind, part in parts:
+                    for line in part.splitlines():
+                        emit(line, is_text=(kind == "text"))
+
+            elif t == "result":
+                session_id = data.get("session_id")
+                if session_id:
+                    _jobs[job_id]["conversation_id"] = session_id
+                result = data.get("result", "").strip()
+                cost = data.get("cost_usd")
+                cost_str = f" — ${cost:.4f}" if cost else ""
+                emit(f"✓ Done{cost_str}" + (f": {result}" if result else ""))
+
+        if text_buf.strip():
+            emit(text_buf.strip(), is_text=True)
+
+        proc.wait()
+        if _jobs[job_id]["status"] != "killed":
+            _jobs[job_id]["status"] = "done" if proc.returncode == 0 else "error"
+
+        # Persist assistant response to chats file and mark unread
+        if todo_id and assistant_text_lines:
+            try:
+                chats = _load_chats()
+                chat = chats.get(todo_id, {"conversationId": None, "messages": []})
+                chat["conversationId"] = _jobs[job_id].get("conversation_id")
+                chat["messages"].append({"role": "assistant", "content": "\n".join(assistant_text_lines)})
+                chat["unread"] = True
+                chats[todo_id] = chat
+                _save_chats(chats)
+            except Exception:
+                pass
+
+    except Exception as exc:
+        _jobs[job_id]["output_lines"].append(f"error: {exc}")
+        _jobs[job_id]["status"] = "error"
+
+
+def _start_claude_chat_job(label: str, job_key: str, message: str, cwd: str,
+                           conversation_id: str | None = None,
+                           todo_id: str | None = None) -> str:
+    """Start a headless Claude chat job; return job_id. Deduplicates by job_key."""
+    for j in _jobs.values():
+        if j["job_key"] == job_key and j["status"] == "running":
+            return j["id"]
+    job_id = str(uuid.uuid4())[:8]
+    _jobs[job_id] = {
+        "id": job_id,
+        "label": label,
+        "job_key": job_key,
+        "status": "pending",
+        "output_lines": [],
+        "proc": None,
+        "created_at": time.time(),
+        "conversation_id": conversation_id,
+        "todo_id": todo_id,
+    }
+    t = threading.Thread(target=_run_claude_chat_job,
+                         args=(job_id, message, cwd, conversation_id, todo_id), daemon=True)
+    t.start()
+    return job_id
+
+
 def _kill_process_tree(pid: int) -> None:
     """Send SIGTERM to a process and all its descendants.
 
@@ -865,6 +1036,83 @@ def start_in_tmux(todo_id):
     job_id = _start_claude_job(todo.get("title", todo_id), f"workon-{todo_id}",
                                f"/ea workon {todo_id}", todo_dir)
     return jsonify({"status": "started", "job_id": job_id})
+
+
+@app.route("/api/todos/<todo_id>/chat", methods=["POST"])
+def chat_with_todo(todo_id):
+    """Send a chat message for a todo item, optionally resuming a conversation."""
+    todos = _parse_todo_file(TODO_FILE)
+    todo = next((t for t in todos if t["id"] == todo_id), None)
+    if not todo:
+        return jsonify({"error": "Todo not found"}), 404
+
+    data = request.json or {}
+    message = data.get("message", "").strip()
+    if not message:
+        return jsonify({"error": "message is required"}), 400
+
+    # Server owns conversation state — read conversation_id from file
+    chats = _load_chats()
+    chat = chats.get(todo_id, {"conversationId": None, "messages": []})
+    conversation_id = chat.get("conversationId")
+
+    # Persist user message immediately
+    chat["messages"].append({"role": "user", "content": message})
+    chats[todo_id] = chat
+    _save_chats(chats)
+
+    todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
+
+    job_id = _start_claude_chat_job(
+        label=f"chat: {todo.get('title', todo_id)[:40]}",
+        job_key=f"chat-{todo_id}",
+        message=message,
+        cwd=todo_dir,
+        conversation_id=conversation_id,
+        todo_id=todo_id,
+    )
+    return jsonify({"job_id": job_id, "conversation_id": conversation_id})
+
+
+@app.route("/api/chats/<todo_id>")
+def get_chat(todo_id):
+    """Return the persisted chat session for a todo item, plus any running job."""
+    chats = _load_chats()
+    chat = chats.get(todo_id, {"conversationId": None, "messages": []})
+    # Check for a running chat job for this todo
+    job_key = f"chat-{todo_id}"
+    for j in _jobs.values():
+        if j["job_key"] == job_key and j["status"] in ("pending", "running"):
+            chat["running_job_id"] = j["id"]
+            break
+    return jsonify(chat)
+
+
+@app.route("/api/chats/<todo_id>", methods=["DELETE"])
+def delete_chat(todo_id):
+    """Clear the persisted chat session for a todo item."""
+    chats = _load_chats()
+    chats.pop(todo_id, None)
+    _save_chats(chats)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/chats/unread")
+def get_unread_chats():
+    """Return list of todo_ids with unread chat responses."""
+    chats = _load_chats()
+    return jsonify([tid for tid, c in chats.items() if c.get("unread")])
+
+
+@app.route("/api/chats/<todo_id>/read", methods=["POST"])
+def mark_chat_read(todo_id):
+    """Mark a chat as read."""
+    chats = _load_chats()
+    chat = chats.get(todo_id)
+    if chat and chat.get("unread"):
+        chat["unread"] = False
+        _save_chats(chats)
+    return jsonify({"ok": True})
 
 
 # ---------------------------------------------------------------------------
@@ -1171,7 +1419,8 @@ def list_jobs():
         del _jobs[jid]
     return jsonify([{
         "id": j["id"], "label": j["label"], "job_key": j["job_key"],
-        "status": j["status"], "line_count": len(j["output_lines"]), "created_at": j["created_at"]
+        "status": j["status"], "line_count": len(j["output_lines"]), "created_at": j["created_at"],
+        "conversation_id": j.get("conversation_id"),
     } for j in _jobs.values()])
 
 
@@ -1189,7 +1438,10 @@ def stream_job(job_id):
                 yield f"data: {json.dumps(job['output_lines'][sent])}\n\n"
                 sent += 1
             if job["status"] in ("done", "error", "killed"):
-                yield f"data: {json.dumps({'__done__': True, 'status': job['status']})}\n\n"
+                done_msg = {'__done__': True, 'status': job['status']}
+                if job.get('conversation_id'):
+                    done_msg['conversation_id'] = job['conversation_id']
+                yield f"data: {json.dumps(done_msg)}\n\n"
                 break
             time.sleep(0.05)
 
@@ -1218,7 +1470,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>Todo List</title>
 <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
 <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32x32.png">
@@ -1228,6 +1480,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <script type="module" src="https://cdn.jsdelivr.net/npm/ldrs/dist/auto/mirage.js"></script>
 <script type="module" src="https://cdn.jsdelivr.net/npm/ldrs/dist/auto/jellyTriangle.js"></script>
 <script type="module" src="https://cdn.jsdelivr.net/npm/ldrs/dist/auto/bouncy.js"></script>
+<script type="module" src="https://cdn.jsdelivr.net/npm/ldrs/dist/auto/ripples.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"></script>
@@ -1735,12 +1988,51 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .term-spinner .sk-bounce2 { animation-delay: -1s; }
   @keyframes sk-doubleBounce { 0%, 100% { transform: scale(0); } 50% { transform: scale(1); } }
   .term-spinner::after { content: '↑'; color: #22c55e; font-size: 11px; font-weight: 700; }
+  .chat-spinner::after { content: '↑'; color: #22c55e; font-size: 11px; font-weight: 700; }
+  .chat-spinner:hover l-jelly-triangle { opacity: 1; }
   /* Terminal overlay */
   #terminal-overlay.visible { display: flex !important; }
   #terminal-container { width: 100%; }
   #terminal-container .xterm { width: 100% !important; height: 100% !important; }
   .xterm-viewport::-webkit-scrollbar { width: 6px; }
   .xterm-viewport::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 3px; }
+  /* Chat overlay */
+  #chat-overlay.visible { display: flex !important; }
+  .chat-log { flex: 1; overflow-y: auto; padding: 16px 20px; font-family: 'Manrope', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 0.85rem; line-height: 1.55; color: #cbd5e1; word-break: break-word; }
+  .chat-log::-webkit-scrollbar { width: 6px; }
+  .chat-log::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 3px; }
+  .chat-user-line { color: #93c5fd; font-weight: 500; padding: 6px 10px; background: rgba(79,110,247,0.08); border-radius: 6px; border-left: 3px solid var(--accent); }
+  .chat-tool-line { color: rgba(255,255,255,0.4); font-size: 0.75rem; font-family: monospace; padding: 2px 10px; }
+  .chat-cost-line { color: rgba(255,255,255,0.4); font-size: 0.75rem; font-family: monospace; padding: 2px 10px; }
+  .chat-turn-sep { border: none; border-top: 1px solid rgba(255,255,255,0.06); margin: 12px 0; }
+  .chat-input-bar { display: flex; gap: 8px; padding: 10px 16px; border-top: 1px solid rgba(255,255,255,0.1); flex-shrink: 0; background: rgba(0,0,0,0.15); }
+  .chat-input { flex: 1; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.1); color: #e2e8f0; padding: 10px 14px; border-radius: 10px; font-family: inherit; font-size: 0.85rem; outline: none; transition: border-color 0.15s; }
+  .chat-input:focus { border-color: rgba(79,110,247,0.5); }
+  .chat-input::placeholder { color: rgba(255,255,255,0.25); }
+  .chat-send-btn { background: var(--accent); border: none; color: #fff; padding: 10px 18px; border-radius: 10px; cursor: pointer; font-size: 0.8rem; font-weight: 600; transition: background 0.15s, transform 0.1s; }
+  .chat-send-btn:hover { background: #3a5bd9; transform: translateY(-1px); }
+  .chat-send-btn:active { transform: translateY(0); }
+  .chat-send-btn:disabled { opacity: 0.4; cursor: default; transform: none; }
+  .chat-send-btn.chat-stop-mode { background: rgba(239,68,68,0.6); }
+  .chat-send-btn.chat-stop-mode:hover { background: rgba(239,68,68,0.8); }
+  .chat-unread-dot {
+    display: inline-flex; align-items: center; margin-right: 2px; flex-shrink: 0;
+  }
+  .chat-assistant-block { margin: 4px 0; padding: 4px 10px; color: #e2e8f0; }
+  .chat-assistant-block p { margin: 0; }
+  .chat-assistant-block p + p { margin-top: 0.4em; }
+  .chat-assistant-block pre { margin: 0.4em 0; padding: 8px 10px; background: rgba(0,0,0,0.3); border-radius: 6px; font-size: 0.8rem; overflow-x: auto; }
+  .chat-assistant-block code { font-size: 0.8rem; background: rgba(0,0,0,0.25); padding: 1px 4px; border-radius: 3px; }
+  .chat-assistant-block pre code { background: none; padding: 0; }
+  .chat-assistant-block ul, .chat-assistant-block ol { margin: 0.2em 0; padding-left: 1.4em; }
+  .chat-assistant-block h1, .chat-assistant-block h2, .chat-assistant-block h3, .chat-assistant-block h4 { margin: 0.5em 0 0.2em; color: #f1f5f9; }
+  .chat-assistant-block blockquote { margin: 0.3em 0; padding-left: 0.8em; border-left: 3px solid rgba(79,110,247,0.4); color: #94a3b8; }
+  .chat-assistant-block a { color: #60a5fa; text-decoration: none; }
+  .chat-assistant-block a:hover { text-decoration: underline; }
+  .chat-user-line { margin: 4px 0; }
+  .chat-tool-line { margin: 2px 0; }
+  .chat-cost-line { margin: 2px 0; }
+  .chat-turn-sep { margin: 10px 0; }
   /* Inline job output — only visible when item is expanded */
   .item-job-output {
     display: none; font-family: monospace; font-size: 0.72rem; line-height: 1.5;
@@ -2120,7 +2412,7 @@ function renderTodo(t) {
   const priorityBadge = `<span class="priority-badge priority-${t.priority || 'medium'}">${t.priority || 'medium'}</span>`;
 
   const activeJob = _getActiveJobForTodo(t.id);
-  const isRunning = activeJob && activeJob.status === 'running';
+  const isRunning = activeJob && activeJob.status === 'running' && !(activeJob.job_key && activeJob.job_key.startsWith('chat-'));
   const spinner = isRunning ? `<span class="job-spinner" title="Stop job" onclick="event.stopPropagation();killJob('${activeJob.id}')"><l-jelly-triangle size="13" speed="1.75" color="var(--accent)"></l-jelly-triangle></span>` : '';
   const jobBubble = `<div class="checkon-bubble" id="checkon-bubble-${t.id}"></div>`;
   const jobSummary = `<div class="checkon-summary" id="checkon-summary-${t.id}"></div>`;
@@ -2136,8 +2428,8 @@ function renderTodo(t) {
     <div class="todo-header">
       <div class="todo-title" style="flex:1;min-width:0;display:flex;align-items:center;gap:2px" onclick="event.stopPropagation();selectTodo('${t.id}');toggleItemDesc('${t.id}')">${_parseTitle(t.title || '').hasUpdatedTag && !_seenUpdates.has(t.id) ? '<span class="ea-update-dot"></span>' : ''}${spinner}${esc(_parseTitle(t.title || '').displayTitle)}</div>
       <div class="todo-actions">
-        ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();eaUpdateItem('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Refresh via /ea checkon" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#8635;</button>` : ''}
-        ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();startInTmux('${t.id}')" style="border:none;background:transparent;font-size:0.8rem;padding:2px 4px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Open terminal (s)" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#9654;</button>` : ''}
+        ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();eaUpdateItem('${t.id}')" style="border:none;background:transparent;font-size:1rem;padding:4px 6px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Refresh via /ea checkon" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#8635;</button>` : ''}
+        ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();openChat('${t.id}')" style="border:none;background:transparent;font-size:1rem;padding:4px 6px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Chat (s)" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#9654;</button>` : ''}
 
       </div>
       ${priorityBadge}
@@ -2866,14 +3158,427 @@ function hideShortcuts() {
 }
 
 async function resumeConv(convId, todoId) {
-  // Kill existing web terminal for this item first (skip minimize — we're reopening)
-  if (todoId && _termSessions[todoId] && _termSessions[todoId].alive) {
-    await killTerminal(todoId, true);
-  }
-  // Open a new web terminal that resumes this conversation
+  // Open chat panel with this conversation
   if (todoId) {
-    await openTerminal(todoId, convId);
+    openChat(todoId, convId);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Chat UI
+// ---------------------------------------------------------------------------
+
+async function startChatBackground(todoId) {
+  // Start /ea workon in background without opening the chat panel
+  await _loadChatSession(todoId);
+  let session = _chatSessions[todoId];
+  const hasAssistantMsg = session && session.messages.some(m => m.role === 'assistant');
+  const isNew = !session || (!hasAssistantMsg && !session.conversationId && !session.streamingJobId);
+  if (!session) {
+    _chatSessions[todoId] = { conversationId: null, messages: [], streamingText: '', streamingJobId: null };
+    session = _chatSessions[todoId];
+  }
+  if (!isNew) { showToast('Chat already active'); return; }
+  session.messages = [];
+  fetch('/api/chats/' + todoId, { method: 'DELETE' }).catch(() => {});
+  const msg = '/ea workon ' + todoId;
+  session.messages.push({ role: 'user', content: msg });
+  session.streamingJobId = 'pending';
+  session.streamingText = '';
+  _updateSpinnersInPlace();
+  try {
+    const res = await fetch(API + '/' + todoId + '/chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ message: msg }),
+    });
+    if (!res.ok) { _chatStreamDone(todoId, 'Failed to send'); return; }
+    const data = await res.json();
+    _streamChatResponse(todoId, data.job_id);
+  } catch (e) {
+    _chatStreamDone(todoId, 'Network error');
+  }
+}
+
+async function openChat(todoId, conversationId) {
+  // Clear unread indicator
+  if (_chatUnread.has(todoId)) {
+    _chatUnread.delete(todoId);
+    _updateSpinnersInPlace();
+    fetch('/api/chats/' + todoId + '/read', { method: 'POST' }).catch(() => {});
+  }
+  // Load persisted chat from server
+  await _loadChatSession(todoId);
+  let session = _chatSessions[todoId];
+  const hasAssistantMsg = session && session.messages.some(m => m.role === 'assistant');
+  const isNew = !session || (!hasAssistantMsg && !session.conversationId && !session.streamingJobId);
+  if (!session) {
+    _chatSessions[todoId] = { conversationId: conversationId || null, messages: [], streamingText: '', streamingJobId: null };
+    session = _chatSessions[todoId];
+  } else if (conversationId) {
+    session.conversationId = conversationId;
+  }
+  _showChatOverlay(todoId);
+  // Auto-send /ea workon for brand-new chats (no conversationId = not resuming)
+  if (isNew && !conversationId) {
+    // Clear stale user-only messages from prior failed attempts
+    session.messages = [];
+    fetch('/api/chats/' + todoId, { method: 'DELETE' }).catch(() => {});
+    const msg = '/ea workon ' + todoId;
+    session.messages.push({ role: 'user', content: msg });
+    session.streamingJobId = 'pending';
+    session.streamingText = '';
+    _syncChatSendBtn(todoId);
+    _renderChatLog(todoId);
+    try {
+      const res = await fetch(API + '/' + todoId + '/chat', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ message: msg }),
+      });
+      if (!res.ok) { _chatStreamDone(todoId, 'Failed to send'); return; }
+      const data = await res.json();
+      _streamChatResponse(todoId, data.job_id);
+    } catch (e) {
+      _chatStreamDone(todoId, 'Network error');
+    }
+  }
+}
+
+function _showChatOverlay(todoId) {
+  _activeChatTodoId = todoId;
+  const todo = allTodos.find(t => t.id === todoId);
+  const title = todo ? _parseTitle(todo.title || '').displayTitle : todoId;
+  document.getElementById('chat-title').textContent = title;
+
+  const overlay = document.getElementById('chat-overlay');
+  overlay.style.display = 'flex';
+  document.body.style.overflow = 'hidden';
+  requestAnimationFrame(() => overlay.classList.add('visible'));
+
+  _renderChatLog(todoId);
+  const input = document.getElementById('chat-input');
+  input.value = '';
+  input.focus();
+  _syncChatSendBtn(todoId);
+}
+
+function _syncChatSendBtn(todoId) {
+  if (_activeChatTodoId !== todoId) return;
+  const session = _chatSessions[todoId];
+  const isStreaming = !!(session && session.streamingJobId);
+  const btn = document.getElementById('chat-send-btn');
+  if (isStreaming) {
+    btn.textContent = 'Stop';
+    btn.disabled = false;
+    btn.classList.add('chat-stop-mode');
+  } else {
+    btn.textContent = 'Send';
+    btn.disabled = false;
+    btn.classList.remove('chat-stop-mode');
+  }
+}
+
+function _renderChatLog(todoId) {
+  const session = _chatSessions[todoId];
+  if (!session) return;
+  const log = document.getElementById('chat-log');
+  let html = '';
+  session.messages.forEach((msg, i) => {
+    if (i > 0 && msg.role === 'user') html += '<hr class="chat-turn-sep">';
+    if (msg.role === 'user') {
+      html += '<div class="chat-user-line">&gt; ' + esc(msg.content) + '</div>';
+    } else {
+      html += '<div class="chat-assistant-block">' + renderMd(msg.content) + '</div>';
+    }
+  });
+  // If currently streaming, re-attach the streaming area + spinner (no extra separator —
+  // the user message that triggered this is already the last rendered item)
+  if (session.streamingJobId) {
+    html += '<div id="chat-assistant-streaming"></div>';
+    html += '<div id="chat-spinner" style="margin-top:4px"><l-bouncy size="20" speed="1.75" color="var(--accent)"></l-bouncy></div>';
+  }
+  log.innerHTML = html;
+  // If streaming, populate the streaming div with current partial text
+  if (session.streamingJobId && session.streamingText) {
+    const streamEl = document.getElementById('chat-assistant-streaming');
+    if (streamEl) {
+      streamEl.innerHTML = '<div class="chat-assistant-block">' + renderMd(session.streamingText) + '</div>';
+    }
+  }
+  log.scrollTop = log.scrollHeight;
+}
+
+async function restartChat() {
+  const todoId = _activeChatTodoId;
+  if (!todoId) return;
+  // Stop any running job first
+  const session = _chatSessions[todoId];
+  if (session && session.streamingJobId && session.streamingJobId !== 'pending') {
+    try { await fetch('/api/jobs/' + session.streamingJobId + '/kill', { method: 'POST' }); } catch {}
+  }
+  _chatSessions[todoId] = { conversationId: null, messages: [], streamingText: '', streamingJobId: null };
+  _renderChatLog(todoId);
+  _syncChatSendBtn(todoId);
+  fetch('/api/chats/' + todoId, { method: 'DELETE' }).catch(() => {});
+  // Auto-send /ea workon
+  const msg = '/ea workon ' + todoId;
+  const s = _chatSessions[todoId];
+  s.messages.push({ role: 'user', content: msg });
+  s.streamingJobId = 'pending';
+  _syncChatSendBtn(todoId);
+  _renderChatLog(todoId);
+  try {
+    const res = await fetch(API + '/' + todoId + '/chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ message: msg }),
+    });
+    if (!res.ok) { _chatStreamDone(todoId, 'Failed to send'); return; }
+    const data = await res.json();
+    _streamChatResponse(todoId, data.job_id);
+  } catch (e) {
+    _chatStreamDone(todoId, 'Network error');
+  }
+}
+
+function minimizeChat() {
+  const overlay = document.getElementById('chat-overlay');
+  overlay.classList.remove('visible');
+  document.body.style.overflow = '';
+  setTimeout(() => { overlay.style.display = 'none'; }, 100);
+  _activeChatTodoId = null;
+}
+
+function chatSendOrStop(todoId) {
+  const session = _chatSessions[todoId];
+  if (session && session.streamingJobId) {
+    stopChat(todoId);
+  } else {
+    sendChatMessage(todoId);
+  }
+}
+
+async function sendChatMessage(todoId) {
+  const session = _chatSessions[todoId];
+  if (session && session.streamingJobId) return;
+  const input = document.getElementById('chat-input');
+  const message = input.value.trim();
+  if (!message) return;
+  input.value = '';
+  await _sendChatDirect(todoId, message);
+}
+
+async function _sendChatDirect(todoId, message) {
+  const session = _chatSessions[todoId];
+  if (!session) return;
+
+  // Add user message and mark as streaming (spinner will show via _renderChatLog)
+  session.messages.push({ role: 'user', content: message });
+  session.streamingJobId = 'pending';
+  session.streamingText = '';
+
+  if (_activeChatTodoId === todoId) {
+    _syncChatSendBtn(todoId);
+    _renderChatLog(todoId);
+  }
+
+  // POST to start job
+  try {
+    const res = await fetch(API + '/' + todoId + '/chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ message, conversation_id: session.conversationId }),
+    });
+    if (!res.ok) {
+      _chatStreamDone(todoId, 'Failed to send message');
+      return;
+    }
+    const data = await res.json();
+    _streamChatResponse(todoId, data.job_id);
+  } catch (e) {
+    _chatStreamDone(todoId, 'Network error');
+  }
+}
+
+function _streamChatResponse(todoId, jobId) {
+  const session = _chatSessions[todoId];
+  if (!session) return;
+
+  session.streamingJobId = jobId;
+  session.streamingText = '';
+  _updateSpinnersInPlace();
+
+  const es = new EventSource('/api/jobs/' + jobId + '/stream');
+  let textDiv = null;
+
+  // Check if this stream is still the active one for this todo
+  function isStale() {
+    const cur = _chatSessions[todoId];
+    return !cur || cur.streamingJobId !== jobId;
+  }
+
+  es.onmessage = function(e) {
+    if (isStale()) { es.close(); return; }
+
+    let raw;
+    try { raw = JSON.parse(e.data); } catch { return; }
+
+    if (typeof raw === 'object' && raw.__done__) {
+      es.close();
+      if (isStale()) return;
+      const cur = _chatSessions[todoId];
+      if (raw.conversation_id && cur) {
+        cur.conversationId = raw.conversation_id;
+      }
+      _chatStreamDone(todoId, null, cur ? cur.streamingText : '');
+      return;
+    }
+
+    if (typeof raw !== 'string') return;
+    const line = raw;
+    const cur = _chatSessions[todoId];
+
+    // Look up the streaming element fresh each time (survives minimize/reopen)
+    const streamEl = document.getElementById('chat-assistant-streaming');
+
+    if (streamEl) {
+      if (line.startsWith('\u25b6 ')) {
+        const div = document.createElement('div');
+        div.className = 'chat-tool-line';
+        div.textContent = line;
+        streamEl.appendChild(div);
+        textDiv = null;
+      } else if (line.startsWith('\u2713 Done')) {
+        const div = document.createElement('div');
+        div.className = 'chat-cost-line';
+        div.textContent = line;
+        streamEl.appendChild(div);
+        textDiv = null;
+      } else {
+        cur.streamingText += (cur.streamingText ? '\n' : '') + line;
+        if (!textDiv || !textDiv.parentNode) {
+          textDiv = document.createElement('div');
+          textDiv.className = 'chat-assistant-block';
+          streamEl.appendChild(textDiv);
+        }
+        textDiv.innerHTML = renderMd(cur.streamingText);
+      }
+    } else {
+      // Panel is minimized — just accumulate text
+      if (!line.startsWith('\u25b6 ') && !line.startsWith('\u2713 Done')) {
+        cur.streamingText += (cur.streamingText ? '\n' : '') + line;
+      }
+    }
+
+    const log = document.getElementById('chat-log');
+    if (log) log.scrollTop = log.scrollHeight;
+  };
+
+  es.onerror = function() {
+    es.close();
+    if (isStale()) return;
+    const cur = _chatSessions[todoId];
+    _chatStreamDone(todoId, null, cur ? cur.streamingText : '');
+  };
+}
+
+function _chatStreamDone(todoId, error, assistantText) {
+  const session = _chatSessions[todoId];
+  if (session) {
+    session.streamingJobId = null;
+    session.streamingText = '';
+  }
+  _updateSpinnersInPlace();
+
+  if (_activeChatTodoId === todoId) {
+    _syncChatSendBtn(todoId);
+    const spinner = document.getElementById('chat-spinner');
+    if (spinner) spinner.remove();
+  }
+
+  if (error) {
+    if (_activeChatTodoId === todoId) {
+      const log = document.getElementById('chat-log');
+      if (log) log.insertAdjacentHTML('beforeend', '<div style="color:#ef4444">' + esc(error) + '</div>');
+    }
+  
+    return;
+  }
+
+  if (session && assistantText) {
+    session.messages.push({ role: 'assistant', content: assistantText });
+  }
+
+  // If chat panel is open for this item, mark as read; otherwise it stays unread
+  if (_activeChatTodoId === todoId) {
+    _chatUnread.delete(todoId);
+    fetch('/api/chats/' + todoId + '/read', { method: 'POST' }).catch(() => {});
+    _renderChatLog(todoId);
+  }
+
+  const input = document.getElementById('chat-input');
+  if (input) input.focus();
+}
+
+async function stopChat(todoId) {
+  const session = _chatSessions[todoId];
+  if (!session || !session.streamingJobId || session.streamingJobId === 'pending') return;
+  try {
+    await fetch('/api/jobs/' + session.streamingJobId + '/kill', { method: 'POST' });
+  } catch {}
+}
+
+async function _loadChatSession(todoId) {
+  try {
+    const res = await fetch('/api/chats/' + todoId);
+    if (!res.ok) return;
+    const data = await res.json();
+    const existing = _chatSessions[todoId];
+    if (existing) {
+      existing.conversationId = data.conversationId || existing.conversationId;
+      existing.messages = data.messages || existing.messages;
+    } else {
+      _chatSessions[todoId] = {
+        conversationId: data.conversationId || null,
+        messages: data.messages || [],
+        streamingText: '',
+        streamingJobId: null,
+      };
+    }
+    // If server reports a running job, reconnect the SSE stream
+    if (data.running_job_id) {
+      const session = _chatSessions[todoId];
+      if (!session.streamingJobId) {
+        session.streamingJobId = data.running_job_id;
+        session.streamingText = '';
+        _streamChatResponse(todoId, data.running_job_id);
+      }
+    }
+  } catch {}
+}
+
+function _startChatResize(e) {
+  e.preventDefault();
+  const panel = document.getElementById('chat-panel');
+  const isTouch = e.type === 'touchstart';
+  const startY = isTouch ? e.touches[0].clientY : e.clientY;
+  const startH = panel.offsetHeight;
+  function onMove(e) {
+    const y = e.touches ? e.touches[0].clientY : e.clientY;
+    const h = Math.min(window.innerHeight * 0.9, Math.max(150, startH - (y - startY)));
+    panel.style.height = h + 'px';
+  }
+  function onUp() {
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup', onUp);
+    document.removeEventListener('touchmove', onMove);
+    document.removeEventListener('touchend', onUp);
+  }
+  document.addEventListener('mousemove', onMove);
+  document.addEventListener('mouseup', onUp);
+  document.addEventListener('touchmove', onMove, { passive: false });
+  document.addEventListener('touchend', onUp);
 }
 
 async function eaUpdateToggle() {
@@ -2962,12 +3667,18 @@ let _eaUpdateBubbleStream = null; // EventSource for ea-update output
 let _termSessions = {};       // todoId -> {sessionId, term, fitAddon, ws, alive}
 let _activeTermTodoId = null;  // which session is visible in the overlay
 let _termResizeObserver = null;
+
+// Chat sessions
+let _chatSessions = {};       // todoId -> { conversationId, messages: [{role, content}] }
+let _activeChatTodoId = null;  // which chat is visible in the overlay
+let _chatUnread = new Set();   // todoIds with unread chat responses
 let _eaTransitionTimer = null;
 
 function _todoIdForJob(job) {
   if (!job || !job.job_key) return null;
   const key = job.job_key;
   if (key.startsWith('workon-')) return key.slice(7);
+  if (key.startsWith('chat-')) return key.slice(5);
   if (key.startsWith('ea-') && key !== 'ea-update') return key.slice(3);
   return null;
 }
@@ -3065,11 +3776,12 @@ function _updateSpinnersInPlace() {
     const todoId = el.dataset.todoId;
     const job = _getActiveJobForTodo(todoId);
     const termSession = _termSessions[todoId];
+    const chatSession = _chatSessions[todoId];
     const titleEl = el.querySelector('.todo-title');
     if (!titleEl) return;
-    const existingSpinner = titleEl.querySelector('.job-spinner');
     const hasTerminal = termSession && termSession.alive;
-    const hasJob = job && job.status === 'running';
+    const hasChatStreaming = !!(chatSession && chatSession.streamingJobId);
+    const hasJob = job && job.status === 'running' && !(job.job_key && job.job_key.startsWith('chat-'));
 
     // Terminal spinner (green, opens terminal on click)
     const existingTermSpinner = titleEl.querySelector('.term-spinner');
@@ -3085,8 +3797,23 @@ function _updateSpinnersInPlace() {
       if (existingTermSpinner) existingTermSpinner.remove();
     }
 
-    // Job spinner (accent color, kills job on click)
-    const existingJobSpinner = titleEl.querySelector('.job-spinner:not(.term-spinner)');
+    // Chat spinner (green jelly-triangle, opens chat on click)
+    const existingChatSpinner = titleEl.querySelector('.chat-spinner');
+    if (hasChatStreaming) {
+      if (!existingChatSpinner) {
+        const s = document.createElement('span');
+        s.className = 'job-spinner chat-spinner'; s.title = 'Open chat';
+        s.innerHTML = '<l-jelly-triangle size="13" speed="1.75" color="#22c55e"></l-jelly-triangle>';
+        s.onclick = e => { e.stopPropagation(); openChat(todoId); };
+        const after = titleEl.querySelector('.term-spinner');
+        titleEl.insertBefore(s, after ? after.nextSibling : titleEl.firstChild);
+      }
+    } else {
+      if (existingChatSpinner) existingChatSpinner.remove();
+    }
+
+    // Job spinner (accent color, kills job on click) — non-chat jobs only
+    const existingJobSpinner = titleEl.querySelector('.job-spinner:not(.term-spinner):not(.chat-spinner)');
     if (hasJob) {
       if (!existingJobSpinner) {
         const s = document.createElement('span');
@@ -3100,6 +3827,21 @@ function _updateSpinnersInPlace() {
       }
     } else {
       if (existingJobSpinner) existingJobSpinner.remove();
+    }
+
+    // Chat unread dot
+    const existingUnreadDot = titleEl.querySelector('.chat-unread-dot');
+    if (_chatUnread.has(todoId)) {
+      if (!existingUnreadDot) {
+        const dot = document.createElement('span');
+        dot.className = 'chat-unread-dot';
+        dot.innerHTML = '<l-ripples size="13" speed="2" color="#f59e0b"></l-ripples>';
+        dot.onclick = e => { e.stopPropagation(); openChat(todoId); };
+        dot.style.cursor = 'pointer';
+        titleEl.insertBefore(dot, titleEl.firstChild);
+      }
+    } else {
+      if (existingUnreadDot) existingUnreadDot.remove();
     }
   });
 }
@@ -3303,7 +4045,7 @@ async function pollJobs() {
         _openEaUpdateStream(j.id);
       }
       const todoId = _todoIdForJob(j);
-      if (todoId && !_itemStreamSources[todoId]) _openItemStream(todoId, j.id);
+      if (todoId && !_itemStreamSources[todoId] && !j.job_key.startsWith('chat-')) _openItemStream(todoId, j.id);
     }
     // Clear client lines for jobs that are gone
     for (const todoId of Object.keys(_clientJobLines)) {
@@ -3336,6 +4078,16 @@ async function pollJobs() {
         }
       }
       _updateSpinnersInPlace();
+    } catch {}
+    // Poll chat unread state
+    try {
+      const uRes = await fetch('/api/chats/unread');
+      const unreadIds = await uRes.json();
+      const newSet = new Set(unreadIds);
+      if (_chatUnread.size !== newSet.size || [..._chatUnread].some(id => !newSet.has(id))) {
+        _chatUnread = newSet;
+        _updateSpinnersInPlace();
+      }
     } catch {}
   } catch {}
 }
@@ -4176,7 +4928,7 @@ document.addEventListener('keydown', e => {
         collapsedSections.delete(sec);
         render();
       } else {
-        toggleItemDesc(curId);
+        openChat(curId);
       }
     }
   } else if (e.key === 'e') {
@@ -4197,9 +4949,14 @@ document.addEventListener('keydown', e => {
   } else if (e.key === 's') {
     if (selectedIdx >= 1 && selectedIdx <= visibleIds.length && !selectedIsSection()) {
       e.preventDefault();
-      startInTmux(visibleIds[selectedIdx - 1]);
+      openChat(visibleIds[selectedIdx - 1]);
     }
-  } else if (e.key === 'r') {
+  } else if (e.key === '.') {
+    if (selectedIdx >= 1 && selectedIdx <= visibleIds.length && !selectedIsSection()) {
+      e.preventDefault();
+      startChatBackground(visibleIds[selectedIdx - 1]);
+    }
+  } else if (e.key === 'r' && !e.metaKey && !e.ctrlKey) {
     if (selectedIdx >= 1 && selectedIdx <= visibleIds.length && !selectedIsSection()) {
       e.preventDefault();
       eaUpdateItem(visibleIds[selectedIdx - 1]);
@@ -4632,6 +5389,23 @@ window.addEventListener('scroll', () => {
       <button onclick="killTerminal(_activeTermTodoId)" style="background:rgba(239,68,68,0.2);border:1px solid rgba(239,68,68,0.4);color:#fca5a5;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem">Kill</button>
     </div>
     <div id="terminal-container" style="flex:1;overflow:hidden;padding:4px"></div>
+  </div>
+</div>
+
+<!-- Chat overlay -->
+<div id="chat-overlay" onclick="if(event.target===this)minimizeChat()" style="display:none;position:fixed;inset:0;z-index:4000;background:rgba(0,0,0,0.5);flex-direction:column;justify-content:flex-end;align-items:center">
+  <div id="chat-panel" style="background:#1a1b1e;border-radius:14px 14px 0 0;height:77vh;min-height:150px;max-height:90vh;display:flex;flex-direction:column;box-shadow:0 -8px 32px rgba(0,0,0,0.4);width:100%;max-width:994px">
+    <div style="height:12px;cursor:ns-resize;flex-shrink:0;display:flex;justify-content:center;align-items:center;touch-action:none" onmousedown="_startChatResize(event)" ontouchstart="_startChatResize(event)"><span style="width:40px;height:4px;border-radius:2px;background:rgba(255,255,255,0.25)"></span></div>
+    <div style="display:flex;align-items:center;padding:6px 14px 10px;gap:10px;border-bottom:1px solid rgba(255,255,255,0.1);flex-shrink:0;cursor:ns-resize;touch-action:none" onmousedown="_startChatResize(event)" ontouchstart="_startChatResize(event)">
+      <span id="chat-title" style="color:#e2e8f0;font-size:0.85rem;font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+      <button onclick="if(_activeChatTodoId){document.getElementById('chat-input').value='/ea checkon '+_activeChatTodoId;sendChatMessage(_activeChatTodoId)}" style="background:rgba(255,255,255,0.1);border:none;color:#e2e8f0;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem" onmousedown="event.stopPropagation()">Check On</button>
+      <button onclick="restartChat()" style="background:rgba(255,255,255,0.1);border:none;color:#e2e8f0;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem" onmousedown="event.stopPropagation()">Restart</button>
+    </div>
+    <div id="chat-log" class="chat-log"></div>
+    <div class="chat-input-bar">
+      <input id="chat-input" class="chat-input" placeholder="Send a message..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();chatSendOrStop(_activeChatTodoId)}else if(event.key==='Escape'){minimizeChat()}">
+      <button id="chat-send-btn" class="chat-send-btn" onclick="chatSendOrStop(_activeChatTodoId)">Send</button>
+    </div>
   </div>
 </div>
 
