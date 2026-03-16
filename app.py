@@ -2208,7 +2208,7 @@ function render() {
   if (searchBar) searchBar.after(form);
 
   // Apply search and priority filters
-  const searching = searchQuery.trim().length > 0 || showPriorities.size > 0 || hidePriorities.size > 0;
+  const searching = searchQuery.trim().length > 0;
 
   const searchTokens = searching ? searchQuery.toLowerCase().trim().split(/\s+/) : [];
   const matchesSearch = t => {
