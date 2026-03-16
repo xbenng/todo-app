@@ -3221,7 +3221,30 @@ async function startChatBackground(todoId) {
     _chatSessions[todoId] = { conversationId: null, messages: [], streamingText: '', streamingJobId: null };
     session = _chatSessions[todoId];
   }
-  if (!isNew) { showToast('Chat already active'); return; }
+  if (!isNew) {
+    // Session exists — send checkon instead
+    if (session.streamingJobId) { showToast('Chat is busy'); return; }
+    const msg = '/ea checkon ' + todoId;
+    session.messages.push({ role: 'user', content: msg });
+    session.streamingJobId = 'pending';
+    session.streamingText = '';
+    _updateSpinnersInPlace();
+    if (_activeChatTodoId === todoId) { _syncChatSendBtn(todoId); _renderChatLog(todoId); }
+    showToast('Checking on...');
+    try {
+      const res = await fetch(API + '/' + todoId + '/chat', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ message: msg }),
+      });
+      if (!res.ok) { _chatStreamDone(todoId, 'Failed to send'); return; }
+      const data = await res.json();
+      _streamChatResponse(todoId, data.job_id);
+    } catch (e) {
+      _chatStreamDone(todoId, 'Network error');
+    }
+    return;
+  }
   session.messages = [];
   fetch('/api/chats/' + todoId, { method: 'DELETE' }).catch(() => {});
   const msg = '/ea workon ' + todoId;
