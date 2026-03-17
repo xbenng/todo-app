@@ -862,10 +862,7 @@ def _run_claude_chat_job(job_id: str, message: str, cwd: str,
 def _start_claude_chat_job(label: str, job_key: str, message: str, cwd: str,
                            conversation_id: str | None = None,
                            todo_id: str | None = None) -> str:
-    """Start a headless Claude chat job; return job_id. Deduplicates by job_key."""
-    for j in _jobs.values():
-        if j["job_key"] == job_key and j["status"] == "running":
-            return j["id"]
+    """Start a headless Claude chat job; return job_id. No dedup — each message is a new job."""
     job_id = str(uuid.uuid4())[:8]
     _jobs[job_id] = {
         "id": job_id,
@@ -1079,12 +1076,15 @@ def get_chat(todo_id):
     """Return the persisted chat session for a todo item, plus any running job."""
     chats = _load_chats()
     chat = chats.get(todo_id, {"conversationId": None, "messages": []})
-    # Check for a running chat job for this todo
+    # Check for the most recent running chat job for this todo
     job_key = f"chat-{todo_id}"
+    latest_job = None
     for j in _jobs.values():
         if j["job_key"] == job_key and j["status"] in ("pending", "running"):
-            chat["running_job_id"] = j["id"]
-            break
+            if not latest_job or j["created_at"] > latest_job["created_at"]:
+                latest_job = j
+    if latest_job:
+        chat["running_job_id"] = latest_job["id"]
     return jsonify(chat)
 
 
@@ -2700,6 +2700,7 @@ function toggleSectionCollapse(section) {
 }
 
 function collapseStep() {
+  _flushPendingMarkRead();
   // First collapse all items, then collapse all sections
   if (expandedItems.size > 0) {
     expandedItems.clear();
@@ -3267,12 +3268,14 @@ async function startChatBackground(todoId) {
 }
 
 async function openChat(todoId, conversationId) {
-  // Clear unread indicator
+  // Clear chat unread immediately (user is looking at it)
   if (_chatUnread.has(todoId)) {
     _chatUnread.delete(todoId);
-    _updateSpinnersInPlace();
     fetch('/api/chats/' + todoId + '/read', { method: 'POST' }).catch(() => {});
+    _updateSpinnersInPlace();
   }
+  // Defer title updated mark-read until navigating away
+  _pendingMarkRead = todoId;
   // Load persisted chat from server
   await _loadChatSession(todoId);
   let session = _chatSessions[todoId];
@@ -3409,6 +3412,7 @@ async function restartChat() {
 }
 
 function minimizeChat() {
+  _flushPendingMarkRead();
   const overlay = document.getElementById('chat-overlay');
   overlay.classList.remove('visible');
   document.body.style.overflow = '';
@@ -4815,23 +4819,23 @@ function selectedIsSection() {
   return visibleIds[selectedIdx - 1].startsWith('__section__:');
 }
 
-function _markPreviousAsRead() {
-  // Mark the previously selected item's updated tag as read
-  if (selectedIdx >= 1 && selectedIdx <= visibleIds.length) {
-    const prevId = visibleIds[selectedIdx - 1];
-    if (prevId && !prevId.startsWith('__section__:') && !_seenUpdates.has(prevId)) {
-      const t = allTodos.find(x => x.id === prevId);
-      if (t && t.title && _parseTitle(t.title).hasUpdatedTag) {
-        _seenUpdates.add(prevId);
-        _updateSpinnersInPlace();
-        fetch(API + '/' + prevId + '/mark-read', { method: 'POST' }).catch(() => {});
-      }
-    }
+let _pendingMarkRead = null; // todoId that was opened but not yet marked read
+
+function _flushPendingMarkRead() {
+  if (!_pendingMarkRead) return;
+  const todoId = _pendingMarkRead;
+  _pendingMarkRead = null;
+  if (_seenUpdates.has(todoId)) return;
+  const t = allTodos.find(x => x.id === todoId);
+  if (t && t.title && _parseTitle(t.title).hasUpdatedTag) {
+    _seenUpdates.add(todoId);
+    _updateSpinnersInPlace();
+    fetch(API + '/' + todoId + '/mark-read', { method: 'POST' }).catch(() => {});
   }
 }
 
 function applySelection() {
-  _markPreviousAsRead();
+  _flushPendingMarkRead();
   // Collapse previous preview-expanded item
   if (previewExpandedId) {
     const prevEl = document.querySelector(`.todo-item[data-todo-id="${previewExpandedId}"]`);
@@ -5513,6 +5517,7 @@ window.addEventListener('scroll', () => {
     <div style="display:flex;align-items:center;padding:6px 14px 10px;gap:10px;border-bottom:1px solid rgba(255,255,255,0.1);flex-shrink:0;cursor:ns-resize;touch-action:none" onmousedown="_startChatResize(event)" ontouchstart="_startChatResize(event)">
       <span id="chat-title" style="color:#e2e8f0;font-size:0.85rem;font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
       <button onclick="if(_activeChatTodoId){document.getElementById('chat-input').value='/ea checkon '+_activeChatTodoId;sendChatMessage(_activeChatTodoId)}" style="background:rgba(255,255,255,0.1);border:none;color:#e2e8f0;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem" onmousedown="event.stopPropagation()">Check On</button>
+      <button onclick="if(_activeChatTodoId){document.getElementById('chat-input').value='/compact';sendChatMessage(_activeChatTodoId)}" style="background:rgba(255,255,255,0.1);border:none;color:#e2e8f0;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem" onmousedown="event.stopPropagation()">Compact</button>
       <button onclick="restartChat()" style="background:rgba(255,255,255,0.1);border:none;color:#e2e8f0;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem" onmousedown="event.stopPropagation()">Restart</button>
     </div>
     <div id="chat-log" class="chat-log"></div>
