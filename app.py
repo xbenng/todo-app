@@ -1494,6 +1494,46 @@ def _openai_tool_defs(depth: int = 0) -> list[dict]:
     } for t in tools]
 
 
+# ---------------------------------------------------------------------------
+# Agent Architecture
+# ---------------------------------------------------------------------------
+#
+# The agentic system has three layers:
+#
+#   Browser ──SSE──> Server (Flask)
+#                      │
+#                      ├── ChatAgent (parent, depth=0)
+#                      │     ├── Calls Claude API or OpenAI-compat API
+#                      │     ├── Streams text to job["output_lines"] → SSE → browser
+#                      │     ├── Executes tools: read_todos, update_todo, MCP, etc.
+#                      │     └── Can call spawn_agents tool → launches subagents
+#                      │
+#                      └── _run_subagent (child, depth=1)
+#                            ├── Fresh messages (no parent history)
+#                            ├── Same system prompt + tools + MCP access
+#                            ├── Emits progress as [label] prefixed lines
+#                            ├── Returns {label, result, error, tokens}
+#                            └── Cannot spawn further subagents (depth >= 2)
+#
+# Flow for /ea update:
+#   1. User sends "/ea update" → ChatAgent starts (depth=0)
+#   2. Model reads EA skill instructions from system prompt
+#   3. Model calls spawn_agents with 5 agents: Slack, Email, Calendar, Notes, Jira
+#   4. _execute_spawn_agents launches 5 threads via ThreadPoolExecutor
+#   5. Each _run_subagent makes its own API calls, uses MCP tools (Slack, IMAP, etc.)
+#   6. Progress streams to parent job: [Slack sweep] Checking unreads...
+#   7. All subagents complete → results returned as tool_result to parent
+#   8. Parent model merges results, updates todos.md, commits
+#
+# Key properties:
+#   - Provider-agnostic: both Anthropic and OpenAI-compat supported at all levels
+#   - Kill propagation: subagents check job["status"] == "killed" each iteration
+#   - Thread safety: output_lines.append() is GIL-safe; file writes serialized
+#   - No persistence: subagent conversations are ephemeral (parent persists)
+#   - Configurable: subagents_enabled toggle in config; model override per subagent
+# ---------------------------------------------------------------------------
+
+
 class ChatAgent:
     """Unified agentic loop for both Anthropic and OpenAI-compatible providers.
 
