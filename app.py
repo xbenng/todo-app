@@ -1123,9 +1123,10 @@ def _get_tool_definitions(depth: int = 0) -> list[dict]:
     if depth < 2 and config.get("subagents_enabled", True):
         tools.append({
             "name": "spawn_agents",
-            "description": "Launch one or more subagents in parallel. Each subagent gets its own prompt, "
-                           "runs independently with full tool access (including MCP), and returns results. "
-                           "Use for parallelizing independent tasks like sweeping Slack, email, and calendar simultaneously. "
+            "description": "Launch multiple subagents in parallel in a SINGLE call. Pass ALL agents in the 'agents' array — "
+                           "they run concurrently via a thread pool. Do NOT call this tool multiple times sequentially; "
+                           "instead, batch all independent tasks into one call. Each subagent gets its own prompt, "
+                           "full tool access (including MCP), and returns results. "
                            "This is the 'Agent tool' referenced in the EA skill instructions.",
             "input_schema": {
                 "type": "object",
@@ -1137,7 +1138,7 @@ def _get_tool_definitions(depth: int = 0) -> list[dict]:
                             "properties": {
                                 "prompt": {"type": "string", "description": "Complete instructions for this subagent. Include all context it needs — it has no access to the parent conversation."},
                                 "label": {"type": "string", "description": "Short label for progress output (e.g., 'Slack sweep')."},
-                                "model": {"type": "string", "description": "Optional model override (e.g., 'haiku', 'sonnet', or a full model ID). Defaults to the parent's model."}
+                                "model": {"type": "string", "description": "Optional model override. Defaults to the parent's model."}
                             },
                             "required": ["prompt"]
                         },
@@ -1156,6 +1157,9 @@ def _execute_tool(name: str, input_data: dict, todo_id: str | None,
 
     agent_context: {job_id, provider, depth} — passed when called from ChatAgent.
     """
+    depth = agent_context.get("depth", 0) if agent_context else 0
+    prefix = f"[tool d={depth}]"
+    print(f"{prefix} {name}({json.dumps(input_data)[:200]})")
     try:
         if name == "read_todos":
             active = _parse_todo_file(TODO_FILE)
@@ -1226,10 +1230,13 @@ def _execute_tool(name: str, input_data: dict, todo_id: str | None,
             if not agent_context:
                 return json.dumps({"error": "spawn_agents requires agent context"})
             agents = input_data.get("agents", [])
+            print(f"[spawn_agents] Received {len(agents)} agent(s): {[a.get('label', '?') for a in agents]}")
             if not agents:
                 return json.dumps({"error": "No agents specified"})
-            if len(agents) > 10:
-                return json.dumps({"error": "Maximum 10 parallel agents"})
+            config = _load_config()
+            max_subagents = config.get("max_subagents", 10)
+            if len(agents) > max_subagents:
+                return json.dumps({"error": f"Maximum {max_subagents} parallel agents"})
             depth = agent_context.get("depth", 0)
             if depth >= 2:
                 return json.dumps({"error": "Maximum agent nesting depth reached"})
@@ -1242,14 +1249,9 @@ def _execute_tool(name: str, input_data: dict, todo_id: str | None,
             return json.dumps({"error": f"Unknown tool: {name}"})
 
     except Exception as exc:
+        print(f"{prefix} {name} ERROR: {exc}")
         return json.dumps({"error": str(exc)})
 
-
-_MODEL_ALIASES = {
-    "haiku": "claude-haiku-4-5-20251001",
-    "sonnet": "claude-sonnet-4-20250514",
-    "opus": "claude-opus-4-20250514",
-}
 
 
 def _execute_spawn_agents(agents: list[dict], agent_context: dict, todo_id: str | None) -> str:
@@ -1261,18 +1263,16 @@ def _execute_spawn_agents(agents: list[dict], agent_context: dict, todo_id: str 
     _jobs[job_id]["output_lines"].append(f"⚡ Launching {len(agents)} subagent(s)...")
 
     results = []
-    with ThreadPoolExecutor(max_workers=min(len(agents), 8)) as executor:
+    config = _load_config()
+    max_workers = config.get("max_subagents", 10)
+    with ThreadPoolExecutor(max_workers=min(len(agents), max_workers)) as executor:
         futures = {}
         for i, spec in enumerate(agents):
             label = spec.get("label", f"agent-{i+1}")
-            model_override = spec.get("model")
-            if model_override and model_override in _MODEL_ALIASES:
-                model_override = _MODEL_ALIASES[model_override]
             future = executor.submit(
                 _run_subagent,
                 job_id=job_id, todo_id=todo_id, provider=provider,
                 prompt=spec["prompt"], label=label, depth=depth + 1,
-                model_override=model_override,
             )
             futures[future] = label
 
@@ -1295,14 +1295,10 @@ def _execute_spawn_agents(agents: list[dict], agent_context: dict, todo_id: str 
 
 
 def _run_subagent(job_id: str, todo_id: str | None, provider: dict,
-                  prompt: str, label: str, depth: int,
-                  model_override: str | None = None) -> dict:
+                  prompt: str, label: str, depth: int) -> dict:
     """Run a single subagent to completion. Returns {label, result, error, tokens}."""
-    sub_provider = dict(provider)
-    if model_override:
-        sub_provider["model"] = model_override
-    ptype = sub_provider.get("type", "local")
-    model = sub_provider.get("model", "claude-sonnet-4-20250514")
+    ptype = provider.get("type", "local")
+    model = provider.get("model", "claude-sonnet-4-20250514")
     job = _jobs[job_id]
 
     def emit(line: str):
@@ -1320,10 +1316,10 @@ def _run_subagent(job_id: str, todo_id: str | None, provider: dict,
         tools = _get_tool_definitions(depth)
         if _mcp_manager:
             tools = tools + _mcp_manager.get_tool_definitions()
-        agent_ctx = {"job_id": job_id, "provider": sub_provider, "depth": depth}
+        agent_ctx = {"job_id": job_id, "provider": provider, "depth": depth}
 
         if ptype == "anthropic":
-            api_key = sub_provider.get("api_key")
+            api_key = provider.get("api_key")
             if not api_key or not anthropic:
                 return {"label": label, "result": "", "error": "Anthropic API not configured",
                         "input_tokens": 0, "output_tokens": 0}
@@ -1369,8 +1365,8 @@ def _run_subagent(job_id: str, todo_id: str | None, provider: dict,
                 break
 
         elif ptype == "openai_compat":
-            base_url = sub_provider.get("base_url")
-            api_key = sub_provider.get("api_key", "none")
+            base_url = provider.get("base_url")
+            api_key = provider.get("api_key", "none")
             if not base_url or not openai_mod:
                 return {"label": label, "result": "", "error": "OpenAI endpoint not configured",
                         "input_tokens": 0, "output_tokens": 0}
@@ -1382,14 +1378,14 @@ def _run_subagent(job_id: str, todo_id: str | None, provider: dict,
                 "function": {"name": t["name"], "description": t.get("description", ""),
                              "parameters": t.get("input_schema", {"type": "object", "properties": {}})}
             } for t in tools]
-            max_tokens = min(sub_provider.get("max_tokens", 4096), 4096)
+            max_tokens = min(provider.get("max_tokens", 4096), 4096)
 
             for _ in range(20):
                 if job["status"] == "killed":
                     return {"label": label, "result": "\n".join(result_lines),
                             "error": "killed", "input_tokens": total_input, "output_tokens": total_output}
                 kwargs = {"model": model, "messages": oai_messages, "max_tokens": max_tokens}
-                if oai_tools and sub_provider.get("tool_use", True):
+                if oai_tools and provider.get("tool_use", True):
                     kwargs["tools"] = oai_tools
                 resp = client.chat.completions.create(**kwargs)
                 if resp.usage:
@@ -2271,7 +2267,7 @@ def put_config():
     data = request.json or {}
     config = _load_config()
     # Merge provided fields (legacy + new)
-    for key in ("anthropic_api_key", "model", "mcp_servers", "openai_compat", "active_provider", "subagents_enabled"):
+    for key in ("anthropic_api_key", "model", "mcp_servers", "openai_compat", "active_provider", "subagents_enabled", "max_subagents"):
         if key in data:
             config[key] = data[key]
     if "providers" in data and isinstance(data["providers"], dict):
@@ -3487,10 +3483,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <hr style="border:none;border-top:1px solid var(--border);margin:16px 0 12px">
     <button class="btn btn-sm" onclick="_addProvider()" style="border:1px solid var(--border);width:100%">+ Add Provider</button>
     <hr style="border:none;border-top:1px solid var(--border);margin:16px 0 12px">
-    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.82rem;font-weight:600;margin:0">
-      <input type="checkbox" id="settings-subagents" style="margin:0"> Enable subagents (parallel tool execution)
-    </label>
-    <div class="settings-hint">Allow the model to spawn parallel subagents for tasks like /ea update and /ea triage.</div>
+    <div style="display:flex;align-items:center;gap:8px;margin:4px 0">
+      <input type="checkbox" id="settings-subagents" style="margin:0;width:auto;flex-shrink:0">
+      <span style="font-size:0.82rem;font-weight:600;cursor:pointer" onclick="document.getElementById('settings-subagents').click()">Enable subagents</span>
+      <span style="font-size:0.75rem;color:var(--subtle)">max</span>
+      <input type="number" id="settings-max-subagents" min="1" max="20" value="10" style="width:50px;padding:2px 6px;font-size:0.8rem;text-align:center">
+    </div>
+    <div class="settings-hint" style="margin-top:2px">Allow the model to spawn parallel subagents for tasks like /ea update and /ea triage.</div>
     <hr style="border:none;border-top:1px solid var(--border);margin:16px 0 12px">
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
       <span style="font-size:0.82rem;font-weight:600">MCP Servers</span>
@@ -4613,6 +4612,7 @@ async function showSettings() {
     _rebuildActiveDropdown();
     sel.value = config.active_provider || config._active_provider_name || '';
     document.getElementById('settings-subagents').checked = config.subagents_enabled !== false;
+    document.getElementById('settings-max-subagents').value = config.max_subagents || 10;
   } catch {}
   _loadMcpStatus();
   _loadGitLog();
@@ -4805,6 +4805,7 @@ async function saveSettings() {
     providers: _settingsProviders,
     active_provider: activeProvider,
     subagents_enabled: document.getElementById('settings-subagents').checked,
+    max_subagents: parseInt(document.getElementById('settings-max-subagents').value) || 10,
   };
   try {
     await fetch('/api/config', {
@@ -5110,8 +5111,9 @@ async function _sendChatDirect(todoId, message) {
 }
 
 function _streamChatResponse(todoId, jobId) {
+  console.log('[chat] _streamChatResponse called', todoId, jobId);
   const session = _chatSessions[todoId];
-  if (!session) return;
+  if (!session) { console.log('[chat] no session for', todoId); return; }
 
   session.streamingJobId = jobId;
   session.streamingText = '';
@@ -5127,11 +5129,13 @@ function _streamChatResponse(todoId, jobId) {
     return !cur || cur.streamingJobId !== jobId;
   }
 
+  console.log('[chat] SSE connected for job', jobId, 'todo', todoId);
   es.onmessage = function(e) {
-    if (isStale()) { es.close(); return; }
+    if (isStale()) { console.log('[chat] stale, closing'); es.close(); return; }
 
     let raw;
-    try { raw = JSON.parse(e.data); } catch { return; }
+    try { raw = JSON.parse(e.data); } catch { console.log('[chat] parse error', e.data); return; }
+    console.log('[chat]', typeof raw === 'string' ? raw : JSON.stringify(raw));
 
     if (typeof raw === 'object' && raw.__done__) {
       es.close();
@@ -6595,12 +6599,24 @@ document.addEventListener('keydown', e => {
       render();
       return;
     }
-    // Action keys that should blur search and fall through to the main handler
-    const actionKeys = new Set(['Enter', 'ArrowDown', 'ArrowUp', 'ArrowLeft', 'ArrowRight', ' ', 'Tab']);
-    if (actionKeys.has(e.key)) {
+    // Only ArrowDown/ArrowUp blur and leave search to select items
+    // Once an item is selected (selectedIdx >= 1), Enter and other action keys work on it
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
       e.target.blur();
+      // Fall through to main handler for navigation
+    } else if (selectedIdx >= 1 && selectedIdx <= visibleIds.length) {
+      // Item is selected — let Enter, Space, and other item actions through
+      const itemActionKeys = new Set(['Enter', ' ']);
+      if (itemActionKeys.has(e.key)) {
+        e.preventDefault();
+        e.target.blur();
+        // Fall through to main handler
+      } else {
+        return; // Stay in search for typing
+      }
     } else {
-      return; // Everything else (typing, Backspace, Delete, Home, End, etc.) stays in search
+      return; // No item selected, stay in search
     }
   }
 
