@@ -30,6 +30,11 @@ from datetime import datetime
 from flask import Flask, request, jsonify, Response
 from flask_sock import Sock
 
+try:
+    import anthropic
+except ImportError:
+    anthropic = None
+
 app = Flask(__name__)
 sock = Sock(app)
 TODO_FILE = "todos.md"
@@ -76,6 +81,33 @@ def _save_chats(data: dict) -> None:
     path = _chats_file_path(TODO_FILE)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
+
+
+def _config_file_path(path: str) -> str:
+    """Derive the config file path from the main todo file path.
+    e.g. todos.md -> todos-config.json
+    """
+    base, _ = os.path.splitext(path)
+    return f"{base}-config.json"
+
+
+def _load_config() -> dict:
+    """Load server config from disk."""
+    path = _config_file_path(TODO_FILE)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_config(data: dict) -> None:
+    """Save server config to disk."""
+    path = _config_file_path(TODO_FILE)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -740,10 +772,336 @@ def _run_claude_job(job_id: str, prompt: str, cwd: str):
         _jobs[job_id]["status"] = "error"
 
 
-def _run_claude_chat_job(job_id: str, message: str, cwd: str,
-                         conversation_id: str | None = None,
-                         todo_id: str | None = None):
-    """Thread target: run claude -p for chat with optional --resume for conversation continuity."""
+# ---------------------------------------------------------------------------
+# Server-side agentic loop (Anthropic SDK)
+# ---------------------------------------------------------------------------
+
+def _get_tool_definitions() -> list[dict]:
+    """Return Claude API tool definitions for server-side tools."""
+    return [
+        {
+            "name": "read_todos",
+            "description": "Read all todo items (active and completed). Returns a JSON array of todo objects with id, title, description, status, priority, and section fields.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "status_filter": {
+                        "type": "string",
+                        "enum": ["all", "open", "completed"],
+                        "description": "Filter by status. Default: all"
+                    }
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "update_todo",
+            "description": "Update a todo item's fields (title, description, status, priority, section).",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "todo_id": {"type": "string", "description": "The todo item ID"},
+                    "title": {"type": "string", "description": "New title"},
+                    "description": {"type": "string", "description": "New description (markdown)"},
+                    "status": {"type": "string", "enum": ["open", "completed"]},
+                    "priority": {"type": "string", "enum": ["high", "medium", "low", "none"]},
+                    "section": {"type": "string", "description": "Section/category name"}
+                },
+                "required": ["todo_id"]
+            }
+        },
+        {
+            "name": "create_todo",
+            "description": "Create a new todo item.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Todo title"},
+                    "description": {"type": "string", "description": "Todo description (markdown)"},
+                    "priority": {"type": "string", "enum": ["high", "medium", "low", "none"]},
+                    "section": {"type": "string", "description": "Section/category name"}
+                },
+                "required": ["title"]
+            }
+        },
+        {
+            "name": "search_todos",
+            "description": "Search todos by text query across titles and descriptions.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"}
+                },
+                "required": ["query"]
+            }
+        },
+        {
+            "name": "read_chat_history",
+            "description": "Read the chat history for a specific todo item.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "todo_id": {"type": "string", "description": "The todo item ID"}
+                },
+                "required": ["todo_id"]
+            }
+        },
+    ]
+
+
+def _execute_tool(name: str, input_data: dict, todo_id: str | None) -> str:
+    """Execute a server-side tool and return the result as a string."""
+    try:
+        if name == "read_todos":
+            active = _parse_todo_file(TODO_FILE)
+            completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+            todos = active + completed
+            status_filter = input_data.get("status_filter", "all")
+            if status_filter == "open":
+                todos = [t for t in todos if t["status"] != "completed"]
+            elif status_filter == "completed":
+                todos = [t for t in todos if t["status"] == "completed"]
+            return json.dumps(todos, ensure_ascii=False)
+
+        elif name == "update_todo":
+            tid = input_data["todo_id"]
+            active = _parse_todo_file(TODO_FILE)
+            completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+            todos = active + completed
+            for t in todos:
+                if t["id"] == tid:
+                    for field in ("title", "description", "status", "priority", "section"):
+                        if field in input_data:
+                            val = input_data[field]
+                            if field == "status" and val not in ("open", "completed"):
+                                continue
+                            if field == "priority" and val not in VALID_PRIORITIES:
+                                continue
+                            t[field] = val.strip() if isinstance(val, str) else val
+                    _snapshot_and_write(TODO_FILE, todos)
+                    return json.dumps(t, ensure_ascii=False)
+            return json.dumps({"error": f"Todo {tid} not found"})
+
+        elif name == "create_todo":
+            active = _parse_todo_file(TODO_FILE)
+            completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+            todos = active + completed
+            new_todo = {
+                "id": str(uuid.uuid4())[:8],
+                "title": input_data.get("title", "").strip(),
+                "description": input_data.get("description", "").strip(),
+                "status": "open",
+                "priority": input_data.get("priority", DEFAULT_PRIORITY),
+                "section": input_data.get("section", "").strip(),
+            }
+            if not new_todo["title"]:
+                return json.dumps({"error": "Title is required"})
+            todos.append(new_todo)
+            _snapshot_and_write(TODO_FILE, todos)
+            return json.dumps(new_todo, ensure_ascii=False)
+
+        elif name == "search_todos":
+            query = input_data.get("query", "").lower()
+            active = _parse_todo_file(TODO_FILE)
+            completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+            results = []
+            for t in active + completed:
+                if (query in t.get("title", "").lower() or
+                        query in t.get("description", "").lower()):
+                    results.append(t)
+            return json.dumps(results, ensure_ascii=False)
+
+        elif name == "read_chat_history":
+            tid = input_data.get("todo_id", todo_id)
+            chats = _load_chats()
+            chat = chats.get(tid, {"messages": []})
+            return json.dumps(chat.get("messages", [])[-20:], ensure_ascii=False)
+
+        else:
+            return json.dumps({"error": f"Unknown tool: {name}"})
+
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+def _build_system_prompt(todo_id: str | None) -> str:
+    """Build a system prompt for the agentic loop."""
+    parts = [
+        "You are a helpful assistant managing a todo list. "
+        "You have tools to read, create, update, and search todos. "
+        "Use them when the user asks about their tasks or wants to make changes."
+    ]
+    if todo_id:
+        parts.append(f"\nThe current conversation is associated with todo item ID: {todo_id}")
+    return "\n".join(parts)
+
+
+def _run_chat_api(job_id: str, message: str, todo_id: str | None):
+    """Thread target: server-side agentic loop using Anthropic SDK."""
+    config = _load_config()
+    api_key = config.get("anthropic_api_key")
+    if not api_key or not anthropic:
+        _jobs[job_id]["output_lines"].append("error: Anthropic API not configured")
+        _jobs[job_id]["status"] = "error"
+        return
+
+    client = anthropic.Anthropic(api_key=api_key)
+    _jobs[job_id]["status"] = "running"
+
+    assistant_text_lines = []
+    total_input_tokens = 0
+    total_output_tokens = 0
+
+    def emit(line: str, is_text: bool = False) -> None:
+        if line.strip():
+            _jobs[job_id]["output_lines"].append(line)
+            if is_text:
+                assistant_text_lines.append(line)
+
+    try:
+        # Build messages from persisted history + new message
+        chats = _load_chats()
+        chat = chats.get(todo_id, {"messages": []}) if todo_id else {"messages": []}
+        messages = []
+        for m in chat.get("messages", []):
+            role = m.get("role", "user")
+            content = m.get("content", "")
+            # Only include user/assistant text messages for API (skip tool history)
+            if role in ("user", "assistant") and isinstance(content, str) and content.strip():
+                messages.append({"role": role, "content": content})
+        messages.append({"role": "user", "content": message})
+
+        model = config.get("model", "claude-sonnet-4-20250514")
+        tools = _get_tool_definitions()
+        system_prompt = _build_system_prompt(todo_id)
+
+        # Agentic loop
+        while _jobs[job_id]["status"] == "running":
+            text_buf = ""
+
+            with client.messages.stream(
+                model=model,
+                system=system_prompt,
+                messages=messages,
+                max_tokens=8192,
+                tools=tools,
+            ) as stream:
+                # Store stream reference so kill_job can cancel it
+                _jobs[job_id]["_stream"] = stream
+
+                for event in stream:
+                    if _jobs[job_id]["status"] == "killed":
+                        stream.close()
+                        return
+
+                    if event.type == "content_block_start":
+                        if hasattr(event, "content_block"):
+                            block = event.content_block
+                            if block.type == "tool_use":
+                                if text_buf.strip():
+                                    for ln in text_buf.strip().splitlines():
+                                        emit(ln, is_text=True)
+                                    text_buf = ""
+                                emit(f"▶ {block.name}...")
+                            elif block.type == "text" and text_buf.strip():
+                                for ln in text_buf.strip().splitlines():
+                                    emit(ln, is_text=True)
+                                text_buf = ""
+
+                    elif event.type == "content_block_delta":
+                        if hasattr(event, "delta") and event.delta.type == "text_delta":
+                            text_buf += event.delta.text
+                            while "\n" in text_buf:
+                                line, text_buf = text_buf.split("\n", 1)
+                                emit(line, is_text=True)
+
+                    elif event.type == "content_block_stop":
+                        if text_buf.strip():
+                            for ln in text_buf.strip().splitlines():
+                                emit(ln, is_text=True)
+                            text_buf = ""
+
+                # Flush any remaining text
+                if text_buf.strip():
+                    for ln in text_buf.strip().splitlines():
+                        emit(ln, is_text=True)
+
+            _jobs[job_id].pop("_stream", None)
+            response = stream.get_final_message()
+
+            # Track token usage
+            if response.usage:
+                total_input_tokens += response.usage.input_tokens
+                total_output_tokens += response.usage.output_tokens
+
+            if response.stop_reason == "tool_use":
+                # Execute tool calls
+                tool_results = []
+                for block in response.content:
+                    if block.type == "tool_use":
+                        result = _execute_tool(block.name, block.input, todo_id)
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result
+                        })
+
+                # Append assistant response + tool results for next iteration
+                # Convert content blocks to dicts for the messages array
+                assistant_content = []
+                for block in response.content:
+                    if block.type == "text":
+                        assistant_content.append({"type": "text", "text": block.text})
+                    elif block.type == "tool_use":
+                        assistant_content.append({
+                            "type": "tool_use",
+                            "id": block.id,
+                            "name": block.name,
+                            "input": block.input
+                        })
+                messages.append({"role": "assistant", "content": assistant_content})
+                messages.append({"role": "user", "content": tool_results})
+                continue  # Next iteration
+
+            # end_turn or max_tokens — we're done
+            break
+
+        if _jobs[job_id]["status"] == "killed":
+            return
+
+        # Estimate cost (Claude Sonnet 4 pricing: $3/$15 per MTok)
+        cost = (total_input_tokens * 3.0 + total_output_tokens * 15.0) / 1_000_000
+        cost_str = f" — ${cost:.4f}" if cost > 0 else ""
+        emit(f"✓ Done{cost_str}")
+
+        _jobs[job_id]["status"] = "done"
+
+        # Persist assistant response to chats file and mark unread
+        if todo_id and assistant_text_lines:
+            try:
+                chats = _load_chats()
+                chat = chats.get(todo_id, {"conversationId": None, "messages": []})
+                chat["messages"].append({
+                    "role": "assistant",
+                    "content": "\n".join(assistant_text_lines)
+                })
+                chat["unread"] = True
+                chats[todo_id] = chat
+                _save_chats(chats)
+            except Exception:
+                pass
+
+    except Exception as exc:
+        _jobs[job_id].pop("_stream", None)
+        if _jobs[job_id]["status"] != "killed":
+            _jobs[job_id]["output_lines"].append(f"error: {exc}")
+            _jobs[job_id]["status"] = "error"
+
+
+def _run_chat_local(job_id: str, message: str, cwd: str,
+                    conversation_id: str | None = None,
+                    todo_id: str | None = None):
+    """Thread target: run claude -p for chat with optional --resume (local CLI fallback)."""
     claude_bin, env = _resolve_claude_bin()
     if not claude_bin:
         _jobs[job_id]["output_lines"].append("error: claude binary not found")
@@ -857,6 +1215,17 @@ def _run_claude_chat_job(job_id: str, message: str, cwd: str,
     except Exception as exc:
         _jobs[job_id]["output_lines"].append(f"error: {exc}")
         _jobs[job_id]["status"] = "error"
+
+
+def _run_claude_chat_job(job_id: str, message: str, cwd: str,
+                         conversation_id: str | None = None,
+                         todo_id: str | None = None):
+    """Dispatcher: use API if configured, otherwise fall back to local CLI."""
+    config = _load_config()
+    if config.get("anthropic_api_key") and anthropic:
+        _run_chat_api(job_id, message, todo_id)
+    else:
+        _run_chat_local(job_id, message, cwd, conversation_id, todo_id)
 
 
 def _start_claude_chat_job(label: str, job_key: str, message: str, cwd: str,
@@ -1112,6 +1481,39 @@ def mark_chat_read(todo_id):
     if chat and chat.get("unread"):
         chat["unread"] = False
         _save_chats(chats)
+    return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Config API
+# ---------------------------------------------------------------------------
+
+@app.route("/api/config", methods=["GET"])
+def get_config():
+    """Return server config with API key redacted."""
+    config = _load_config()
+    safe = dict(config)
+    if "anthropic_api_key" in safe:
+        key = safe["anthropic_api_key"]
+        if key and len(key) > 8:
+            safe["anthropic_api_key"] = key[:8] + "..." + key[-4:]
+        elif key:
+            safe["anthropic_api_key"] = "***"
+    return jsonify(safe)
+
+
+@app.route("/api/config", methods=["PUT"])
+def put_config():
+    """Update server config."""
+    data = request.json or {}
+    config = _load_config()
+    # Merge provided fields
+    for key in ("anthropic_api_key", "model"):
+        if key in data:
+            config[key] = data[key]
+    if "tokens" in data and isinstance(data["tokens"], dict):
+        config.setdefault("tokens", {}).update(data["tokens"])
+    _save_config(config)
     return jsonify({"ok": True})
 
 
@@ -1451,10 +1853,18 @@ def stream_job(job_id):
 
 @app.route("/api/jobs/<job_id>/kill", methods=["POST"])
 def kill_job(job_id):
-    """Cancel a running job."""
+    """Cancel a running job (supports both local subprocess and API stream)."""
     job = _jobs.get(job_id)
     if not job:
         return jsonify({"error": "not found"}), 404
+    # Cancel API stream if present
+    api_stream = job.get("_stream")
+    if api_stream:
+        try:
+            api_stream.close()
+        except Exception:
+            pass
+    # Kill local subprocess if present
     proc = job.get("proc")
     if proc and proc.poll() is None:
         _kill_process_tree(proc.pid)
@@ -1813,6 +2223,27 @@ HTML_PAGE = r"""<!DOCTYPE html>
     padding: 1px 6px; font-size: 0.78rem; font-family: inherit;
   }
   .shortcuts-dialog .shortcut-section { color: var(--accent); font-weight: 700; font-size: 0.8rem; padding: 10px 0 4px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .settings-overlay {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.4);
+    z-index: 3000; justify-content: center; align-items: center;
+  }
+  .settings-overlay.visible { display: flex; }
+  .settings-dialog {
+    background: var(--card); border-radius: var(--radius-lg); padding: 24px 28px;
+    box-shadow: var(--shadow-lg); max-width: 420px; width: 90%;
+  }
+  .settings-dialog h2 { margin: 0 0 16px; font-size: 1.1rem; }
+  .settings-dialog label { display: block; font-size: 0.82rem; font-weight: 600; margin: 12px 0 4px; color: var(--fg); }
+  .settings-dialog label:first-of-type { margin-top: 0; }
+  .settings-dialog input, .settings-dialog select {
+    width: 100%; box-sizing: border-box; padding: 7px 10px; border: 1px solid var(--border);
+    border-radius: var(--radius); font-size: 0.85rem; background: var(--bg); color: var(--fg);
+    font-family: inherit;
+  }
+  .settings-dialog input:focus, .settings-dialog select:focus { outline: none; border-color: var(--accent); }
+  .settings-dialog .settings-actions { display: flex; gap: 8px; margin-top: 18px; justify-content: flex-end; }
+  .settings-dialog .settings-actions button { font-size: 0.82rem; padding: 6px 16px; }
+  .settings-dialog .settings-hint { font-size: 0.75rem; color: var(--subtle); margin-top: 2px; }
 
   /* Edit mode */
   .edit-title {
@@ -2050,7 +2481,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <div class="fab-new">
   <button class="btn btn-primary" id="add-toggle-btn" onclick="showAddForm()">+ New <span style="opacity:0.6;font-weight:400;font-size:0.8em">(n)</span></button>
 </div>
-<div class="fab-help">
+<div class="fab-help" style="display:flex;gap:6px">
+  <button class="btn btn-sm" onclick="showSettings()" style="border:1px solid var(--border);font-size:0.82rem;padding:5px 10px" title="Settings">&#9881;</button>
   <button class="btn btn-sm" onclick="showShortcuts()" style="border:1px solid var(--border);font-size:0.75rem;padding:5px 10px" title="Keyboard shortcuts (?)">?</button>
 </div>
 
@@ -2124,6 +2556,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <tr><td><kbd>Esc</kbd></td><td>Clear search / deselect</td></tr>
       <tr><td><kbd>?</kbd></td><td>Show this dialog</td></tr>
     </table>
+  </div>
+</div>
+
+<div class="settings-overlay" id="settings-overlay" onclick="if(event.target===this)hideSettings()">
+  <div class="settings-dialog">
+    <h2>Settings</h2>
+    <label for="settings-api-key">Anthropic API Key</label>
+    <input type="password" id="settings-api-key" placeholder="sk-ant-...">
+    <div class="settings-hint">Used for server-side chat. Leave blank to use local Claude CLI.</div>
+    <label for="settings-model">Model</label>
+    <select id="settings-model">
+      <option value="claude-sonnet-4-20250514">Claude Sonnet 4</option>
+      <option value="claude-haiku-4-5-20251001">Claude Haiku 4.5</option>
+      <option value="claude-opus-4-20250514">Claude Opus 4</option>
+    </select>
+    <div class="settings-actions">
+      <button class="btn btn-sm" onclick="hideSettings()" style="border:1px solid var(--border)">Cancel</button>
+      <button class="btn btn-sm btn-primary" onclick="saveSettings()">Save</button>
+    </div>
   </div>
 </div>
 
@@ -3199,6 +3650,44 @@ function showShortcuts() {
 }
 function hideShortcuts() {
   document.getElementById('shortcuts-overlay').classList.remove('visible');
+}
+
+async function showSettings() {
+  try {
+    const res = await fetch('/api/config');
+    const config = await res.json();
+    document.getElementById('settings-api-key').value = config.anthropic_api_key || '';
+    const modelSel = document.getElementById('settings-model');
+    const model = config.model || 'claude-sonnet-4-20250514';
+    for (const opt of modelSel.options) {
+      if (opt.value === model) { modelSel.value = model; break; }
+    }
+  } catch {}
+  document.getElementById('settings-overlay').classList.add('visible');
+  document.getElementById('settings-api-key').focus();
+}
+function hideSettings() {
+  document.getElementById('settings-overlay').classList.remove('visible');
+}
+async function saveSettings() {
+  const apiKey = document.getElementById('settings-api-key').value.trim();
+  const model = document.getElementById('settings-model').value;
+  const body = { model };
+  // Only send api key if user typed a full key (not the redacted placeholder)
+  if (apiKey && !apiKey.includes('...')) {
+    body.anthropic_api_key = apiKey;
+  }
+  try {
+    await fetch('/api/config', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    hideSettings();
+    showToast('Settings saved');
+  } catch {
+    showToast('Failed to save settings');
+  }
 }
 
 async function resumeConv(convId, todoId) {
@@ -4880,6 +5369,12 @@ function applySelection() {
 }
 
 document.addEventListener('keydown', e => {
+  // Settings dialog: Escape closes it, block all other keys while open
+  const settingsOpen = document.getElementById('settings-overlay').classList.contains('visible');
+  if (settingsOpen) {
+    if (e.key === 'Escape') { e.preventDefault(); hideSettings(); }
+    return;
+  }
   // Shortcuts dialog: Escape closes it, block all other keys while open
   const shortcutsOpen = document.getElementById('shortcuts-overlay').classList.contains('visible');
   if (shortcutsOpen) {
