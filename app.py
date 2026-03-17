@@ -35,6 +35,18 @@ try:
 except ImportError:
     anthropic = None
 
+try:
+    import openai as openai_mod
+except ImportError:
+    openai_mod = None
+
+try:
+    import asyncio
+    from mcp import ClientSessionGroup, StdioServerParameters
+    from mcp.client.session_group import SseServerParameters
+except ImportError:
+    ClientSessionGroup = None
+
 app = Flask(__name__)
 sock = Sock(app)
 TODO_FILE = "todos.md"
@@ -46,6 +58,194 @@ _undo_stack: deque[tuple[list[dict], list[dict]]] = deque(maxlen=30)
 _jobs: dict[str, dict] = {}
 # session_id -> {id, todo_id, title, tmux_target, alive, created_at, needs_auto_send, resume_id}
 _pty_sessions: dict[str, dict] = {}
+
+
+# ---------------------------------------------------------------------------
+# MCP Server Manager
+# ---------------------------------------------------------------------------
+
+class MCPManager:
+    """Manages MCP server connections in a background asyncio event loop."""
+
+    def __init__(self):
+        self._loop: object = None  # asyncio event loop
+        self._thread: threading.Thread | None = None
+        self._group: object = None  # ClientSessionGroup
+        self._tool_defs: list[dict] = []  # cached Anthropic API format
+        self._mcp_tool_names: set[str] = set()
+        self._started = threading.Event()
+        self._server_status: dict[str, dict] = {}  # name -> {connected, tool_count}
+
+    def start(self, server_configs: dict, tokens: dict | None = None):
+        """Start background event loop thread and connect to all configured MCP servers."""
+        if not ClientSessionGroup:
+            return
+        self._tokens = tokens or {}
+        self._server_configs = server_configs
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+        self._started.wait(timeout=5)
+        # Connect to servers (blocking wait)
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._connect_all(server_configs), self._loop
+            )
+            future.result(timeout=60)
+        except Exception as exc:
+            print(f"MCP startup error: {exc}")
+
+    def stop(self):
+        """Shutdown all MCP connections and stop the event loop."""
+        if self._loop and self._loop.is_running():
+            async def _shutdown():
+                if self._group:
+                    await self._group.__aexit__(None, None, None)
+            try:
+                future = asyncio.run_coroutine_threadsafe(_shutdown(), self._loop)
+                future.result(timeout=10)
+            except Exception:
+                pass
+            self._loop.call_soon_threadsafe(self._loop.stop)
+
+    def get_tool_definitions(self) -> list[dict]:
+        """Return MCP tools in Anthropic API tool definition format."""
+        return list(self._tool_defs)
+
+    def is_mcp_tool(self, name: str) -> bool:
+        """Check if a tool name belongs to an MCP server."""
+        return name in self._mcp_tool_names
+
+    def call_tool(self, name: str, arguments: dict, timeout: float = 120.0) -> str:
+        """Execute an MCP tool call synchronously from a Flask thread."""
+        if not self._loop or not self._group:
+            return json.dumps({"error": "MCP not initialized"})
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._async_call_tool(name, arguments), self._loop
+            )
+            return future.result(timeout=timeout)
+        except Exception as exc:
+            return json.dumps({"error": str(exc)})
+
+    def get_status(self) -> dict:
+        """Return status of all MCP servers."""
+        return dict(self._server_status)
+
+    # -- internal --
+
+    def _run_loop(self):
+        """Background thread target: run an asyncio event loop forever."""
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self._started.set()
+        self._loop.run_forever()
+
+    async def _connect_all(self, server_configs: dict):
+        """Connect to all configured MCP servers."""
+        # Track which server_info.name maps to which config key.
+        # We populate this before connecting so the name_hook can use it.
+        self._name_map = {}  # server_impl_name -> config_key
+        self._pending_config_key = None  # set before each connect
+
+        def name_hook(name, server_info):
+            # Register mapping on first tool encountered
+            if server_info.name not in self._name_map and self._pending_config_key:
+                self._name_map[server_info.name] = self._pending_config_key
+            config_key = self._name_map.get(server_info.name, server_info.name)
+            return f"mcp__{config_key}__{name}"
+
+        self._group = ClientSessionGroup(component_name_hook=name_hook)
+        await self._group.__aenter__()
+
+        for server_name, config in server_configs.items():
+            try:
+                self._pending_config_key = server_name
+                await self._connect_server(server_name, config)
+                tool_count = sum(1 for t in self._group.tools
+                                 if t.startswith(f"mcp__{server_name}__"))
+                self._server_status[server_name] = {
+                    "connected": True, "tool_count": tool_count
+                }
+                print(f"MCP connected: {server_name} ({tool_count} tools)")
+            except Exception as exc:
+                self._server_status[server_name] = {
+                    "connected": False, "error": str(exc)
+                }
+                print(f"MCP failed: {server_name}: {exc}")
+        self._pending_config_key = None
+
+        # Rebuild cached tool definitions
+        self._rebuild_tool_cache()
+
+    async def _connect_server(self, server_name: str, config: dict):
+        """Connect to a single MCP server. Returns the ClientSession."""
+        server_type = config.get("type", "stdio")
+
+        if server_type == "stdio":
+            # Start with user's full shell environment so npx/node/python are on PATH
+            shell_env = _get_user_shell_env()
+            # Merge server-specific env vars on top
+            server_env = self._resolve_env(config.get("env", {}))
+            full_env = dict(shell_env)
+            full_env.update(server_env)
+            # Resolve command via shell PATH if not absolute
+            command = config["command"]
+            if not os.path.isabs(command):
+                resolved = shutil.which(command, path=full_env.get("PATH", os.defpath))
+                if resolved:
+                    command = resolved
+            params = StdioServerParameters(
+                command=command,
+                args=config.get("args", []),
+                env=full_env,
+            )
+        elif server_type in ("sse", "http"):
+            params = SseServerParameters(url=config["url"])
+        else:
+            raise ValueError(f"Unknown MCP server type: {server_type}")
+
+        return await self._group.connect_to_server(params)
+
+    def _resolve_env(self, env: dict) -> dict:
+        """Replace ${tokens.X} placeholders with actual values from config tokens."""
+        resolved = {}
+        for key, value in env.items():
+            if isinstance(value, str) and value.startswith("${tokens.") and value.endswith("}"):
+                token_key = value[9:-1]
+                resolved[key] = self._tokens.get(token_key, value)
+            else:
+                resolved[key] = value
+        return resolved
+
+    def _rebuild_tool_cache(self):
+        """Convert MCP Tool objects to Anthropic API tool definition dicts."""
+        self._tool_defs = []
+        self._mcp_tool_names = set()
+        if not self._group:
+            return
+        for name, tool in self._group.tools.items():
+            self._tool_defs.append({
+                "name": name,
+                "description": tool.description or "",
+                "input_schema": tool.inputSchema,
+            })
+            self._mcp_tool_names.add(name)
+
+    async def _async_call_tool(self, name: str, arguments: dict) -> str:
+        """Execute an MCP tool and return the result as a JSON string."""
+        result = await self._group.call_tool(name, arguments)
+        parts = []
+        for block in (result.content or []):
+            if hasattr(block, "text"):
+                parts.append(block.text)
+            elif hasattr(block, "data"):
+                parts.append(f"[binary data: {getattr(block, 'mimeType', 'unknown')}]")
+        if result.isError:
+            return json.dumps({"error": "\n".join(parts) if parts else "Tool call failed"})
+        return "\n".join(parts) if parts else json.dumps({"result": "ok"})
+
+
+_mcp_manager: MCPManager | None = None
 
 
 def _completed_file_path(path: str) -> str:
@@ -83,17 +283,87 @@ def _save_chats(data: dict) -> None:
         json.dump(data, f, ensure_ascii=False)
 
 
-def _config_file_path(path: str) -> str:
-    """Derive the config file path from the main todo file path.
-    e.g. todos.md -> todos-config.json
-    """
-    base, _ = os.path.splitext(path)
-    return f"{base}-config.json"
+_DEFAULT_SYSTEM_PROMPT = """\
+You are a helpful assistant managing a todo list.
+You have tools to read, create, update, and search todos.
+Use them when the user asks about their tasks or wants to make changes.
+"""
+
+# Source files to seed into the config context/ directory on first run.
+_CONTEXT_SEED_FILES = [
+    ("claude.md", "~/.claude/CLAUDE.md"),
+    ("communication-style.md", "~/.claude/communication-style.md"),
+    ("org.md", "~/.claude/org.md"),
+    ("status-index.md", "~/.claude/status-index.md"),
+]
+_MEMORY_INDEX_PATH = "~/.claude/projects/-Users-ben-ng-Projects/memory/MEMORY.md"
+
+
+def _config_dir_path() -> str:
+    """Return the config directory path derived from the todo file."""
+    base, _ = os.path.splitext(TODO_FILE)
+    return f"{base}-config"
+
+
+def _ensure_config_dir() -> str:
+    """Create config dir structure. Migrate from flat file if needed. Return dir path."""
+    config_dir = _config_dir_path()
+    context_dir = os.path.join(config_dir, "context")
+    os.makedirs(context_dir, exist_ok=True)
+    os.makedirs(os.path.join(config_dir, "users"), exist_ok=True)
+
+    # Migrate from old flat config file
+    old_flat = f"{os.path.splitext(TODO_FILE)[0]}-config.json"
+    new_json = os.path.join(config_dir, "config.json")
+    if os.path.exists(old_flat) and not os.path.exists(new_json):
+        shutil.move(old_flat, new_json)
+
+    # Seed system-prompt.md if missing
+    prompt_path = os.path.join(config_dir, "system-prompt.md")
+    if not os.path.exists(prompt_path):
+        with open(prompt_path, "w", encoding="utf-8") as f:
+            f.write(_DEFAULT_SYSTEM_PROMPT)
+
+    # Seed context files from ~/.claude/ if context dir is empty
+    if not any(f.endswith(".md") for f in os.listdir(context_dir)):
+        for dest_name, src_path in _CONTEXT_SEED_FILES:
+            src = os.path.expanduser(src_path)
+            if os.path.exists(src):
+                try:
+                    shutil.copy2(src, os.path.join(context_dir, dest_name))
+                except OSError:
+                    pass
+        # Assemble memory from MEMORY.md + referenced files
+        _seed_memory_context(context_dir)
+
+    return config_dir
+
+
+def _seed_memory_context(context_dir: str) -> None:
+    """Read MEMORY.md index, resolve relative .md links, assemble into context/memory.md."""
+    index_path = os.path.expanduser(_MEMORY_INDEX_PATH)
+    if not os.path.exists(index_path):
+        return
+    try:
+        with open(index_path, "r", encoding="utf-8") as f:
+            index_content = f.read()
+        parts = [index_content.strip()]
+        # Resolve relative .md links: [name](file.md)
+        memory_dir = os.path.dirname(index_path)
+        for match in re.finditer(r'\[.*?\]\(([^)]+\.md)\)', index_content):
+            ref_path = os.path.join(memory_dir, match.group(1))
+            if os.path.exists(ref_path):
+                with open(ref_path, "r", encoding="utf-8") as rf:
+                    parts.append(rf.read().strip())
+        with open(os.path.join(context_dir, "memory.md"), "w", encoding="utf-8") as f:
+            f.write("\n\n---\n\n".join(parts))
+    except OSError:
+        pass
 
 
 def _load_config() -> dict:
     """Load server config from disk."""
-    path = _config_file_path(TODO_FILE)
+    path = os.path.join(_config_dir_path(), "config.json")
     if not os.path.exists(path):
         return {}
     try:
@@ -105,7 +375,8 @@ def _load_config() -> dict:
 
 def _save_config(data: dict) -> None:
     """Save server config to disk."""
-    path = _config_file_path(TODO_FILE)
+    _ensure_config_dir()
+    path = os.path.join(_config_dir_path(), "config.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
@@ -918,6 +1189,9 @@ def _execute_tool(name: str, input_data: dict, todo_id: str | None) -> str:
             return json.dumps(chat.get("messages", [])[-20:], ensure_ascii=False)
 
         else:
+            # Delegate to MCP if it's an MCP tool
+            if _mcp_manager and _mcp_manager.is_mcp_tool(name):
+                return _mcp_manager.call_tool(name, input_data)
             return json.dumps({"error": f"Unknown tool: {name}"})
 
     except Exception as exc:
@@ -925,177 +1199,331 @@ def _execute_tool(name: str, input_data: dict, todo_id: str | None) -> str:
 
 
 def _build_system_prompt(todo_id: str | None) -> str:
-    """Build a system prompt for the agentic loop."""
-    parts = [
-        "You are a helpful assistant managing a todo list. "
-        "You have tools to read, create, update, and search todos. "
-        "Use them when the user asks about their tasks or wants to make changes."
-    ]
+    """Build a system prompt from config directory files."""
+    config_dir = _config_dir_path()
+    parts = []
+
+    # 1. Base system prompt
+    prompt_path = os.path.join(config_dir, "system-prompt.md")
+    if os.path.exists(prompt_path):
+        try:
+            with open(prompt_path, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+            if content:
+                parts.append(content)
+        except OSError:
+            pass
+    if not parts:
+        parts.append(_DEFAULT_SYSTEM_PROMPT.strip())
+
+    # 2. Context files (alphabetical)
+    context_dir = os.path.join(config_dir, "context")
+    if os.path.isdir(context_dir):
+        for name in sorted(os.listdir(context_dir)):
+            if name.endswith(".md"):
+                fp = os.path.join(context_dir, name)
+                try:
+                    with open(fp, "r", encoding="utf-8") as f:
+                        content = f.read().strip()
+                    if content:
+                        parts.append(f"# {name}\n{content}")
+                except OSError:
+                    pass
+
+    # 3. Current date
+    parts.append(f"Today's date is {datetime.now().strftime('%Y-%m-%d')}.")
+
+    # 4. Todo context
     if todo_id:
-        parts.append(f"\nThe current conversation is associated with todo item ID: {todo_id}")
-    return "\n".join(parts)
+        parts.append(f"Current conversation is for todo item ID: {todo_id}")
+
+    return "\n\n---\n\n".join(parts)
 
 
-def _run_chat_api(job_id: str, message: str, todo_id: str | None):
-    """Thread target: server-side agentic loop using Anthropic SDK."""
-    config = _load_config()
-    api_key = config.get("anthropic_api_key")
-    if not api_key or not anthropic:
-        _jobs[job_id]["output_lines"].append("error: Anthropic API not configured")
-        _jobs[job_id]["status"] = "error"
-        return
+def _strip_think_tags(text: str) -> str:
+    """Remove <think>...</think> reasoning blocks from model output."""
+    return re.sub(r'<think>[\s\S]*?</think>\s*', '', text).strip()
 
-    client = anthropic.Anthropic(api_key=api_key)
-    _jobs[job_id]["status"] = "running"
 
-    assistant_text_lines = []
-    total_input_tokens = 0
-    total_output_tokens = 0
+def _openai_tool_defs() -> list[dict]:
+    """Convert Anthropic-format tool definitions to OpenAI function-calling format."""
+    tools = _get_tool_definitions()
+    if _mcp_manager:
+        tools = tools + _mcp_manager.get_tool_definitions()
+    return [{
+        "type": "function",
+        "function": {
+            "name": t["name"],
+            "description": t.get("description", ""),
+            "parameters": t.get("input_schema", {"type": "object", "properties": {}}),
+        }
+    } for t in tools]
 
-    def emit(line: str, is_text: bool = False) -> None:
+
+class ChatAgent:
+    """Unified agentic loop for both Anthropic and OpenAI-compatible providers.
+
+    Handles: message history, system prompt, streaming, tool execution,
+    output emission, persistence. Provider-specific logic is in _call_anthropic
+    and _call_openai.
+    """
+
+    def __init__(self, job_id: str, todo_id: str | None, provider: dict):
+        self.job_id = job_id
+        self.todo_id = todo_id
+        self.provider = provider
+        self.ptype = provider.get("type", "local")
+        self.model = provider.get("model", "claude-sonnet-4-20250514")
+        self.assistant_text_lines: list[str] = []
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+
+    @property
+    def job(self):
+        return _jobs[self.job_id]
+
+    def emit(self, line: str, is_text: bool = False) -> None:
         if line.strip():
-            _jobs[job_id]["output_lines"].append(line)
+            self.job["output_lines"].append(line)
             if is_text:
-                assistant_text_lines.append(line)
+                self.assistant_text_lines.append(line)
 
-    try:
-        # Build messages from persisted history + new message
+    def is_killed(self) -> bool:
+        return self.job["status"] == "killed"
+
+    def _build_history(self, message: str) -> list[dict]:
+        """Build messages array from persisted history + new message."""
         chats = _load_chats()
-        chat = chats.get(todo_id, {"messages": []}) if todo_id else {"messages": []}
+        chat = chats.get(self.todo_id, {"messages": []}) if self.todo_id else {"messages": []}
         messages = []
         for m in chat.get("messages", []):
             role = m.get("role", "user")
             content = m.get("content", "")
-            # Only include user/assistant text messages for API (skip tool history)
             if role in ("user", "assistant") and isinstance(content, str) and content.strip():
                 messages.append({"role": role, "content": content})
         messages.append({"role": "user", "content": message})
+        return messages
 
-        model = config.get("model", "claude-sonnet-4-20250514")
+    def _get_tools_anthropic(self) -> list[dict]:
         tools = _get_tool_definitions()
-        system_prompt = _build_system_prompt(todo_id)
+        if _mcp_manager:
+            tools = tools + _mcp_manager.get_tool_definitions()
+        return tools
 
-        # Agentic loop
-        while _jobs[job_id]["status"] == "running":
+    def _get_tools_openai(self) -> list[dict]:
+        return _openai_tool_defs()
+
+    def _persist_response(self) -> None:
+        """Persist assistant response to chats file and mark unread."""
+        if self.todo_id and self.assistant_text_lines:
+            try:
+                chats = _load_chats()
+                chat = chats.get(self.todo_id, {"conversationId": None, "messages": []})
+                chat["messages"].append({
+                    "role": "assistant",
+                    "content": "\n".join(self.assistant_text_lines)
+                })
+                chat["unread"] = True
+                chats[self.todo_id] = chat
+                _save_chats(chats)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Anthropic provider
+    # ------------------------------------------------------------------
+
+    def _run_anthropic(self, message: str) -> None:
+        api_key = self.provider.get("api_key")
+        if not api_key or not anthropic:
+            self.emit("error: Anthropic API not configured")
+            self.job["status"] = "error"
+            return
+
+        client = anthropic.Anthropic(api_key=api_key)
+        messages = self._build_history(message)
+        tools = self._get_tools_anthropic()
+        system_prompt = _build_system_prompt(self.todo_id)
+
+        while not self.is_killed():
             text_buf = ""
-
             with client.messages.stream(
-                model=model,
+                model=self.model,
                 system=system_prompt,
                 messages=messages,
                 max_tokens=8192,
                 tools=tools,
             ) as stream:
-                # Store stream reference so kill_job can cancel it
-                _jobs[job_id]["_stream"] = stream
-
+                self.job["_stream"] = stream
                 for event in stream:
-                    if _jobs[job_id]["status"] == "killed":
+                    if self.is_killed():
                         stream.close()
                         return
-
                     if event.type == "content_block_start":
                         if hasattr(event, "content_block"):
                             block = event.content_block
                             if block.type == "tool_use":
                                 if text_buf.strip():
                                     for ln in text_buf.strip().splitlines():
-                                        emit(ln, is_text=True)
+                                        self.emit(ln, is_text=True)
                                     text_buf = ""
-                                emit(f"▶ {block.name}...")
+                                self.emit(f"▶ {block.name}...")
                             elif block.type == "text" and text_buf.strip():
                                 for ln in text_buf.strip().splitlines():
-                                    emit(ln, is_text=True)
+                                    self.emit(ln, is_text=True)
                                 text_buf = ""
-
                     elif event.type == "content_block_delta":
                         if hasattr(event, "delta") and event.delta.type == "text_delta":
                             text_buf += event.delta.text
                             while "\n" in text_buf:
                                 line, text_buf = text_buf.split("\n", 1)
-                                emit(line, is_text=True)
-
+                                self.emit(line, is_text=True)
                     elif event.type == "content_block_stop":
                         if text_buf.strip():
                             for ln in text_buf.strip().splitlines():
-                                emit(ln, is_text=True)
+                                self.emit(ln, is_text=True)
                             text_buf = ""
-
-                # Flush any remaining text
                 if text_buf.strip():
                     for ln in text_buf.strip().splitlines():
-                        emit(ln, is_text=True)
+                        self.emit(ln, is_text=True)
 
-            _jobs[job_id].pop("_stream", None)
+            self.job.pop("_stream", None)
             response = stream.get_final_message()
 
-            # Track token usage
             if response.usage:
-                total_input_tokens += response.usage.input_tokens
-                total_output_tokens += response.usage.output_tokens
+                self.total_input_tokens += response.usage.input_tokens
+                self.total_output_tokens += response.usage.output_tokens
 
             if response.stop_reason == "tool_use":
-                # Execute tool calls
                 tool_results = []
-                for block in response.content:
-                    if block.type == "tool_use":
-                        result = _execute_tool(block.name, block.input, todo_id)
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": result
-                        })
-
-                # Append assistant response + tool results for next iteration
-                # Convert content blocks to dicts for the messages array
                 assistant_content = []
                 for block in response.content:
                     if block.type == "text":
                         assistant_content.append({"type": "text", "text": block.text})
                     elif block.type == "tool_use":
                         assistant_content.append({
-                            "type": "tool_use",
-                            "id": block.id,
-                            "name": block.name,
-                            "input": block.input
+                            "type": "tool_use", "id": block.id,
+                            "name": block.name, "input": block.input
+                        })
+                        result = _execute_tool(block.name, block.input, self.todo_id)
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result
                         })
                 messages.append({"role": "assistant", "content": assistant_content})
                 messages.append({"role": "user", "content": tool_results})
-                continue  # Next iteration
+                continue
+            break  # end_turn or max_tokens
 
-            # end_turn or max_tokens — we're done
-            break
+    # ------------------------------------------------------------------
+    # OpenAI-compatible provider
+    # ------------------------------------------------------------------
 
-        if _jobs[job_id]["status"] == "killed":
+    def _run_openai(self, message: str) -> None:
+        base_url = self.provider.get("base_url")
+        api_key = self.provider.get("api_key", "none")
+        if not base_url or not openai_mod:
+            self.emit("error: OpenAI-compatible endpoint not configured")
+            self.job["status"] = "error"
             return
 
-        # Estimate cost (Claude Sonnet 4 pricing: $3/$15 per MTok)
-        cost = (total_input_tokens * 3.0 + total_output_tokens * 15.0) / 1_000_000
-        cost_str = f" — ${cost:.4f}" if cost > 0 else ""
-        emit(f"✓ Done{cost_str}")
+        client = openai_mod.OpenAI(base_url=base_url, api_key=api_key)
+        system_prompt = _build_system_prompt(self.todo_id)
+        messages = [{"role": "system", "content": system_prompt}] + self._build_history(message)
+        tools = self._get_tools_openai()
+        max_tokens = min(self.provider.get("max_tokens", 4096), 4096)
 
-        _jobs[job_id]["status"] = "done"
+        for _ in range(10):  # max iterations
+            if self.is_killed():
+                return
+            kwargs = {"model": self.model, "messages": messages, "max_tokens": max_tokens}
+            if tools and self.provider.get("tool_use", True):
+                kwargs["tools"] = tools
 
-        # Persist assistant response to chats file and mark unread
-        if todo_id and assistant_text_lines:
-            try:
-                chats = _load_chats()
-                chat = chats.get(todo_id, {"conversationId": None, "messages": []})
-                chat["messages"].append({
-                    "role": "assistant",
-                    "content": "\n".join(assistant_text_lines)
-                })
-                chat["unread"] = True
-                chats[todo_id] = chat
-                _save_chats(chats)
-            except Exception:
-                pass
+            response = client.chat.completions.create(**kwargs)
 
-    except Exception as exc:
-        _jobs[job_id].pop("_stream", None)
-        if _jobs[job_id]["status"] != "killed":
-            _jobs[job_id]["output_lines"].append(f"error: {exc}")
-            _jobs[job_id]["status"] = "error"
+            if response.usage:
+                self.total_input_tokens += response.usage.prompt_tokens or 0
+                self.total_output_tokens += response.usage.completion_tokens or 0
+
+            choice = response.choices[0]
+            msg = choice.message
+
+            if msg.content:
+                cleaned = _strip_think_tags(msg.content)
+                if cleaned:
+                    for line in cleaned.splitlines():
+                        self.emit(line, is_text=True)
+
+            if msg.tool_calls:
+                assistant_msg = {"role": "assistant", "content": msg.content or ""}
+                assistant_msg["tool_calls"] = [
+                    {"id": tc.id, "type": "function",
+                     "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                    for tc in msg.tool_calls
+                ]
+                messages.append(assistant_msg)
+                for tc in msg.tool_calls:
+                    self.emit(f"▶ {tc.function.name}...")
+                    try:
+                        args = json.loads(tc.function.arguments)
+                    except json.JSONDecodeError:
+                        args = {}
+                    result = _execute_tool(tc.function.name, args, self.todo_id)
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+                continue
+            break  # No tool calls — done
+
+    # ------------------------------------------------------------------
+    # Entry point
+    # ------------------------------------------------------------------
+
+    def run(self, message: str) -> None:
+        """Run the agentic loop. Called from a thread."""
+        self.job["status"] = "running"
+        try:
+            if self.ptype == "anthropic":
+                self._run_anthropic(message)
+            elif self.ptype == "openai_compat":
+                self._run_openai(message)
+            else:
+                self.emit(f"error: unknown provider type '{self.ptype}'")
+                self.job["status"] = "error"
+                return
+
+            if self.is_killed():
+                return
+
+            # Cost/token summary
+            if self.ptype == "anthropic":
+                cost = (self.total_input_tokens * 3.0 + self.total_output_tokens * 15.0) / 1_000_000
+                self.emit(f"✓ Done — ${cost:.4f}" if cost > 0 else "✓ Done")
+            else:
+                self.emit(f"✓ Done (tokens: {self.total_input_tokens}+{self.total_output_tokens})")
+
+            self.job["status"] = "done"
+            self._persist_response()
+
+        except Exception as exc:
+            self.job.pop("_stream", None)
+            if not self.is_killed():
+                exc_str = str(exc)
+                # Provide actionable detail for common errors
+                if "max_tokens" in exc_str or "context_length" in exc_str or "too long" in exc_str.lower() or "maximum" in exc_str.lower():
+                    hist_count = len(self.assistant_text_lines)
+                    self.emit(f"error: Context length exceeded. The conversation history + system prompt is too large for the model. "
+                              f"({self.total_input_tokens} input tokens so far, {hist_count} assistant lines accumulated). "
+                              f"Try /compact or Restart to reduce context. Raw: {exc_str[:200]}")
+                elif "401" in exc_str or "auth" in exc_str.lower() or "api_key" in exc_str.lower():
+                    self.emit(f"error: Authentication failed. Check your API key in Settings. Raw: {exc_str[:200]}")
+                elif "429" in exc_str or "rate" in exc_str.lower():
+                    self.emit(f"error: Rate limited. Too many requests — wait a moment and try again. Raw: {exc_str[:200]}")
+                elif "connection" in exc_str.lower() or "timeout" in exc_str.lower() or "refused" in exc_str.lower():
+                    self.emit(f"error: Connection failed. Is the endpoint reachable? Provider: {self.ptype}, model: {self.model}. Raw: {exc_str[:200]}")
+                else:
+                    self.emit(f"error: {self.ptype}/{self.model} — {exc_str[:300]}")
+                self.job["status"] = "error"
 
 
 def _run_chat_local(job_id: str, message: str, cwd: str,
@@ -1217,13 +1645,47 @@ def _run_chat_local(job_id: str, message: str, cwd: str,
         _jobs[job_id]["status"] = "error"
 
 
+def _get_active_provider() -> tuple[str, dict]:
+    """Return (provider_name, provider_config) for the active provider."""
+    config = _load_config()
+    active = config.get("active_provider", "")
+
+    # Explicit local CLI selection
+    if active == "local":
+        return "local", {"type": "local"}
+
+    # Named provider from providers dict
+    providers = config.get("providers", {})
+    if active and active in providers:
+        return active, providers[active]
+
+    # Migration: build provider from legacy flat config
+    if config.get("openai_compat", {}).get("base_url"):
+        oai = config["openai_compat"]
+        return "openai_compat", {
+            "type": "openai_compat",
+            "base_url": oai.get("base_url"),
+            "api_key": oai.get("api_key", "none"),
+            "model": oai.get("model", "default"),
+        }
+    if config.get("anthropic_api_key"):
+        return "anthropic", {
+            "type": "anthropic",
+            "api_key": config["anthropic_api_key"],
+            "model": config.get("model", "claude-sonnet-4-20250514"),
+        }
+    return "local", {"type": "local"}
+
+
 def _run_claude_chat_job(job_id: str, message: str, cwd: str,
                          conversation_id: str | None = None,
                          todo_id: str | None = None):
-    """Dispatcher: use API if configured, otherwise fall back to local CLI."""
-    config = _load_config()
-    if config.get("anthropic_api_key") and anthropic:
-        _run_chat_api(job_id, message, todo_id)
+    """Dispatcher: route to the active provider via ChatAgent, or local CLI fallback."""
+    name, provider = _get_active_provider()
+    ptype = provider.get("type", "local")
+    if ptype in ("anthropic", "openai_compat"):
+        agent = ChatAgent(job_id, todo_id, provider)
+        agent.run(message)
     else:
         _run_chat_local(job_id, message, cwd, conversation_id, todo_id)
 
@@ -1488,17 +1950,41 @@ def mark_chat_read(todo_id):
 # Config API
 # ---------------------------------------------------------------------------
 
+def _redact_key(key: str) -> str:
+    """Redact an API key for display."""
+    if not key:
+        return ""
+    if len(key) > 12:
+        return key[:8] + "..." + key[-4:]
+    return "***"
+
+
 @app.route("/api/config", methods=["GET"])
 def get_config():
-    """Return server config with API key redacted."""
+    """Return server config with API keys redacted."""
     config = _load_config()
     safe = dict(config)
-    if "anthropic_api_key" in safe:
-        key = safe["anthropic_api_key"]
-        if key and len(key) > 8:
-            safe["anthropic_api_key"] = key[:8] + "..." + key[-4:]
-        elif key:
-            safe["anthropic_api_key"] = "***"
+    # Redact legacy flat keys
+    if "anthropic_api_key" in safe and safe["anthropic_api_key"]:
+        safe["anthropic_api_key"] = _redact_key(safe["anthropic_api_key"])
+    if "openai_compat" in safe and isinstance(safe["openai_compat"], dict):
+        oai = dict(safe["openai_compat"])
+        if oai.get("api_key"):
+            oai["api_key"] = _redact_key(oai["api_key"])
+        safe["openai_compat"] = oai
+    # Redact provider keys
+    if "providers" in safe and isinstance(safe["providers"], dict):
+        providers = {}
+        for name, prov in safe["providers"].items():
+            p = dict(prov)
+            if p.get("api_key"):
+                p["api_key"] = _redact_key(p["api_key"])
+            providers[name] = p
+        safe["providers"] = providers
+    # Include active provider info
+    active_name, active_prov = _get_active_provider()
+    safe["_active_provider_name"] = active_name
+    safe["_active_provider_type"] = active_prov.get("type", "local")
     return jsonify(safe)
 
 
@@ -1507,14 +1993,164 @@ def put_config():
     """Update server config."""
     data = request.json or {}
     config = _load_config()
-    # Merge provided fields
-    for key in ("anthropic_api_key", "model"):
+    # Merge provided fields (legacy + new)
+    for key in ("anthropic_api_key", "model", "mcp_servers", "openai_compat", "active_provider"):
         if key in data:
             config[key] = data[key]
+    if "providers" in data and isinstance(data["providers"], dict):
+        existing = config.get("providers", {})
+        for name, prov in data["providers"].items():
+            if prov is None:
+                existing.pop(name, None)  # Delete provider
+            elif name in existing:
+                # Merge: don't overwrite api_key with redacted value
+                for k, v in prov.items():
+                    if k == "api_key" and v and "..." in v:
+                        continue  # Skip redacted key
+                    existing[name][k] = v
+            else:
+                existing[name] = prov
+        config["providers"] = existing
     if "tokens" in data and isinstance(data["tokens"], dict):
         config.setdefault("tokens", {}).update(data["tokens"])
     _save_config(config)
     return jsonify({"ok": True})
+
+
+@app.route("/api/mcp/status")
+def mcp_status():
+    """Return status of all MCP servers."""
+    if not _mcp_manager:
+        return jsonify({"servers": [], "available": bool(ClientSessionGroup)})
+    status = _mcp_manager.get_status()
+    servers = [{"name": name, **info} for name, info in status.items()]
+    return jsonify({"servers": servers, "available": True})
+
+
+@app.route("/api/mcp/reconnect", methods=["POST"])
+def mcp_reconnect():
+    """Restart all MCP server connections."""
+    global _mcp_manager
+    if _mcp_manager:
+        _mcp_manager.stop()
+    config = _load_config()
+    mcp_configs = config.get("mcp_servers", {})
+    if mcp_configs and ClientSessionGroup:
+        _mcp_manager = MCPManager()
+        _mcp_manager.start(mcp_configs, config.get("tokens", {}))
+    return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Git version control for todo files
+# ---------------------------------------------------------------------------
+
+def _todo_git_dir() -> str | None:
+    """Return the git repo directory containing the todo file, or None."""
+    todo_path = os.path.realpath(TODO_FILE)
+    try:
+        result = subprocess.run(
+            ["git", "-C", os.path.dirname(todo_path), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+@app.route("/api/git/log")
+def git_log():
+    """Return recent git log for the todo files."""
+    git_dir = _todo_git_dir()
+    if not git_dir:
+        return jsonify({"error": "No git repo found for todo file"}), 404
+    todo_real = os.path.realpath(TODO_FILE)
+    completed_real = os.path.realpath(_completed_file_path(TODO_FILE))
+    # Get paths relative to git root
+    todo_rel = os.path.relpath(todo_real, git_dir)
+    completed_rel = os.path.relpath(completed_real, git_dir)
+    try:
+        result = subprocess.run(
+            ["git", "-C", git_dir, "log", "--oneline", "--format=%H|%ai|%s", "-30",
+             "--", todo_rel, completed_rel],
+            capture_output=True, text=True, timeout=10
+        )
+        commits = []
+        for line in result.stdout.strip().splitlines():
+            if "|" in line:
+                parts = line.split("|", 2)
+                commits.append({"hash": parts[0], "date": parts[1], "message": parts[2] if len(parts) > 2 else ""})
+        return jsonify({"commits": commits, "git_dir": git_dir})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/git/commit", methods=["POST"])
+def git_commit():
+    """Commit current todo files."""
+    git_dir = _todo_git_dir()
+    if not git_dir:
+        return jsonify({"error": "No git repo found"}), 404
+    data = request.json or {}
+    message = data.get("message", "").strip() or f"Manual save {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    todo_real = os.path.realpath(TODO_FILE)
+    completed_real = os.path.realpath(_completed_file_path(TODO_FILE))
+    todo_rel = os.path.relpath(todo_real, git_dir)
+    completed_rel = os.path.relpath(completed_real, git_dir)
+    try:
+        subprocess.run(["git", "-C", git_dir, "add", todo_rel, completed_rel],
+                       capture_output=True, text=True, timeout=10)
+        result = subprocess.run(
+            ["git", "-C", git_dir, "commit", "-m", message],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            return jsonify({"ok": True, "message": message})
+        elif "nothing to commit" in result.stdout:
+            return jsonify({"ok": True, "message": "No changes to commit"})
+        else:
+            return jsonify({"error": result.stderr.strip() or result.stdout.strip()}), 500
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/git/rollback", methods=["POST"])
+def git_rollback():
+    """Rollback todo files to a specific commit."""
+    git_dir = _todo_git_dir()
+    if not git_dir:
+        return jsonify({"error": "No git repo found"}), 404
+    data = request.json or {}
+    commit_hash = data.get("hash", "").strip()
+    if not commit_hash:
+        return jsonify({"error": "hash is required"}), 400
+    todo_real = os.path.realpath(TODO_FILE)
+    completed_real = os.path.realpath(_completed_file_path(TODO_FILE))
+    todo_rel = os.path.relpath(todo_real, git_dir)
+    completed_rel = os.path.relpath(completed_real, git_dir)
+    try:
+        # Checkout the files from that commit
+        subprocess.run(
+            ["git", "-C", git_dir, "checkout", commit_hash, "--", todo_rel, completed_rel],
+            capture_output=True, text=True, timeout=10, check=True
+        )
+        # Commit the rollback
+        subprocess.run(
+            ["git", "-C", git_dir, "add", todo_rel, completed_rel],
+            capture_output=True, text=True, timeout=10
+        )
+        subprocess.run(
+            ["git", "-C", git_dir, "commit", "-m",
+             f"Rollback to {commit_hash[:8]} — {datetime.now().strftime('%Y-%m-%d %H:%M')}"],
+            capture_output=True, text=True, timeout=10
+        )
+        return jsonify({"ok": True})
+    except subprocess.CalledProcessError as exc:
+        return jsonify({"error": exc.stderr.strip() if exc.stderr else str(exc)}), 500
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
 
 
 # ---------------------------------------------------------------------------
@@ -1729,7 +2365,7 @@ def _terminal_io_loop(ws, master_fd, proc, tmux_target=None):
 
 @app.route("/api/ea-update", methods=["POST"])
 def ea_update():
-    """Run /ea update as a headless Claude job."""
+    """Run /ea update via ChatAgent."""
     data = request.json or {}
     force = data.get("force", False)
 
@@ -1740,13 +2376,13 @@ def ea_update():
         return jsonify({"status": "already_running", "job_id": existing["id"]})
 
     todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
-    job_id = _start_claude_job("EA Update", "ea-update", "/ea update", todo_dir)
+    job_id = _start_claude_chat_job("EA Update", "ea-update", "/ea update", todo_dir)
     return jsonify({"status": "started", "job_id": job_id})
 
 
 @app.route("/api/ea-update-item", methods=["POST"])
 def ea_update_item():
-    """Run /ea checkon <item_id> as a headless Claude job."""
+    """Run /ea checkon <item_id> via ChatAgent."""
     data = request.json
     item_id = (data.get("id") or "").strip()
     force = data.get("force", False)
@@ -1760,7 +2396,7 @@ def ea_update_item():
         return jsonify({"status": "already_running", "job_id": existing["id"]})
 
     todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
-    job_id = _start_claude_job(f"Check: {item_id}", job_key, f"/ea checkon {item_id}", todo_dir)
+    job_id = _start_claude_chat_job(f"Check: {item_id}", job_key, f"/ea checkon {item_id}", todo_dir)
     return jsonify({"status": "started", "job_id": job_id})
 
 
@@ -2230,8 +2866,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .settings-overlay.visible { display: flex; }
   .settings-dialog {
     background: var(--card); border-radius: var(--radius-lg); padding: 24px 28px;
-    box-shadow: var(--shadow-lg); max-width: 420px; width: 90%;
+    box-shadow: var(--shadow-lg); max-width: 480px; width: 90%; max-height: 85vh; overflow-y: auto;
   }
+  .mcp-server-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 0.8rem; }
+  .mcp-server-row:last-child { border-bottom: none; }
+  .mcp-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .mcp-dot.connected { background: #22c55e; }
+  .mcp-dot.disconnected { background: #ef4444; }
   .settings-dialog h2 { margin: 0 0 16px; font-size: 1.1rem; }
   .settings-dialog label { display: block; font-size: 0.82rem; font-weight: 600; margin: 12px 0 4px; color: var(--fg); }
   .settings-dialog label:first-of-type { margin-top: 0; }
@@ -2562,15 +3203,24 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <div class="settings-overlay" id="settings-overlay" onclick="if(event.target===this)hideSettings()">
   <div class="settings-dialog">
     <h2>Settings</h2>
-    <label for="settings-api-key">Anthropic API Key</label>
-    <input type="password" id="settings-api-key" placeholder="sk-ant-...">
-    <div class="settings-hint">Used for server-side chat. Leave blank to use local Claude CLI.</div>
-    <label for="settings-model">Model</label>
-    <select id="settings-model">
-      <option value="claude-sonnet-4-20250514">Claude Sonnet 4</option>
-      <option value="claude-haiku-4-5-20251001">Claude Haiku 4.5</option>
-      <option value="claude-opus-4-20250514">Claude Opus 4</option>
-    </select>
+    <label for="settings-active-provider">Active Provider</label>
+    <select id="settings-active-provider" onchange="_onActiveProviderChange()"></select>
+    <div class="settings-hint">Which inference endpoint to use for chat.</div>
+    <div id="provider-list"></div>
+    <hr style="border:none;border-top:1px solid var(--border);margin:16px 0 12px">
+    <button class="btn btn-sm" onclick="_addProvider()" style="border:1px solid var(--border);width:100%">+ Add Provider</button>
+    <hr style="border:none;border-top:1px solid var(--border);margin:16px 0 12px">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+      <span style="font-size:0.82rem;font-weight:600">MCP Servers</span>
+      <button class="btn btn-sm" onclick="_refreshMcp()" style="border:1px solid var(--border);font-size:0.7rem;padding:2px 8px">Reconnect</button>
+    </div>
+    <div id="mcp-server-list" style="margin-bottom:8px"></div>
+    <hr style="border:none;border-top:1px solid var(--border);margin:16px 0 12px">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+      <span style="font-size:0.82rem;font-weight:600">Version History</span>
+      <button class="btn btn-sm" onclick="_gitCommit()" style="border:1px solid var(--border);font-size:0.7rem;padding:2px 8px">Save Snapshot</button>
+    </div>
+    <div id="git-log-list" style="max-height:200px;overflow-y:auto;margin-bottom:8px"></div>
     <div class="settings-actions">
       <button class="btn btn-sm" onclick="hideSettings()" style="border:1px solid var(--border)">Cancel</button>
       <button class="btn btn-sm btn-primary" onclick="saveSettings()">Save</button>
@@ -3652,31 +4302,226 @@ function hideShortcuts() {
   document.getElementById('shortcuts-overlay').classList.remove('visible');
 }
 
+let _settingsProviders = {}; // name -> {type, api_key, model, base_url}
+
 async function showSettings() {
   try {
     const res = await fetch('/api/config');
     const config = await res.json();
-    document.getElementById('settings-api-key').value = config.anthropic_api_key || '';
-    const modelSel = document.getElementById('settings-model');
-    const model = config.model || 'claude-sonnet-4-20250514';
-    for (const opt of modelSel.options) {
-      if (opt.value === model) { modelSel.value = model; break; }
+    // Build providers from config
+    _settingsProviders = {};
+    if (config.providers) {
+      for (const [name, prov] of Object.entries(config.providers)) {
+        _settingsProviders[name] = { ...prov };
+      }
     }
+    // Migration: if no providers dict but legacy keys exist, show them
+    if (Object.keys(_settingsProviders).length === 0) {
+      if (config.anthropic_api_key) {
+        _settingsProviders['anthropic'] = { type: 'anthropic', api_key: config.anthropic_api_key, model: config.model || 'claude-sonnet-4-20250514' };
+      }
+      const oai = config.openai_compat || {};
+      if (oai.base_url) {
+        _settingsProviders['openai-compat'] = { type: 'openai_compat', base_url: oai.base_url, api_key: oai.api_key || '', model: oai.model || '' };
+      }
+    }
+    _renderProviderList();
+    // Set active provider dropdown
+    const sel = document.getElementById('settings-active-provider');
+    _rebuildActiveDropdown();
+    sel.value = config.active_provider || config._active_provider_name || '';
   } catch {}
+  _loadMcpStatus();
+  _loadGitLog();
   document.getElementById('settings-overlay').classList.add('visible');
-  document.getElementById('settings-api-key').focus();
 }
+
+async function _loadMcpStatus() {
+  const container = document.getElementById('mcp-server-list');
+  if (!container) return;
+  try {
+    const res = await fetch('/api/mcp/status');
+    const data = await res.json();
+    if (!data.servers || data.servers.length === 0) {
+      container.innerHTML = '<div style="font-size:0.75rem;color:var(--subtle)">No MCP servers configured.</div>';
+      return;
+    }
+    container.innerHTML = data.servers.map(s => {
+      const dot = s.connected ? 'connected' : 'disconnected';
+      const info = s.connected ? s.tool_count + ' tools' : esc(s.error || 'disconnected');
+      return '<div class="mcp-server-row">'
+        + '<span class="mcp-dot ' + dot + '"></span>'
+        + '<strong style="flex-shrink:0">' + esc(s.name) + '</strong>'
+        + '<span style="color:var(--subtle);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(info) + '</span>'
+        + '</div>';
+    }).join('');
+  } catch {
+    container.innerHTML = '<div style="font-size:0.75rem;color:var(--subtle)">Failed to load MCP status.</div>';
+  }
+}
+
+async function _refreshMcp() {
+  showToast('Reconnecting MCP servers...');
+  try {
+    await fetch('/api/mcp/reconnect', { method: 'POST' });
+    await _loadMcpStatus();
+    showToast('MCP reconnected');
+  } catch {
+    showToast('Failed to reconnect MCP', true);
+  }
+}
+
+async function _loadGitLog() {
+  const container = document.getElementById('git-log-list');
+  if (!container) return;
+  try {
+    const res = await fetch('/api/git/log');
+    const data = await res.json();
+    if (data.error) {
+      container.innerHTML = '<div style="font-size:0.75rem;color:var(--subtle)">' + esc(data.error) + '</div>';
+      return;
+    }
+    if (!data.commits || data.commits.length === 0) {
+      container.innerHTML = '<div style="font-size:0.75rem;color:var(--subtle)">No commits yet.</div>';
+      return;
+    }
+    container.innerHTML = data.commits.map(c => {
+      const date = c.date.replace(/\s\+.*/, '').replace('T', ' ').slice(0, 16);
+      const hash = c.hash.slice(0, 8);
+      return '<div style="display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid var(--border);font-size:0.75rem">'
+        + '<code style="color:var(--subtle);flex-shrink:0">' + esc(hash) + '</code>'
+        + '<span style="color:var(--subtle);flex-shrink:0;width:100px">' + esc(date) + '</span>'
+        + '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(c.message) + '</span>'
+        + '<button onclick="_gitRollback(\'' + esc(c.hash) + '\')" style="flex-shrink:0;background:none;border:1px solid var(--border);border-radius:4px;padding:1px 6px;font-size:0.65rem;cursor:pointer;color:var(--subtle)" onmousedown="event.stopPropagation()">Restore</button>'
+        + '</div>';
+    }).join('');
+  } catch {
+    container.innerHTML = '<div style="font-size:0.75rem;color:var(--subtle)">Failed to load git log.</div>';
+  }
+}
+
+async function _gitCommit() {
+  const message = prompt('Commit message:', 'Manual save ' + new Date().toLocaleString());
+  if (message === null) return;
+  try {
+    const res = await fetch('/api/git/commit', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ message }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      showToast(data.message || 'Saved');
+      _loadGitLog();
+    } else {
+      showToast(data.error || 'Commit failed', true);
+    }
+  } catch {
+    showToast('Failed to commit', true);
+  }
+}
+
+async function _gitRollback(hash) {
+  if (!confirm('Restore todos to commit ' + hash.slice(0, 8) + '? Current changes will be overwritten.')) return;
+  try {
+    const res = await fetch('/api/git/rollback', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ hash }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      showToast('Restored to ' + hash.slice(0, 8));
+      _loadGitLog();
+      loadTodos();
+    } else {
+      showToast(data.error || 'Rollback failed', true);
+    }
+  } catch {
+    showToast('Failed to rollback', true);
+  }
+}
+
+function _rebuildActiveDropdown() {
+  const sel = document.getElementById('settings-active-provider');
+  const cur = sel.value;
+  sel.innerHTML = '<option value="local">Local CLI (fallback)</option>';
+  for (const name of Object.keys(_settingsProviders)) {
+    const prov = _settingsProviders[name];
+    const label = name + ' (' + (prov.type === 'anthropic' ? 'Anthropic' : 'OpenAI-compat') + ')';
+    sel.innerHTML += '<option value="' + esc(name) + '">' + esc(label) + '</option>';
+  }
+  if (cur && [...sel.options].some(o => o.value === cur)) sel.value = cur;
+}
+
+function _renderProviderList() {
+  const container = document.getElementById('provider-list');
+  let html = '';
+  for (const [name, prov] of Object.entries(_settingsProviders)) {
+    const isAnthro = prov.type === 'anthropic';
+    html += '<div style="border:1px solid var(--border);border-radius:8px;padding:10px;margin:8px 0">';
+    html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><strong>' + esc(name) + '</strong>';
+    html += '<span style="font-size:0.7rem;color:var(--subtle)">' + (isAnthro ? 'Anthropic' : 'OpenAI-compat') + '</span>';
+    html += '<button onclick="_removeProvider(\'' + esc(name).replace(/'/g,"\\'") + '\')" style="margin-left:auto;background:none;border:none;color:var(--danger);cursor:pointer;font-size:0.75rem">Remove</button></div>';
+    html += '<label style="font-size:0.75rem">API Key</label>';
+    html += '<input type="password" data-prov="' + esc(name) + '" data-field="api_key" value="' + esc(prov.api_key || '') + '" placeholder="' + (isAnthro ? 'sk-ant-...' : 'API key') + '" style="width:100%;margin-bottom:4px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;font-size:0.8rem">';
+    if (!isAnthro) {
+      html += '<label style="font-size:0.75rem">Base URL</label>';
+      html += '<input type="text" data-prov="' + esc(name) + '" data-field="base_url" value="' + esc(prov.base_url || '') + '" placeholder="https://..." style="width:100%;margin-bottom:4px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;font-size:0.8rem">';
+    }
+    html += '<label style="font-size:0.75rem">Model</label>';
+    if (isAnthro) {
+      html += '<select data-prov="' + esc(name) + '" data-field="model" style="width:100%;padding:4px 8px;border:1px solid var(--border);border-radius:4px;font-size:0.8rem">';
+      for (const m of ['claude-sonnet-4-20250514','claude-haiku-4-5-20251001','claude-opus-4-20250514']) {
+        html += '<option value="' + m + '"' + (prov.model === m ? ' selected' : '') + '>' + m.replace(/-20[0-9]+$/, '') + '</option>';
+      }
+      html += '</select>';
+    } else {
+      html += '<input type="text" data-prov="' + esc(name) + '" data-field="model" value="' + esc(prov.model || '') + '" placeholder="model-id" style="width:100%;padding:4px 8px;border:1px solid var(--border);border-radius:4px;font-size:0.8rem">';
+    }
+    html += '</div>';
+  }
+  container.innerHTML = html;
+}
+
+function _addProvider() {
+  const name = prompt('Provider name (e.g. "runpod", "ollama"):');
+  if (!name || _settingsProviders[name]) return;
+  const type = prompt('Type: "anthropic" or "openai_compat":', 'openai_compat');
+  if (type !== 'anthropic' && type !== 'openai_compat') return;
+  _settingsProviders[name] = { type, api_key: '', model: '', base_url: type === 'openai_compat' ? '' : undefined };
+  _renderProviderList();
+  _rebuildActiveDropdown();
+}
+
+function _removeProvider(name) {
+  delete _settingsProviders[name];
+  _renderProviderList();
+  _rebuildActiveDropdown();
+}
+
+function _onActiveProviderChange() {}
+
 function hideSettings() {
   document.getElementById('settings-overlay').classList.remove('visible');
 }
+
 async function saveSettings() {
-  const apiKey = document.getElementById('settings-api-key').value.trim();
-  const model = document.getElementById('settings-model').value;
-  const body = { model };
-  // Only send api key if user typed a full key (not the redacted placeholder)
-  if (apiKey && !apiKey.includes('...')) {
-    body.anthropic_api_key = apiKey;
-  }
+  // Read values from DOM back into _settingsProviders
+  document.querySelectorAll('#provider-list [data-prov]').forEach(el => {
+    const name = el.dataset.prov;
+    const field = el.dataset.field;
+    if (_settingsProviders[name]) {
+      const val = el.value.trim();
+      if (field === 'api_key' && val.includes('...')) return; // Skip redacted
+      _settingsProviders[name][field] = val;
+    }
+  });
+  const activeProvider = document.getElementById('settings-active-provider').value;
+  const body = {
+    providers: _settingsProviders,
+    active_provider: activeProvider,
+  };
   try {
     await fetch('/api/config', {
       method: 'PUT',
@@ -3808,6 +4653,7 @@ function _showChatOverlay(todoId) {
   const todo = allTodos.find(t => t.id === todoId);
   const title = todo ? _parseTitle(todo.title || '').displayTitle : todoId;
   document.getElementById('chat-title').textContent = title;
+  _updateProviderBadge();
 
   const overlay = document.getElementById('chat-overlay');
   overlay.style.display = 'flex';
@@ -3819,6 +4665,25 @@ function _showChatOverlay(todoId) {
   input.value = '';
   input.focus();
   _syncChatSendBtn(todoId);
+}
+
+async function _updateProviderBadge() {
+  const badge = document.getElementById('chat-provider-badge');
+  if (!badge) return;
+  try {
+    const res = await fetch('/api/config');
+    const config = await res.json();
+    const name = config._active_provider_name || 'local';
+    const type = config._active_provider_type || 'local';
+    const providers = config.providers || {};
+    const prov = providers[name] || {};
+    let label = name;
+    if (type === 'anthropic') label = (prov.model || 'claude').replace(/-20[0-9]+$/, '');
+    else if (type === 'openai_compat') label = name + ': ' + (prov.model || 'default');
+    badge.textContent = label;
+  } catch {
+    badge.textContent = '';
+  }
 }
 
 function _syncChatSendBtn(todoId) {
@@ -3970,6 +4835,7 @@ function _streamChatResponse(todoId, jobId) {
 
   const es = new EventSource('/api/jobs/' + jobId + '/stream');
   let textDiv = null;
+  let currentBlockText = ''; // text for the current block only (resets after tool calls)
 
   // Check if this stream is still the active one for this todo
   function isStale() {
@@ -4002,26 +4868,36 @@ function _streamChatResponse(todoId, jobId) {
     const streamEl = document.getElementById('chat-assistant-streaming');
 
     if (streamEl) {
-      if (line.startsWith('\u25b6 ')) {
+      if (line.startsWith('error:') || line.startsWith('error ')) {
+        const div = document.createElement('div');
+        div.style.cssText = 'color:#ef4444;font-size:0.8rem;padding:6px 10px;background:rgba(239,68,68,0.08);border-radius:6px;border-left:3px solid #ef4444;margin:4px 0;white-space:pre-wrap;word-break:break-word';
+        div.textContent = line;
+        streamEl.appendChild(div);
+        textDiv = null;
+        currentBlockText = '';
+      } else if (line.startsWith('\u25b6 ')) {
         const div = document.createElement('div');
         div.className = 'chat-tool-line';
         div.textContent = line;
         streamEl.appendChild(div);
         textDiv = null;
+        currentBlockText = ''; // reset for next text block
       } else if (line.startsWith('\u2713 Done')) {
         const div = document.createElement('div');
         div.className = 'chat-cost-line';
         div.textContent = line;
         streamEl.appendChild(div);
         textDiv = null;
+        currentBlockText = '';
       } else {
         cur.streamingText += (cur.streamingText ? '\n' : '') + line;
+        currentBlockText += (currentBlockText ? '\n' : '') + line;
         if (!textDiv || !textDiv.parentNode) {
           textDiv = document.createElement('div');
           textDiv.className = 'chat-assistant-block';
           streamEl.appendChild(textDiv);
         }
-        textDiv.innerHTML = renderMd(cur.streamingText);
+        textDiv.innerHTML = renderMd(currentBlockText);
       }
     } else {
       // Panel is minimized — just accumulate text
@@ -6011,6 +6887,7 @@ window.addEventListener('scroll', () => {
     <div style="height:12px;cursor:ns-resize;flex-shrink:0;display:flex;justify-content:center;align-items:center;touch-action:none" onmousedown="_startChatResize(event)" ontouchstart="_startChatResize(event)"><span style="width:40px;height:4px;border-radius:2px;background:rgba(255,255,255,0.25)"></span></div>
     <div style="display:flex;align-items:center;padding:6px 14px 10px;gap:10px;border-bottom:1px solid rgba(255,255,255,0.1);flex-shrink:0;cursor:ns-resize;touch-action:none" onmousedown="_startChatResize(event)" ontouchstart="_startChatResize(event)">
       <span id="chat-title" style="color:#e2e8f0;font-size:0.85rem;font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+      <span id="chat-provider-badge" style="font-size:0.65rem;color:rgba(255,255,255,0.45);background:rgba(255,255,255,0.08);padding:2px 7px;border-radius:4px;white-space:nowrap;flex-shrink:0;opacity:0;transition:opacity 0.15s" onmouseenter="this.style.opacity='1'" onmouseleave="this.style.opacity='0'"></span>
       <button onclick="if(_activeChatTodoId){document.getElementById('chat-input').value='/ea checkon '+_activeChatTodoId;sendChatMessage(_activeChatTodoId)}" style="background:rgba(255,255,255,0.1);border:none;color:#e2e8f0;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem" onmousedown="event.stopPropagation()">Check On</button>
       <button onclick="if(_activeChatTodoId){document.getElementById('chat-input').value='/compact';sendChatMessage(_activeChatTodoId)}" style="background:rgba(255,255,255,0.1);border:none;color:#e2e8f0;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem" onmousedown="event.stopPropagation()">Compact</button>
       <button onclick="restartChat()" style="background:rgba(255,255,255,0.1);border:none;color:#e2e8f0;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem" onmousedown="event.stopPropagation()">Restart</button>
@@ -6046,6 +6923,19 @@ if __name__ == "__main__":
     if not os.path.exists(TODO_FILE):
         _write_todo_file(TODO_FILE, [])
         print(f"Created new todo file: {TODO_FILE}")
+
+    # Ensure config directory exists (migrates flat file if needed, seeds context)
+    _ensure_config_dir()
+
+    # Start MCP servers (only in the reloader's main process to avoid double-init)
+    if os.environ.get("WERKZEUG_RUN_MAIN") == "true" or not os.environ.get("WERKZEUG_RUN_MAIN"):
+        config = _load_config()
+        mcp_servers = config.get("mcp_servers", {})
+        if mcp_servers and ClientSessionGroup:
+            _mcp_manager = MCPManager()
+            _mcp_manager.start(mcp_servers, config.get("tokens", {}))
+            import atexit
+            atexit.register(_mcp_manager.stop)
 
     # Recover any existing tmux sessions from a previous server run
     _tmux_recover_sessions()
