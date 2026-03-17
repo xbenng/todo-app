@@ -26,6 +26,7 @@ import termios
 import struct
 import select as _select
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from flask import Flask, request, jsonify, Response
 from flask_sock import Sock
@@ -1047,9 +1048,9 @@ def _run_claude_job(job_id: str, prompt: str, cwd: str):
 # Server-side agentic loop (Anthropic SDK)
 # ---------------------------------------------------------------------------
 
-def _get_tool_definitions() -> list[dict]:
+def _get_tool_definitions(depth: int = 0) -> list[dict]:
     """Return Claude API tool definitions for server-side tools."""
-    return [
+    tools = [
         {
             "name": "read_todos",
             "description": "Read all todo items (active and completed). Returns a JSON array of todo objects with id, title, description, status, priority, and section fields.",
@@ -1118,10 +1119,43 @@ def _get_tool_definitions() -> list[dict]:
             }
         },
     ]
+    config = _load_config()
+    if depth < 2 and config.get("subagents_enabled", True):
+        tools.append({
+            "name": "spawn_agents",
+            "description": "Launch one or more subagents in parallel. Each subagent gets its own prompt, "
+                           "runs independently with full tool access (including MCP), and returns results. "
+                           "Use for parallelizing independent tasks like sweeping Slack, email, and calendar simultaneously. "
+                           "This is the 'Agent tool' referenced in the EA skill instructions.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "agents": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "prompt": {"type": "string", "description": "Complete instructions for this subagent. Include all context it needs — it has no access to the parent conversation."},
+                                "label": {"type": "string", "description": "Short label for progress output (e.g., 'Slack sweep')."},
+                                "model": {"type": "string", "description": "Optional model override (e.g., 'haiku', 'sonnet', or a full model ID). Defaults to the parent's model."}
+                            },
+                            "required": ["prompt"]
+                        },
+                        "description": "Array of agent specs to launch in parallel."
+                    }
+                },
+                "required": ["agents"]
+            }
+        })
+    return tools
 
 
-def _execute_tool(name: str, input_data: dict, todo_id: str | None) -> str:
-    """Execute a server-side tool and return the result as a string."""
+def _execute_tool(name: str, input_data: dict, todo_id: str | None,
+                  agent_context: dict | None = None) -> str:
+    """Execute a server-side tool and return the result as a string.
+
+    agent_context: {job_id, provider, depth} — passed when called from ChatAgent.
+    """
     try:
         if name == "read_todos":
             active = _parse_todo_file(TODO_FILE)
@@ -1188,6 +1222,19 @@ def _execute_tool(name: str, input_data: dict, todo_id: str | None) -> str:
             chat = chats.get(tid, {"messages": []})
             return json.dumps(chat.get("messages", [])[-20:], ensure_ascii=False)
 
+        elif name == "spawn_agents":
+            if not agent_context:
+                return json.dumps({"error": "spawn_agents requires agent context"})
+            agents = input_data.get("agents", [])
+            if not agents:
+                return json.dumps({"error": "No agents specified"})
+            if len(agents) > 10:
+                return json.dumps({"error": "Maximum 10 parallel agents"})
+            depth = agent_context.get("depth", 0)
+            if depth >= 2:
+                return json.dumps({"error": "Maximum agent nesting depth reached"})
+            return _execute_spawn_agents(agents, agent_context, todo_id)
+
         else:
             # Delegate to MCP if it's an MCP tool
             if _mcp_manager and _mcp_manager.is_mcp_tool(name):
@@ -1196,6 +1243,193 @@ def _execute_tool(name: str, input_data: dict, todo_id: str | None) -> str:
 
     except Exception as exc:
         return json.dumps({"error": str(exc)})
+
+
+_MODEL_ALIASES = {
+    "haiku": "claude-haiku-4-5-20251001",
+    "sonnet": "claude-sonnet-4-20250514",
+    "opus": "claude-opus-4-20250514",
+}
+
+
+def _execute_spawn_agents(agents: list[dict], agent_context: dict, todo_id: str | None) -> str:
+    """Launch subagents in parallel and return their results."""
+    job_id = agent_context["job_id"]
+    provider = agent_context["provider"]
+    depth = agent_context.get("depth", 0)
+
+    _jobs[job_id]["output_lines"].append(f"⚡ Launching {len(agents)} subagent(s)...")
+
+    results = []
+    with ThreadPoolExecutor(max_workers=min(len(agents), 8)) as executor:
+        futures = {}
+        for i, spec in enumerate(agents):
+            label = spec.get("label", f"agent-{i+1}")
+            model_override = spec.get("model")
+            if model_override and model_override in _MODEL_ALIASES:
+                model_override = _MODEL_ALIASES[model_override]
+            future = executor.submit(
+                _run_subagent,
+                job_id=job_id, todo_id=todo_id, provider=provider,
+                prompt=spec["prompt"], label=label, depth=depth + 1,
+                model_override=model_override,
+            )
+            futures[future] = label
+
+        for future in as_completed(futures, timeout=600):
+            try:
+                result = future.result(timeout=300)
+                results.append(result)
+            except Exception as exc:
+                results.append({
+                    "label": futures[future], "result": "",
+                    "error": str(exc), "input_tokens": 0, "output_tokens": 0,
+                })
+
+    total_in = sum(r.get("input_tokens", 0) for r in results)
+    total_out = sum(r.get("output_tokens", 0) for r in results)
+    _jobs[job_id]["output_lines"].append(
+        f"✓ All {len(results)} subagent(s) complete (tokens: {total_in}+{total_out})"
+    )
+    return json.dumps({"agents": results}, ensure_ascii=False)
+
+
+def _run_subagent(job_id: str, todo_id: str | None, provider: dict,
+                  prompt: str, label: str, depth: int,
+                  model_override: str | None = None) -> dict:
+    """Run a single subagent to completion. Returns {label, result, error, tokens}."""
+    sub_provider = dict(provider)
+    if model_override:
+        sub_provider["model"] = model_override
+    ptype = sub_provider.get("type", "local")
+    model = sub_provider.get("model", "claude-sonnet-4-20250514")
+    job = _jobs[job_id]
+
+    def emit(line: str):
+        if line.strip():
+            job["output_lines"].append(f"[{label}] {line}")
+
+    emit(f"Starting ({model})...")
+    result_lines = []
+    total_input = 0
+    total_output = 0
+
+    try:
+        system_prompt = _build_system_prompt(todo_id)
+        messages_api = [{"role": "user", "content": prompt}]
+        tools = _get_tool_definitions(depth)
+        if _mcp_manager:
+            tools = tools + _mcp_manager.get_tool_definitions()
+        agent_ctx = {"job_id": job_id, "provider": sub_provider, "depth": depth}
+
+        if ptype == "anthropic":
+            api_key = sub_provider.get("api_key")
+            if not api_key or not anthropic:
+                return {"label": label, "result": "", "error": "Anthropic API not configured",
+                        "input_tokens": 0, "output_tokens": 0}
+            client = anthropic.Anthropic(api_key=api_key)
+
+            for _ in range(20):
+                if job["status"] == "killed":
+                    return {"label": label, "result": "\n".join(result_lines),
+                            "error": "killed", "input_tokens": total_input, "output_tokens": total_output}
+                response = client.messages.create(
+                    model=model, system=system_prompt, messages=messages_api,
+                    max_tokens=8192, tools=tools,
+                )
+                if response.usage:
+                    total_input += response.usage.input_tokens
+                    total_output += response.usage.output_tokens
+
+                for block in response.content:
+                    if block.type == "text" and block.text.strip():
+                        for ln in block.text.strip().splitlines():
+                            emit(ln)
+                            result_lines.append(ln)
+
+                if response.stop_reason == "tool_use":
+                    tool_results = []
+                    assistant_content = []
+                    for block in response.content:
+                        if block.type == "text":
+                            assistant_content.append({"type": "text", "text": block.text})
+                        elif block.type == "tool_use":
+                            assistant_content.append({
+                                "type": "tool_use", "id": block.id,
+                                "name": block.name, "input": block.input
+                            })
+                            emit(f"▶ {block.name}...")
+                            result = _execute_tool(block.name, block.input, todo_id, agent_ctx)
+                            tool_results.append({
+                                "type": "tool_result", "tool_use_id": block.id, "content": result
+                            })
+                    messages_api.append({"role": "assistant", "content": assistant_content})
+                    messages_api.append({"role": "user", "content": tool_results})
+                    continue
+                break
+
+        elif ptype == "openai_compat":
+            base_url = sub_provider.get("base_url")
+            api_key = sub_provider.get("api_key", "none")
+            if not base_url or not openai_mod:
+                return {"label": label, "result": "", "error": "OpenAI endpoint not configured",
+                        "input_tokens": 0, "output_tokens": 0}
+            client = openai_mod.OpenAI(base_url=base_url, api_key=api_key)
+            oai_messages = [{"role": "system", "content": system_prompt},
+                            {"role": "user", "content": prompt}]
+            oai_tools = [{
+                "type": "function",
+                "function": {"name": t["name"], "description": t.get("description", ""),
+                             "parameters": t.get("input_schema", {"type": "object", "properties": {}})}
+            } for t in tools]
+            max_tokens = min(sub_provider.get("max_tokens", 4096), 4096)
+
+            for _ in range(20):
+                if job["status"] == "killed":
+                    return {"label": label, "result": "\n".join(result_lines),
+                            "error": "killed", "input_tokens": total_input, "output_tokens": total_output}
+                kwargs = {"model": model, "messages": oai_messages, "max_tokens": max_tokens}
+                if oai_tools and sub_provider.get("tool_use", True):
+                    kwargs["tools"] = oai_tools
+                resp = client.chat.completions.create(**kwargs)
+                if resp.usage:
+                    total_input += resp.usage.prompt_tokens or 0
+                    total_output += resp.usage.completion_tokens or 0
+                choice = resp.choices[0]
+                msg = choice.message
+                if msg.content:
+                    cleaned = _strip_think_tags(msg.content)
+                    if cleaned:
+                        for ln in cleaned.splitlines():
+                            emit(ln)
+                            result_lines.append(ln)
+                if msg.tool_calls:
+                    assistant_msg = {"role": "assistant", "content": msg.content or ""}
+                    assistant_msg["tool_calls"] = [
+                        {"id": tc.id, "type": "function",
+                         "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                        for tc in msg.tool_calls
+                    ]
+                    oai_messages.append(assistant_msg)
+                    for tc in msg.tool_calls:
+                        emit(f"▶ {tc.function.name}...")
+                        try:
+                            args = json.loads(tc.function.arguments)
+                        except json.JSONDecodeError:
+                            args = {}
+                        result = _execute_tool(tc.function.name, args, todo_id, agent_ctx)
+                        oai_messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+                    continue
+                break
+
+        emit("Done.")
+        return {"label": label, "result": "\n".join(result_lines), "error": None,
+                "input_tokens": total_input, "output_tokens": total_output}
+
+    except Exception as exc:
+        emit(f"Error: {str(exc)[:200]}")
+        return {"label": label, "result": "\n".join(result_lines), "error": str(exc),
+                "input_tokens": total_input, "output_tokens": total_output}
 
 
 def _build_system_prompt(todo_id: str | None) -> str:
@@ -1245,9 +1479,9 @@ def _strip_think_tags(text: str) -> str:
     return re.sub(r'<think>[\s\S]*?</think>\s*', '', text).strip()
 
 
-def _openai_tool_defs() -> list[dict]:
+def _openai_tool_defs(depth: int = 0) -> list[dict]:
     """Convert Anthropic-format tool definitions to OpenAI function-calling format."""
-    tools = _get_tool_definitions()
+    tools = _get_tool_definitions(depth)
     if _mcp_manager:
         tools = tools + _mcp_manager.get_tool_definitions()
     return [{
@@ -1268,12 +1502,13 @@ class ChatAgent:
     and _call_openai.
     """
 
-    def __init__(self, job_id: str, todo_id: str | None, provider: dict):
+    def __init__(self, job_id: str, todo_id: str | None, provider: dict, depth: int = 0):
         self.job_id = job_id
         self.todo_id = todo_id
         self.provider = provider
         self.ptype = provider.get("type", "local")
         self.model = provider.get("model", "claude-sonnet-4-20250514")
+        self.depth = depth
         self.assistant_text_lines: list[str] = []
         self.total_input_tokens = 0
         self.total_output_tokens = 0
@@ -1305,13 +1540,13 @@ class ChatAgent:
         return messages
 
     def _get_tools_anthropic(self) -> list[dict]:
-        tools = _get_tool_definitions()
+        tools = _get_tool_definitions(self.depth)
         if _mcp_manager:
             tools = tools + _mcp_manager.get_tool_definitions()
         return tools
 
     def _get_tools_openai(self) -> list[dict]:
-        return _openai_tool_defs()
+        return _openai_tool_defs(self.depth)
 
     def _persist_response(self) -> None:
         """Persist assistant response to chats file and mark unread."""
@@ -1405,7 +1640,8 @@ class ChatAgent:
                             "type": "tool_use", "id": block.id,
                             "name": block.name, "input": block.input
                         })
-                        result = _execute_tool(block.name, block.input, self.todo_id)
+                        result = _execute_tool(block.name, block.input, self.todo_id,
+                                              agent_context={"job_id": self.job_id, "provider": self.provider, "depth": self.depth})
                         tool_results.append({
                             "type": "tool_result",
                             "tool_use_id": block.id,
@@ -1470,7 +1706,8 @@ class ChatAgent:
                         args = json.loads(tc.function.arguments)
                     except json.JSONDecodeError:
                         args = {}
-                    result = _execute_tool(tc.function.name, args, self.todo_id)
+                    result = _execute_tool(tc.function.name, args, self.todo_id,
+                                          agent_context={"job_id": self.job_id, "provider": self.provider, "depth": self.depth})
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
                 continue
             break  # No tool calls — done
@@ -1994,7 +2231,7 @@ def put_config():
     data = request.json or {}
     config = _load_config()
     # Merge provided fields (legacy + new)
-    for key in ("anthropic_api_key", "model", "mcp_servers", "openai_compat", "active_provider"):
+    for key in ("anthropic_api_key", "model", "mcp_servers", "openai_compat", "active_provider", "subagents_enabled"):
         if key in data:
             config[key] = data[key]
     if "providers" in data and isinstance(data["providers"], dict):
@@ -3210,6 +3447,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <hr style="border:none;border-top:1px solid var(--border);margin:16px 0 12px">
     <button class="btn btn-sm" onclick="_addProvider()" style="border:1px solid var(--border);width:100%">+ Add Provider</button>
     <hr style="border:none;border-top:1px solid var(--border);margin:16px 0 12px">
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.82rem;font-weight:600;margin:0">
+      <input type="checkbox" id="settings-subagents" style="margin:0"> Enable subagents (parallel tool execution)
+    </label>
+    <div class="settings-hint">Allow the model to spawn parallel subagents for tasks like /ea update and /ea triage.</div>
+    <hr style="border:none;border-top:1px solid var(--border);margin:16px 0 12px">
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
       <span style="font-size:0.82rem;font-weight:600">MCP Servers</span>
       <button class="btn btn-sm" onclick="_refreshMcp()" style="border:1px solid var(--border);font-size:0.7rem;padding:2px 8px">Reconnect</button>
@@ -4330,6 +4572,7 @@ async function showSettings() {
     const sel = document.getElementById('settings-active-provider');
     _rebuildActiveDropdown();
     sel.value = config.active_provider || config._active_provider_name || '';
+    document.getElementById('settings-subagents').checked = config.subagents_enabled !== false;
   } catch {}
   _loadMcpStatus();
   _loadGitLog();
@@ -4521,6 +4764,7 @@ async function saveSettings() {
   const body = {
     providers: _settingsProviders,
     active_provider: activeProvider,
+    subagents_enabled: document.getElementById('settings-subagents').checked,
   };
   try {
     await fetch('/api/config', {
