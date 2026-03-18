@@ -284,6 +284,10 @@ class MCPManager:
 _mcp_managers: dict[str, MCPManager] = {}  # user_id -> MCPManager
 _mcp_managers_lock = threading.Lock()
 
+# Runtime tool approval: approval_id -> {event, approved, server_name, tool_name}
+_pending_approvals: dict[str, dict] = {}
+_approvals_lock = threading.Lock()
+
 
 def _get_mcp_manager(user_id: str | None = None) -> MCPManager | None:
     """Get or lazily create an MCPManager for the given user.
@@ -306,7 +310,14 @@ def _get_mcp_manager(user_id: str | None = None) -> MCPManager | None:
     else:
         config = _load_config()
     tokens = config.get("tokens", {})
-    mcp_configs = _build_mcp_configs_from_registry(registry, tokens)
+    # Only connect servers the user has enabled
+    enabled_servers = None
+    if _USE_DB and user_id and user_id != "local":
+        prefs = _db.get_mcp_preferences(user_id)
+        enabled_servers = {name for name, p in prefs.items() if p["enabled"]}
+        if not enabled_servers:
+            return None  # No servers enabled
+    mcp_configs = _build_mcp_configs_from_registry(registry, tokens, enabled_servers)
     if not mcp_configs:
         return None
     mgr = MCPManager()
@@ -318,6 +329,97 @@ def _get_mcp_manager(user_id: str | None = None) -> MCPManager | None:
             return _mcp_managers[uid]
         _mcp_managers[uid] = mgr
     return mgr
+
+
+def _get_mcp_tools(user_id: str | None = None) -> list[dict]:
+    """Get filtered MCP tool definitions, excluding registry + per-user disabled tools."""
+    mgr = _get_mcp_manager(user_id)
+    if not mgr:
+        return []
+    tools = mgr.get_tool_definitions()
+    registry = _load_mcp_registry()
+    # Build set of excluded tool names (registry-level)
+    excluded = set()
+    if registry:
+        for server_name, entry in registry.items():
+            for tool_name in entry.get("exclude_tools", []):
+                excluded.add(f"mcp__{server_name}__{tool_name}")
+    # Add per-user disabled tools
+    if _USE_DB and user_id and user_id != "local":
+        prefs = _db.get_mcp_preferences(user_id)
+        for server_name, pref in prefs.items():
+            for tool_name in pref.get("disabled_tools", []):
+                excluded.add(f"mcp__{server_name}__{tool_name}")
+    if not excluded:
+        return tools
+    return [t for t in tools if t["name"] not in excluded]
+
+
+def _parse_mcp_tool_name(name: str) -> tuple[str, str] | None:
+    """Parse 'mcp__{server}__{tool}' → (server, tool), or None."""
+    if not name.startswith("mcp__"):
+        return None
+    parts = name.split("__", 2)
+    if len(parts) == 3:
+        return parts[1], parts[2]
+    return None
+
+
+def _check_tool_permission(user_id: str, tool_name: str, input_data: dict,
+                           agent_context: dict | None) -> str:
+    """Check if an MCP tool is auto-approved or needs user confirmation.
+
+    Returns 'approved', 'denied', or blocks until user responds.
+    """
+    # Global bypass
+    config = _db.get_config(user_id)
+    if config.get("auto_approve_all"):
+        return "approved"
+
+    parsed = _parse_mcp_tool_name(tool_name)
+    if not parsed:
+        return "approved"  # Not an MCP tool, always allow
+    server_name, bare_tool = parsed
+
+    # Check per-tool auto-approval
+    prefs = _db.get_mcp_preferences(user_id)
+    server_pref = prefs.get(server_name, {})
+    if bare_tool in server_pref.get("auto_approved_tools", []):
+        return "approved"
+
+    # Need user approval — emit SSE event and block
+    approval_id = str(uuid.uuid4())[:8]
+    event = threading.Event()
+    with _approvals_lock:
+        _pending_approvals[approval_id] = {
+            "event": event,
+            "approved": None,
+            "server_name": server_name,
+            "tool_name": bare_tool,
+        }
+
+    # Emit approval request to the job's SSE stream
+    job_id = agent_context.get("job_id") if agent_context else None
+    if job_id and job_id in _jobs:
+        approval_msg = json.dumps({
+            "__tool_approval__": True,
+            "approval_id": approval_id,
+            "tool": tool_name,
+            "tool_display": bare_tool,
+            "server": server_name,
+            "args": input_data,
+        })
+        _jobs[job_id]["output_lines"].append(approval_msg)
+
+    # Block until user responds (timeout after 5 minutes)
+    event.wait(timeout=300)
+
+    with _approvals_lock:
+        result = _pending_approvals.pop(approval_id, {})
+
+    if result.get("approved") is True:
+        return "approved"
+    return "denied"
 
 
 def _completed_file_path(path: str) -> str:
@@ -366,9 +468,8 @@ _CONTEXT_SEED_FILES = [
     ("claude.md", "~/.claude/CLAUDE.md"),
     ("communication-style.md", "~/.claude/communication-style.md"),
     ("org.md", "~/.claude/org.md"),
-    ("status-index.md", "~/.claude/status-index.md"),
 ]
-_MEMORY_INDEX_PATH = "~/.claude/projects/-Users-ben-ng-Projects/memory/MEMORY.md"
+_MEMORY_INDEX_PATH = ""  # Disabled — memory context is not seeded
 
 
 def _config_dir_path() -> str:
@@ -458,11 +559,14 @@ def _load_mcp_registry() -> dict:
         return {}
 
 
-def _build_mcp_configs_from_registry(registry: dict, tokens: dict) -> dict:
+def _build_mcp_configs_from_registry(registry: dict, tokens: dict,
+                                     enabled_servers: set | None = None) -> dict:
     """Convert registry.json entries + user tokens into MCPManager-compatible server_configs."""
     app_dir = os.path.dirname(os.path.abspath(__file__))
     server_configs = {}
     for name, entry in registry.items():
+        if enabled_servers is not None and name not in enabled_servers:
+            continue
         server_type = entry.get("type", "stdio")
         if server_type == "stdio":
             env = dict(entry.get("static_env", {}))
@@ -1520,11 +1624,15 @@ def _execute_tool(name: str, input_data: dict, todo_id: str | None,
 
         else:
             # Delegate to MCP if it's an MCP tool
-            user_id = None
-            if agent_context and agent_context.get("job_id"):
+            if not user_id and agent_context and agent_context.get("job_id"):
                 user_id = _jobs.get(agent_context["job_id"], {}).get("user_id")
             mgr = _get_mcp_manager(user_id)
             if mgr and mgr.is_mcp_tool(name):
+                # Check runtime permission before executing
+                if _USE_DB and user_id and user_id != "local":
+                    permission = _check_tool_permission(user_id, name, input_data, agent_context)
+                    if permission == "denied":
+                        return json.dumps({"error": f"Tool '{name}' was denied by the user"})
                 return mgr.call_tool(name, input_data)
             return json.dumps({"error": f"Unknown tool: {name}"})
 
@@ -1591,12 +1699,10 @@ def _run_subagent(job_id: str, todo_id: str | None, provider: dict,
     total_output = 0
 
     try:
-        system_prompt = _build_system_prompt(todo_id)
+        system_prompt = _build_system_prompt(todo_id, job.get("user_id"))
         messages_api = [{"role": "user", "content": prompt}]
         tools = _get_tool_definitions(depth)
-        mgr = _get_mcp_manager(job.get("user_id"))
-        if mgr:
-            tools = tools + mgr.get_tool_definitions()
+        tools = tools + _get_mcp_tools(job.get("user_id"))
         agent_ctx = {"job_id": job_id, "provider": provider, "depth": depth}
 
         if ptype == "anthropic":
@@ -1709,37 +1815,52 @@ def _run_subagent(job_id: str, todo_id: str | None, provider: dict,
                 "input_tokens": total_input, "output_tokens": total_output}
 
 
-def _build_system_prompt(todo_id: str | None) -> str:
-    """Build a system prompt from config directory files."""
-    config_dir = _config_dir_path()
+def _build_system_prompt(todo_id: str | None, user_id: str | None = None) -> str:
+    """Build a system prompt from per-user DB config or file-based fallback."""
     parts = []
 
-    # 1. Base system prompt
-    prompt_path = os.path.join(config_dir, "system-prompt.md")
-    if os.path.exists(prompt_path):
-        try:
-            with open(prompt_path, "r", encoding="utf-8") as f:
-                content = f.read().strip()
-            if content:
-                parts.append(content)
-        except OSError:
-            pass
-    if not parts:
-        parts.append(_DEFAULT_SYSTEM_PROMPT.strip())
-
-    # 2. Context files (alphabetical)
-    context_dir = os.path.join(config_dir, "context")
-    if os.path.isdir(context_dir):
-        for name in sorted(os.listdir(context_dir)):
-            if name.endswith(".md"):
-                fp = os.path.join(context_dir, name)
-                try:
-                    with open(fp, "r", encoding="utf-8") as f:
-                        content = f.read().strip()
-                    if content:
-                        parts.append(f"# {name}\n{content}")
-                except OSError:
-                    pass
+    if _USE_DB and user_id:
+        config = _db.get_config(user_id)
+        # 1. Base system prompt from DB
+        sp = config.get("system_prompt")
+        if sp and sp.strip():
+            parts.append(sp.strip())
+        else:
+            parts.append(_DEFAULT_SYSTEM_PROMPT.strip())
+        # 2. Context files from user_context_files table
+        ctx = _db.get_context_files(user_id)
+        for name in sorted(ctx.keys()):
+            content = ctx[name]
+            if content and content.strip():
+                parts.append(f"# {name}\n{content.strip()}")
+    else:
+        # File-based fallback
+        config_dir = _config_dir_path()
+        # 1. Base system prompt
+        prompt_path = os.path.join(config_dir, "system-prompt.md")
+        if os.path.exists(prompt_path):
+            try:
+                with open(prompt_path, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                if content:
+                    parts.append(content)
+            except OSError:
+                pass
+        if not parts:
+            parts.append(_DEFAULT_SYSTEM_PROMPT.strip())
+        # 2. Context files from disk
+        context_dir = os.path.join(config_dir, "context")
+        if os.path.isdir(context_dir):
+            for name in sorted(os.listdir(context_dir)):
+                if name.endswith(".md"):
+                    fp = os.path.join(context_dir, name)
+                    try:
+                        with open(fp, "r", encoding="utf-8") as f:
+                            content = f.read().strip()
+                        if content:
+                            parts.append(f"# {name}\n{content}")
+                    except OSError:
+                        pass
 
     # 3. Current date
     parts.append(f"Today's date is {datetime.now().strftime('%Y-%m-%d')}.")
@@ -1759,9 +1880,7 @@ def _strip_think_tags(text: str) -> str:
 def _openai_tool_defs(depth: int = 0, user_id: str | None = None) -> list[dict]:
     """Convert Anthropic-format tool definitions to OpenAI function-calling format."""
     tools = _get_tool_definitions(depth)
-    mgr = _get_mcp_manager(user_id)
-    if mgr:
-        tools = tools + mgr.get_tool_definitions()
+    tools = tools + _get_mcp_tools(user_id)
     return [{
         "type": "function",
         "function": {
@@ -1860,9 +1979,7 @@ class ChatAgent:
 
     def _get_tools_anthropic(self) -> list[dict]:
         tools = _get_tool_definitions(self.depth)
-        mgr = _get_mcp_manager(self.user_id)
-        if mgr:
-            tools = tools + mgr.get_tool_definitions()
+        tools = tools + _get_mcp_tools(self.user_id)
         return tools
 
     def _get_tools_openai(self) -> list[dict]:
@@ -1900,7 +2017,7 @@ class ChatAgent:
         client = anthropic.Anthropic(api_key=api_key)
         messages = self._build_history(message)
         tools = self._get_tools_anthropic()
-        system_prompt = _build_system_prompt(self.todo_id)
+        system_prompt = _build_system_prompt(self.todo_id, self.user_id)
 
         while not self.is_killed():
             text_buf = ""
@@ -1987,7 +2104,7 @@ class ChatAgent:
             return
 
         client = openai_mod.OpenAI(base_url=base_url, api_key=api_key)
-        system_prompt = _build_system_prompt(self.todo_id)
+        system_prompt = _build_system_prompt(self.todo_id, self.user_id)
         messages = [{"role": "system", "content": system_prompt}] + self._build_history(message)
         tools = self._get_tools_openai()
         max_tokens = min(self.provider.get("max_tokens", 4096), 4096)
@@ -2595,7 +2712,7 @@ def put_config():
     else:
         config = _load_config()
     # Merge provided fields (legacy + new)
-    for key in ("anthropic_api_key", "model", "mcp_servers", "openai_compat", "active_provider", "subagents_enabled", "max_subagents"):
+    for key in ("anthropic_api_key", "model", "mcp_servers", "openai_compat", "active_provider", "subagents_enabled", "max_subagents", "auto_approve_all"):
         if key in data:
             config[key] = data[key]
     if "providers" in data and isinstance(data["providers"], dict):
@@ -2617,7 +2734,8 @@ def put_config():
     if _USE_DB and user:
         _db.save_config(user["id"], **{k: v for k, v in config.items()
                         if k in ("providers", "active_provider", "tokens",
-                                 "subagents_enabled", "max_subagents")})
+                                 "subagents_enabled", "max_subagents",
+                                 "auto_approve_all")})
     else:
         _save_config(config)
     return jsonify({"ok": True})
@@ -2625,21 +2743,42 @@ def put_config():
 
 @app.route("/api/mcp/status")
 def mcp_status():
-    """Return status of all MCP servers for the current user."""
+    """Return status of all MCP servers with per-user preferences."""
     user = get_current_user()
     user_id = user["id"] if user else None
-    mgr = _get_mcp_manager(user_id)
-    if not mgr:
-        return jsonify({"servers": [], "available": bool(ClientSessionGroup)})
     registry = _load_mcp_registry()
-    status = mgr.get_status()
+    mgr = _get_mcp_manager(user_id)
+    connected_status = mgr.get_status() if mgr else {}
+    # Load user preferences
+    prefs = {}
+    auto_approve_all = False
+    if _USE_DB and user_id and user_id != "local":
+        prefs = _db.get_mcp_preferences(user_id)
+        config = _db.get_config(user_id)
+        auto_approve_all = config.get("auto_approve_all", False)
     servers = []
-    for name, info in status.items():
-        entry = {"name": name, **info}
-        if name in registry:
-            entry["label"] = registry[name].get("label", name)
+    for name, reg_entry in registry.items():
+        pref = prefs.get(name, {})
+        entry = {
+            "name": name,
+            "label": reg_entry.get("label", name),
+            "enabled": pref.get("enabled", False),
+            "disabled_tools": pref.get("disabled_tools", []),
+            "auto_approved_tools": pref.get("auto_approved_tools", []),
+        }
+        if name in connected_status:
+            entry["connected"] = connected_status[name].get("connected", False)
+            entry["tool_count"] = connected_status[name].get("tool_count", 0)
+            if "error" in connected_status[name]:
+                entry["error"] = connected_status[name]["error"]
+        else:
+            entry["connected"] = False
         servers.append(entry)
-    return jsonify({"servers": servers, "available": True})
+    return jsonify({
+        "servers": servers,
+        "available": bool(ClientSessionGroup),
+        "auto_approve_all": auto_approve_all,
+    })
 
 
 @app.route("/api/mcp/reconnect", methods=["POST"])
@@ -2655,6 +2794,74 @@ def mcp_reconnect():
     # Next call to _get_mcp_manager will lazy-create a fresh one
     mgr = _get_mcp_manager(user_id)
     return jsonify({"ok": True, "connected": mgr is not None})
+
+
+@app.route("/api/mcp/approve", methods=["POST"])
+def mcp_approve():
+    """Approve or deny a pending tool execution."""
+    data = request.json or {}
+    approval_id = data.get("approval_id", "")
+    approved = data.get("approved", False)
+    always_allow = data.get("always_allow", False)
+
+    with _approvals_lock:
+        pending = _pending_approvals.get(approval_id)
+    if not pending:
+        return jsonify({"error": "No pending approval with that ID"}), 404
+
+    pending["approved"] = approved
+
+    # Persist auto-approval if requested
+    if approved and always_allow:
+        user = get_current_user()
+        if user and _USE_DB:
+            _db.set_tool_auto_approved(
+                user["id"], pending["server_name"], pending["tool_name"], True
+            )
+
+    # Unblock the waiting thread
+    pending["event"].set()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/mcp/servers", methods=["PUT"])
+def mcp_set_server():
+    """Enable or disable an MCP server for the current user."""
+    user = get_current_user()
+    if not user or not _USE_DB:
+        return jsonify({"error": "Not authenticated"}), 401
+    data = request.json or {}
+    server = data.get("server", "")
+    enabled = data.get("enabled", False)
+    registry = _load_mcp_registry()
+    if server not in registry:
+        return jsonify({"error": f"Unknown server: {server}"}), 400
+    _db.set_server_enabled(user["id"], server, enabled)
+    # Reconnect with new server set
+    uid = user["id"]
+    with _mcp_managers_lock:
+        old = _mcp_managers.pop(uid, None)
+    if old:
+        old.stop()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/mcp/tools", methods=["PUT"])
+def mcp_set_tool():
+    """Set tool disabled or auto_approved state."""
+    user = get_current_user()
+    if not user or not _USE_DB:
+        return jsonify({"error": "Not authenticated"}), 401
+    data = request.json or {}
+    server = data.get("server", "")
+    tool = data.get("tool", "")
+    if not server or not tool:
+        return jsonify({"error": "server and tool required"}), 400
+    if "disabled" in data:
+        _db.set_tool_disabled(user["id"], server, tool, data["disabled"])
+    if "auto_approved" in data:
+        _db.set_tool_auto_approved(user["id"], server, tool, data["auto_approved"])
+    return jsonify({"ok": True})
 
 
 # ---------------------------------------------------------------------------
@@ -3009,6 +3216,7 @@ def _terminal_io_loop(ws, master_fd, proc, tmux_target=None):
 @app.route("/api/ea-update", methods=["POST"])
 def ea_update():
     """Run /ea update via ChatAgent."""
+    user = get_current_user()
     data = request.json or {}
     force = data.get("force", False)
 
@@ -3019,13 +3227,15 @@ def ea_update():
         return jsonify({"status": "already_running", "job_id": existing["id"]})
 
     todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
-    job_id = _start_claude_chat_job("EA Update", "ea-update", "/ea update", todo_dir)
+    job_id = _start_claude_chat_job("EA Update", "ea-update", "/ea update", todo_dir,
+                                     user_id=user["id"] if user else None)
     return jsonify({"status": "started", "job_id": job_id})
 
 
 @app.route("/api/ea-update-item", methods=["POST"])
 def ea_update_item():
     """Run /ea checkon <item_id> via ChatAgent."""
+    user = get_current_user()
     data = request.json
     item_id = (data.get("id") or "").strip()
     force = data.get("force", False)
@@ -3039,7 +3249,8 @@ def ea_update_item():
         return jsonify({"status": "already_running", "job_id": existing["id"]})
 
     todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
-    job_id = _start_claude_chat_job(f"Check: {item_id}", job_key, f"/ea checkon {item_id}", todo_dir)
+    job_id = _start_claude_chat_job(f"Check: {item_id}", job_key, f"/ea checkon {item_id}", todo_dir,
+                                     user_id=user["id"] if user else None)
     return jsonify({"status": "started", "job_id": job_id})
 
 
@@ -3593,6 +3804,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .mcp-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
   .mcp-dot.connected { background: #22c55e; }
   .mcp-dot.disconnected { background: #ef4444; }
+  .mcp-dot.disabled { background: #6b7280; }
+  .mcp-server-toggle { width: 36px; height: 20px; border-radius: 10px; border: none; cursor: pointer; position: relative; transition: background 0.2s; flex-shrink: 0; }
+  .mcp-server-toggle.on { background: #22c55e; }
+  .mcp-server-toggle.off { background: #374151; }
+  .mcp-server-toggle::after { content: ''; position: absolute; top: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: left 0.2s; }
+  .mcp-server-toggle.on::after { left: 18px; }
+  .mcp-server-toggle.off::after { left: 2px; }
+  .mcp-tools-list { padding: 4px 0 4px 24px; font-size: 0.75rem; }
+  .mcp-tool-row { display: flex; align-items: center; gap: 6px; padding: 2px 0; color: var(--muted); }
+  .mcp-tool-row .tool-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mcp-tool-btn { font-size: 0.65rem; padding: 1px 6px; border-radius: 4px; border: 1px solid var(--border); background: none; color: var(--subtle); cursor: pointer; }
+  .mcp-tool-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .mcp-tool-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .mcp-tool-btn.danger { border-color: #ef4444; color: #ef4444; }
+  .mcp-tool-btn.danger:hover { background: #ef4444; color: #fff; }
+  .mcp-tool-btn.danger.active { background: #ef4444; color: #fff; }
   .settings-dialog h2 { margin: 0 0 16px; font-size: 1.1rem; }
   .settings-dialog label { display: block; font-size: 0.82rem; font-weight: 600; margin: 12px 0 4px; color: var(--fg); }
   .settings-dialog label:first-of-type { margin-top: 0; }
@@ -3941,6 +4168,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
       <span style="font-size:0.82rem;font-weight:600">MCP Servers</span>
       <button class="btn btn-sm" onclick="_refreshMcp()" style="border:1px solid var(--border);font-size:0.7rem;padding:2px 8px">Reconnect</button>
+      <span style="flex:1"></span>
+      <label style="display:flex;align-items:center;gap:4px;font-size:0.7rem;color:var(--subtle);cursor:pointer;margin:0">
+        <input type="checkbox" id="mcp-auto-approve-all" onchange="_toggleAutoApproveAll(this.checked)">
+        Auto-approve all
+      </label>
     </div>
     <div id="mcp-server-list" style="margin-bottom:8px"></div>
     <hr style="border:none;border-top:1px solid var(--border);margin:16px 0 12px">
@@ -5067,28 +5299,142 @@ async function showSettings() {
   document.getElementById('settings-overlay').classList.add('visible');
 }
 
+let _mcpStatusData = null;
+
 async function _loadMcpStatus() {
   const container = document.getElementById('mcp-server-list');
   if (!container) return;
   try {
     const res = await fetch('/api/mcp/status');
     const data = await res.json();
+    _mcpStatusData = data;
+    // Set global auto-approve checkbox
+    const aaChk = document.getElementById('mcp-auto-approve-all');
+    if (aaChk) aaChk.checked = !!data.auto_approve_all;
     if (!data.servers || data.servers.length === 0) {
       container.innerHTML = '<div style="font-size:0.75rem;color:var(--subtle)">No MCP servers configured.</div>';
       return;
     }
     container.innerHTML = data.servers.map(s => {
-      const dot = s.connected ? 'connected' : 'disconnected';
-      const info = s.connected ? s.tool_count + ' tools' : esc(s.error || 'disconnected');
-      return '<div class="mcp-server-row">'
+      const dot = s.enabled ? (s.connected ? 'connected' : 'disconnected') : 'disabled';
+      const toggleCls = s.enabled ? 'on' : 'off';
+      const info = !s.enabled ? 'disabled' : (s.connected ? s.tool_count + ' tools' : esc(s.error || 'disconnected'));
+      const expandId = 'mcp-tools-' + s.name;
+      let html = '<div class="mcp-server-row">'
+        + '<button class="mcp-server-toggle ' + toggleCls + '" onclick="_toggleMcpServer(\'' + esc(s.name) + '\',' + !s.enabled + ')"></button>'
         + '<span class="mcp-dot ' + dot + '"></span>'
-        + '<strong style="flex-shrink:0">' + esc(s.name) + '</strong>'
-        + '<span style="color:var(--subtle);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(info) + '</span>'
-        + '</div>';
+        + '<strong style="flex-shrink:0">' + esc(s.label || s.name) + '</strong>'
+        + '<span style="color:var(--subtle);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(info) + '</span>';
+      if (s.enabled && s.connected) {
+        html += '<button class="mcp-tool-btn" onclick="document.getElementById(\'' + expandId + '\').style.display=document.getElementById(\'' + expandId + '\').style.display===\'none\'?\'block\':\'none\'" style="font-size:0.65rem">Tools</button>';
+      }
+      html += '</div>';
+      if (s.enabled && s.connected) {
+        html += '<div id="' + expandId + '" class="mcp-tools-list" style="display:none">Loading...</div>';
+      }
+      return html;
     }).join('');
+    // Load tool lists for connected servers
+    data.servers.filter(s => s.enabled && s.connected).forEach(s => _renderMcpTools(s));
   } catch {
     container.innerHTML = '<div style="font-size:0.75rem;color:var(--subtle)">Failed to load MCP status.</div>';
   }
+}
+
+function _renderMcpTools(server) {
+  const el = document.getElementById('mcp-tools-' + server.name);
+  if (!el) return;
+  // Get tool list from the manager (we have tool_count but need names)
+  // Use the status data disabled/auto_approved lists
+  const disabled = new Set(server.disabled_tools || []);
+  const autoApproved = new Set(server.auto_approved_tools || []);
+  // We need tool names — fetch from job definitions or hardcode from status
+  // For now, show the preference controls we have
+  let html = '';
+  if (disabled.size > 0) {
+    html += '<div style="margin-bottom:4px;color:var(--subtle)">Disabled: ' + [...disabled].map(t => '<span style="background:rgba(239,68,68,0.1);padding:1px 4px;border-radius:3px;margin:0 2px">' + esc(t) + ' <button class="mcp-tool-btn" onclick="_setMcpTool(\'' + esc(server.name) + '\',\'' + esc(t) + '\',false,null)" style="font-size:0.6rem;padding:0 3px;margin-left:2px">x</button></span>').join('') + '</div>';
+  }
+  if (autoApproved.size > 0) {
+    html += '<div style="margin-bottom:4px;color:var(--subtle)">Auto-approved: ' + [...autoApproved].map(t => '<span style="background:rgba(34,197,94,0.1);padding:1px 4px;border-radius:3px;margin:0 2px">' + esc(t) + ' <button class="mcp-tool-btn" onclick="_setMcpTool(\'' + esc(server.name) + '\',\'' + esc(t) + '\',null,false)" style="font-size:0.6rem;padding:0 3px;margin-left:2px">x</button></span>').join('') + '</div>';
+  }
+  if (!html) {
+    html = '<div style="color:var(--subtle)">' + server.tool_count + ' tools active. Tool permissions are managed via approval prompts during chat.</div>';
+  }
+  el.innerHTML = html;
+}
+
+async function _toggleMcpServer(name, enabled) {
+  try {
+    await fetch('/api/mcp/servers', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({server: name, enabled})
+    });
+    showToast(enabled ? name + ' enabled' : name + ' disabled');
+    // Wait for server to connect before reloading
+    if (enabled) await new Promise(r => setTimeout(r, 3000));
+    await _loadMcpStatus();
+  } catch { showToast('Failed to toggle server', true); }
+}
+
+async function _setMcpTool(server, tool, disabled, autoApproved) {
+  const body = {server, tool};
+  if (disabled !== null) body.disabled = disabled;
+  if (autoApproved !== null) body.auto_approved = autoApproved;
+  try {
+    await fetch('/api/mcp/tools', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body)
+    });
+    await _loadMcpStatus();
+  } catch { showToast('Failed to update tool', true); }
+}
+
+function _showToolApproval(data, todoId) {
+  const streamEl = document.getElementById('chat-assistant-streaming');
+  if (!streamEl) return;
+  const div = document.createElement('div');
+  div.style.cssText = 'background:rgba(79,110,247,0.08);border:1px solid var(--accent);border-radius:8px;padding:10px 12px;margin:6px 0;font-size:0.8rem';
+  const argsStr = Object.entries(data.args || {}).map(([k,v]) => esc(k) + ': ' + esc(typeof v === 'string' ? v : JSON.stringify(v)).slice(0,80)).join('<br>');
+  div.innerHTML = '<div style="font-weight:600;margin-bottom:6px">' + esc(data.server) + '.' + esc(data.tool_display) + ' wants to run</div>'
+    + (argsStr ? '<div style="color:var(--subtle);font-size:0.75rem;margin-bottom:8px;font-family:monospace">' + argsStr + '</div>' : '')
+    + '<div style="display:flex;gap:6px;align-items:center">'
+    + '<button onclick="_respondToolApproval(\'' + esc(data.approval_id) + '\',true,false,this)" style="background:var(--accent);color:#fff;border:none;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:0.75rem">Approve</button>'
+    + '<button onclick="_respondToolApproval(\'' + esc(data.approval_id) + '\',true,true,this)" style="background:#22c55e;color:#fff;border:none;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:0.75rem">Always Allow</button>'
+    + '<button onclick="_respondToolApproval(\'' + esc(data.approval_id) + '\',false,false,this)" style="background:none;border:1px solid #ef4444;color:#ef4444;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:0.75rem">Deny</button>'
+    + '</div>';
+  streamEl.appendChild(div);
+  const log = document.getElementById('chat-log');
+  if (log) log.scrollTop = log.scrollHeight;
+}
+
+async function _respondToolApproval(approvalId, approved, alwaysAllow, btn) {
+  // Disable all buttons in the parent
+  const parent = btn.closest('div').parentElement;
+  parent.querySelectorAll('button').forEach(b => { b.disabled = true; b.style.opacity = '0.4'; });
+  const statusDiv = document.createElement('div');
+  statusDiv.style.cssText = 'font-size:0.7rem;color:var(--subtle);margin-top:4px';
+  statusDiv.textContent = approved ? (alwaysAllow ? 'Always allowed' : 'Approved') : 'Denied';
+  parent.appendChild(statusDiv);
+  try {
+    await fetch('/api/mcp/approve', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({approval_id: approvalId, approved, always_allow: alwaysAllow})
+    });
+  } catch { showToast('Failed to send approval', true); }
+}
+
+async function _toggleAutoApproveAll(checked) {
+  try {
+    await fetch('/api/config', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({auto_approve_all: checked})
+    });
+    showToast(checked ? 'Auto-approve enabled' : 'Auto-approve disabled');
+  } catch { showToast('Failed to update', true); }
 }
 
 async function _logout() {
@@ -5611,6 +5957,11 @@ function _streamChatResponse(todoId, jobId) {
         cur.conversationId = raw.conversation_id;
       }
       _chatStreamDone(todoId, null, cur ? cur.streamingText : '');
+      return;
+    }
+
+    if (typeof raw === 'object' && raw.__tool_approval__) {
+      _showToolApproval(raw, todoId);
       return;
     }
 

@@ -63,7 +63,7 @@ def _conn():
 
 
 def _run_migrations():
-    """Apply schema if tables don't exist."""
+    """Apply schema if tables don't exist, and run incremental migrations."""
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -71,11 +71,63 @@ def _run_migrations():
                     SELECT FROM information_schema.tables WHERE table_name = 'users'
                 )
             """)
-            if cur.fetchone()[0]:
-                return  # tables exist
+            if not cur.fetchone()[0]:
+                cur.execute(SCHEMA)
+                print("[db] Schema created")
 
-            cur.execute(SCHEMA)
-            print("[db] Schema created")
+            # Incremental migrations
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables WHERE table_name = 'user_context_files'
+                )
+            """)
+            if not cur.fetchone()[0]:
+                cur.execute("""
+                    CREATE TABLE user_context_files (
+                        id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        name        TEXT NOT NULL,
+                        content     TEXT NOT NULL,
+                        created_at  TIMESTAMPTZ DEFAULT now(),
+                        updated_at  TIMESTAMPTZ DEFAULT now(),
+                        UNIQUE(user_id, name)
+                    );
+                    CREATE INDEX idx_context_files_user ON user_context_files(user_id);
+                """)
+                print("[db] Created user_context_files table")
+
+            # Migration: user_mcp_preferences table
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables WHERE table_name = 'user_mcp_preferences'
+                )
+            """)
+            if not cur.fetchone()[0]:
+                cur.execute("""
+                    CREATE TABLE user_mcp_preferences (
+                        user_id             UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        server_name         TEXT NOT NULL,
+                        enabled             BOOLEAN DEFAULT FALSE,
+                        disabled_tools      TEXT[] DEFAULT '{}',
+                        auto_approved_tools TEXT[] DEFAULT '{}',
+                        created_at          TIMESTAMPTZ DEFAULT now(),
+                        updated_at          TIMESTAMPTZ DEFAULT now(),
+                        PRIMARY KEY (user_id, server_name)
+                    );
+                    CREATE INDEX idx_mcp_prefs_user ON user_mcp_preferences(user_id);
+                """)
+                print("[db] Created user_mcp_preferences table")
+
+            # Migration: auto_approve_all column on user_configs
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.columns
+                    WHERE table_name = 'user_configs' AND column_name = 'auto_approve_all'
+                )
+            """)
+            if not cur.fetchone()[0]:
+                cur.execute("ALTER TABLE user_configs ADD COLUMN auto_approve_all BOOLEAN DEFAULT FALSE")
+                print("[db] Added auto_approve_all to user_configs")
 
 
 # ---------------------------------------------------------------------------
@@ -547,7 +599,8 @@ def get_config(user_id: str) -> dict:
         with conn.cursor() as cur:
             cur.execute(
                 """SELECT providers, active_provider, mcp_servers, tokens,
-                          system_prompt, context_files, subagents_enabled, max_subagents
+                          system_prompt, context_files, subagents_enabled, max_subagents,
+                          auto_approve_all
                    FROM user_configs WHERE user_id = %s""",
                 (user_id,),
             )
@@ -555,7 +608,8 @@ def get_config(user_id: str) -> dict:
             if not r:
                 return {"providers": {}, "active_provider": "local", "mcp_servers": {},
                         "tokens": {}, "system_prompt": None, "context_files": {},
-                        "subagents_enabled": True, "max_subagents": 10}
+                        "subagents_enabled": True, "max_subagents": 10,
+                        "auto_approve_all": False}
             return {
                 "providers": r[0] or {},
                 "active_provider": r[1] or "local",
@@ -565,13 +619,15 @@ def get_config(user_id: str) -> dict:
                 "context_files": r[5] or {},
                 "subagents_enabled": r[6] if r[6] is not None else True,
                 "max_subagents": r[7] or 10,
+                "auto_approve_all": r[8] if r[8] is not None else False,
             }
 
 
 def save_config(user_id: str, **fields):
     """Update user config fields. Only updates provided fields."""
     allowed = {"providers", "active_provider", "mcp_servers", "tokens",
-               "system_prompt", "context_files", "subagents_enabled", "max_subagents"}
+               "system_prompt", "context_files", "subagents_enabled", "max_subagents",
+               "auto_approve_all"}
     updates = {}
     for k, v in fields.items():
         if k in allowed:
@@ -591,3 +647,136 @@ def save_config(user_id: str, **fields):
                 f"UPDATE user_configs SET {set_clause}, updated_at = now() WHERE user_id = %s",
                 values,
             )
+
+
+# ---------------------------------------------------------------------------
+# User Context Files
+# ---------------------------------------------------------------------------
+
+def get_context_files(user_id: str) -> dict[str, str]:
+    """Get all context files for a user. Returns {name: content}."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT name, content FROM user_context_files WHERE user_id = %s ORDER BY name",
+                (user_id,),
+            )
+            return {r[0]: r[1] for r in cur.fetchall()}
+
+
+def get_context_file(user_id: str, name: str) -> str | None:
+    """Get a single context file by name. Returns content or None."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT content FROM user_context_files WHERE user_id = %s AND name = %s",
+                (user_id, name),
+            )
+            r = cur.fetchone()
+            return r[0] if r else None
+
+
+def upsert_context_file(user_id: str, name: str, content: str) -> None:
+    """Create or update a context file."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO user_context_files (user_id, name, content)
+                   VALUES (%s, %s, %s)
+                   ON CONFLICT (user_id, name)
+                   DO UPDATE SET content = EXCLUDED.content, updated_at = now()""",
+                (user_id, name, content),
+            )
+
+
+def delete_context_file(user_id: str, name: str) -> bool:
+    """Delete a context file. Returns True if it existed."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM user_context_files WHERE user_id = %s AND name = %s",
+                (user_id, name),
+            )
+            return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# MCP Preferences
+# ---------------------------------------------------------------------------
+
+def get_mcp_preferences(user_id: str) -> dict:
+    """Get MCP server preferences. Returns {server_name: {enabled, disabled_tools, auto_approved_tools}}."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT server_name, enabled, disabled_tools, auto_approved_tools
+                   FROM user_mcp_preferences WHERE user_id = %s""",
+                (user_id,),
+            )
+            return {
+                r[0]: {
+                    "enabled": r[1],
+                    "disabled_tools": list(r[2] or []),
+                    "auto_approved_tools": list(r[3] or []),
+                }
+                for r in cur.fetchall()
+            }
+
+
+def set_server_enabled(user_id: str, server_name: str, enabled: bool) -> None:
+    """Enable or disable a server for a user."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO user_mcp_preferences (user_id, server_name, enabled)
+                   VALUES (%s, %s, %s)
+                   ON CONFLICT (user_id, server_name)
+                   DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = now()""",
+                (user_id, server_name, enabled),
+            )
+
+
+def set_tool_disabled(user_id: str, server_name: str, tool_name: str, disabled: bool) -> None:
+    """Add or remove a tool from the disabled list."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            if disabled:
+                cur.execute(
+                    """INSERT INTO user_mcp_preferences (user_id, server_name, disabled_tools)
+                       VALUES (%s, %s, ARRAY[%s])
+                       ON CONFLICT (user_id, server_name)
+                       DO UPDATE SET disabled_tools = array_append(
+                           array_remove(user_mcp_preferences.disabled_tools, %s), %s
+                       ), updated_at = now()""",
+                    (user_id, server_name, tool_name, tool_name, tool_name),
+                )
+            else:
+                cur.execute(
+                    """UPDATE user_mcp_preferences
+                       SET disabled_tools = array_remove(disabled_tools, %s), updated_at = now()
+                       WHERE user_id = %s AND server_name = %s""",
+                    (tool_name, user_id, server_name),
+                )
+
+
+def set_tool_auto_approved(user_id: str, server_name: str, tool_name: str, auto_approved: bool) -> None:
+    """Add or remove a tool from the auto-approved list."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            if auto_approved:
+                cur.execute(
+                    """INSERT INTO user_mcp_preferences (user_id, server_name, auto_approved_tools)
+                       VALUES (%s, %s, ARRAY[%s])
+                       ON CONFLICT (user_id, server_name)
+                       DO UPDATE SET auto_approved_tools = array_append(
+                           array_remove(user_mcp_preferences.auto_approved_tools, %s), %s
+                       ), updated_at = now()""",
+                    (user_id, server_name, tool_name, tool_name, tool_name),
+                )
+            else:
+                cur.execute(
+                    """UPDATE user_mcp_preferences
+                       SET auto_approved_tools = array_remove(auto_approved_tools, %s), updated_at = now()
+                       WHERE user_id = %s AND server_name = %s""",
+                    (tool_name, user_id, server_name),
+                )

@@ -15,7 +15,13 @@
     "type": "stdio",
     "command": "node",
     "args": ["mcp-servers/imap/dist/index.js"],
-    "credential_fields": []
+    "credential_fields": [],
+    "exclude_tools": [
+      "imap_check_spam", "imap_delete_spam", "imap_domain_stats",
+      "imap_add_spam_domain", "imap_remove_spam_domain",
+      "imap_add_whitelist_domain", "imap_list_spam_domains",
+      "imap_add_account", "imap_remove_account"
+    ]
   },
   "caldav": {
     "label": "Calendar (CalDAV)",
