@@ -576,6 +576,24 @@ import tempfile as _tempfile
 _user_temp_dirs: dict[str, str] = {}
 
 
+def _refresh_oauth_token(oauth_token: dict) -> str | None:
+    """Refresh an OAuth access token. Returns new access token or None on failure."""
+    import requests as _req
+    try:
+        resp = _req.post(oauth_token["token_uri"], data={
+            "client_id": oauth_token["client_id"],
+            "client_secret": oauth_token["client_secret"],
+            "refresh_token": oauth_token["refresh_token"],
+            "grant_type": "refresh_token",
+        })
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("access_token")
+    except Exception as exc:
+        print(f"[oauth] Token refresh failed: {exc}")
+    return None
+
+
 def _write_server_accounts(user_id: str, server_name: str, entry: dict) -> dict:
     """Write per-user account configs to temp files. Returns extra env vars to set."""
     if not _USE_DB or not user_id or user_id == "local":
@@ -617,10 +635,20 @@ def _write_server_accounts(user_id: str, server_name: str, entry: dict) -> dict:
             cfg.setdefault("id", acct["id"])
             cfg.setdefault("tls", True)
             cfg.setdefault("port", 993)
-            # Encrypt password
-            if "password" in cfg and cfg["password"]:
+            # Handle OAuth accounts
+            oauth_token = cfg.pop("oauth_token", None)
+            if oauth_token and cfg.get("auth_type") == "oauth":
+                # Refresh the access token and write as accessToken
+                fresh_token = _refresh_oauth_token(oauth_token)
+                if fresh_token:
+                    cfg["accessToken"] = fresh_token
+                    cfg.pop("password", None)  # Don't need password for OAuth
+                else:
+                    print(f"[imap] OAuth token refresh failed for {cfg.get('name')}")
+                    continue  # Skip account if refresh fails
+            # Encrypt password for non-OAuth accounts
+            elif "password" in cfg and cfg["password"]:
                 iv = os.urandom(16)
-                # Pad to 16 bytes
                 pw = cfg["password"].encode()
                 pad_len = 16 - (len(pw) % 16)
                 pw_padded = pw + bytes([pad_len] * pad_len)

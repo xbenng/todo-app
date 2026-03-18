@@ -32,7 +32,25 @@
     ],
     "config_env": "HOME",
     "config_path": ".imap-mcp/accounts.json",
-    "config_format": "imap"
+    "config_format": "imap",
+    "oauth_providers": [
+      {
+        "id": "google",
+        "label": "Gmail",
+        "client_id_env": "GOOGLE_CALDAV_CLIENT_ID",
+        "client_secret_env": "GOOGLE_CALDAV_CLIENT_SECRET",
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "scope": "https://mail.google.com/ https://www.googleapis.com/auth/userinfo.email",
+        "account_template": {
+          "name": "{email}",
+          "host": "imap.gmail.com",
+          "port": 993,
+          "tls": true,
+          "auth_type": "oauth"
+        }
+      }
+    ]
   },
   "caldav": {
     "label": "Calendar (CalDAV)",

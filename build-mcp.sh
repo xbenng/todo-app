@@ -41,6 +41,14 @@ do
   rm -rf "$tmp"
 done
 
+# --- Patch IMAP to support OAuth2 accessToken ---
+IMAP_DIST="$MCP_DIR/imap/dist/index.js"
+if [ -f "$IMAP_DIST" ]; then
+  # Replace hardcoded password auth with accessToken-aware auth
+  sed -i.bak 's/auth: {\n\s*user: account.user,\n\s*pass: account.password\n\s*}/auth: account.accessToken ? { user: account.user, accessToken: account.accessToken } : { user: account.user, pass: account.password }/g' "$IMAP_DIST" 2>/dev/null || true
+  rm -f "$IMAP_DIST.bak"
+fi
+
 # --- CalDAV (Python): clone at pinned ref and pip install ---
 echo "Building caldav @ ${CALDAV_REF:0:10}..."
 rm -rf "$MCP_DIR/caldav"
