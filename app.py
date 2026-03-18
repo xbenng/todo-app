@@ -2854,7 +2854,8 @@ def mcp_status():
                 # Get global excludes from registry
                 global_excludes = set(reg_entry.get("exclude_tools", []))
                 entry["tools"] = [
-                    t["name"][len(prefix):]
+                    {"name": t["name"][len(prefix):],
+                     "description": (t.get("description") or "")[:120]}
                     for t in mgr.get_tool_definitions()
                     if t["name"].startswith(prefix)
                     and t["name"][len(prefix):] not in global_excludes
@@ -5439,16 +5440,19 @@ function _renderMcpTools(server) {
     el.innerHTML = '<div style="color:var(--subtle)">No tools available.</div>';
     return;
   }
-  el.innerHTML = tools.map(t => {
+  el.innerHTML = tools.map(tool => {
+    const t = typeof tool === 'string' ? tool : tool.name;
+    const desc = typeof tool === 'object' ? (tool.description || '') : '';
     const isDis = disabled.has(t);
     const isAuto = autoApproved.has(t);
     const sn = esc(server.name);
     const tn = esc(t);
     return '<div class="mcp-tool-row" style="' + (isDis ? 'opacity:0.5' : '') + '">'
-      + '<span class="tool-name" title="' + tn + '">' + tn + '</span>'
-      + '<button class="mcp-tool-btn' + (isAuto ? ' active' : '') + '" onclick="_setMcpToolInline(this,\'' + sn + '\',\'' + tn + '\',null,' + !isAuto + ')" title="Auto-approve">Auto</button>'
-      + '<button class="mcp-tool-btn danger' + (isDis ? ' active' : '') + '" onclick="_setMcpToolInline(this,\'' + sn + '\',\'' + tn + '\',' + !isDis + ',null)" title="Disable tool">Off</button>'
-      + '</div>';
+      + '<span class="tool-name" title="' + esc(desc) + '">' + tn + '</span>'
+      + '<button class="mcp-tool-btn' + (isAuto ? ' active' : '') + '" onclick="_setMcpToolInline(this,\'' + sn + '\',\'' + tn + '\',null,' + !isAuto + ')" title="Auto-approve this tool">Auto</button>'
+      + '<button class="mcp-tool-btn danger' + (isDis ? ' active' : '') + '" onclick="_setMcpToolInline(this,\'' + sn + '\',\'' + tn + '\',' + !isDis + ',null)" title="Disable this tool">Off</button>'
+      + '</div>'
+      + (desc ? '<div style="padding:0 0 4px 0;font-size:0.65rem;color:var(--subtle);line-height:1.3">' + esc(desc) + '</div>' : '');
   }).join('');
 }
 
