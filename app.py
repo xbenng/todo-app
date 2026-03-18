@@ -992,14 +992,22 @@ def delete_todo_route(todo_id):
 
 @app.route("/api/todos/reorder", methods=["POST"])
 def reorder_todo():
+    user = get_current_user()
+    if _USE_DB and not user:
+        return jsonify({"error": "Not authenticated"}), 401
     data = request.json
     todo_id = data.get("id")
     direction = data.get("direction")  # "up" or "down"
     if not todo_id or direction not in ("up", "down"):
         return jsonify({"error": "id and direction (up/down) required"}), 400
 
-    active = _parse_todo_file(TODO_FILE)
-    completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+    if _USE_DB:
+        all_todos = _db.get_todos(user["id"])
+        active = [t for t in all_todos if t["status"] != "completed"]
+        completed = [t for t in all_todos if t["status"] == "completed"]
+    else:
+        active = _parse_todo_file(TODO_FILE)
+        completed = _parse_todo_file(_completed_file_path(TODO_FILE))
 
     # Find the item in active list
     idx = next((i for i, t in enumerate(active) if t["id"] == todo_id), None)
@@ -1071,20 +1079,33 @@ def reorder_todo():
                     last_in_new = i
             active.insert(last_in_new + 1, item)
 
-    _snapshot_and_write(TODO_FILE, active + completed)
+    if _USE_DB:
+        for i, t in enumerate(active):
+            t["position"] = i
+        _db.bulk_update_todos(user["id"], active)
+    else:
+        _snapshot_and_write(TODO_FILE, active + completed)
     return jsonify({"ok": True, "moved": True})
 
 
 @app.route("/api/todos/move-to-top", methods=["POST"])
 def move_to_top():
     """Move a todo to the top of its section."""
+    user = get_current_user()
+    if _USE_DB and not user:
+        return jsonify({"error": "Not authenticated"}), 401
     data = request.json
     todo_id = data.get("id")
     if not todo_id:
         return jsonify({"error": "id required"}), 400
 
-    active = _parse_todo_file(TODO_FILE)
-    completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+    if _USE_DB:
+        all_todos = _db.get_todos(user["id"])
+        active = [t for t in all_todos if t["status"] != "completed"]
+        completed = [t for t in all_todos if t["status"] == "completed"]
+    else:
+        active = _parse_todo_file(TODO_FILE)
+        completed = _parse_todo_file(_completed_file_path(TODO_FILE))
 
     idx = next((i for i, t in enumerate(active) if t["id"] == todo_id), None)
     if idx is None:
@@ -1102,18 +1123,31 @@ def move_to_top():
     active.pop(idx)
     active.insert(first_idx, item)
 
-    _snapshot_and_write(TODO_FILE, active + completed)
+    if _USE_DB:
+        for i, t in enumerate(active):
+            t["position"] = i
+        _db.bulk_update_todos(user["id"], active)
+    else:
+        _snapshot_and_write(TODO_FILE, active + completed)
     return jsonify({"ok": True, "moved": True})
 
 
 @app.route("/api/todos/sort-priority", methods=["POST"])
 def sort_by_priority():
     """Sort todos by priority within a given section."""
+    user = get_current_user()
+    if _USE_DB and not user:
+        return jsonify({"error": "Not authenticated"}), 401
     data = request.json
     section = data.get("section", "")
 
-    active = _parse_todo_file(TODO_FILE)
-    completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+    if _USE_DB:
+        all_todos = _db.get_todos(user["id"])
+        active = [t for t in all_todos if t["status"] != "completed"]
+        completed = [t for t in all_todos if t["status"] == "completed"]
+    else:
+        active = _parse_todo_file(TODO_FILE)
+        completed = _parse_todo_file(_completed_file_path(TODO_FILE))
 
     # Separate items in the target section from others, preserving order
     section_items = []
@@ -1140,13 +1174,21 @@ def sort_by_priority():
     if not inserted:
         rebuilt.extend(section_items)
 
-    _snapshot_and_write(TODO_FILE, rebuilt + completed)
+    if _USE_DB:
+        for i, t in enumerate(rebuilt):
+            t["position"] = i
+        _db.bulk_update_todos(user["id"], rebuilt)
+    else:
+        _snapshot_and_write(TODO_FILE, rebuilt + completed)
     return jsonify({"ok": True})
 
 
 @app.route("/api/todos/drop", methods=["POST"])
 def drop_todo():
     """Move a todo to a specific position: before another item, or to the end of a section."""
+    user = get_current_user()
+    if _USE_DB and not user:
+        return jsonify({"error": "Not authenticated"}), 401
     data = request.json
     todo_id = data.get("id")
     before_id = data.get("before_id")  # insert before this item (None = end of section)
@@ -1155,8 +1197,13 @@ def drop_todo():
     if not todo_id:
         return jsonify({"error": "id required"}), 400
 
-    active = _parse_todo_file(TODO_FILE)
-    completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+    if _USE_DB:
+        all_todos = _db.get_todos(user["id"])
+        active = [t for t in all_todos if t["status"] != "completed"]
+        completed = [t for t in all_todos if t["status"] == "completed"]
+    else:
+        active = _parse_todo_file(TODO_FILE)
+        completed = _parse_todo_file(_completed_file_path(TODO_FILE))
 
     idx = next((i for i, t in enumerate(active) if t["id"] == todo_id), None)
     if idx is None:
@@ -1180,13 +1227,21 @@ def drop_todo():
     else:
         active.append(item)
 
-    _snapshot_and_write(TODO_FILE, active + completed)
+    if _USE_DB:
+        for i, t in enumerate(active):
+            t["position"] = i
+        _db.bulk_update_todos(user["id"], active)
+    else:
+        _snapshot_and_write(TODO_FILE, active + completed)
     return jsonify({"ok": True})
 
 
 @app.route("/api/sections/rename", methods=["POST"])
 def rename_section():
     """Rename a section header across all todos."""
+    user = get_current_user()
+    if _USE_DB and not user:
+        return jsonify({"error": "Not authenticated"}), 401
     data = request.json
     old_name = (data.get("old_name") or "").strip()
     new_name = (data.get("new_name") or "").strip()
@@ -1195,9 +1250,12 @@ def rename_section():
     if old_name == new_name:
         return jsonify({"ok": True})
 
-    active = _parse_todo_file(TODO_FILE)
-    completed = _parse_todo_file(_completed_file_path(TODO_FILE))
-    todos = active + completed
+    if _USE_DB:
+        todos = _db.get_todos(user["id"])
+    else:
+        active = _parse_todo_file(TODO_FILE)
+        completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+        todos = active + completed
     changed = False
     for t in todos:
         if t.get("section", "") == old_name:
@@ -1205,13 +1263,19 @@ def rename_section():
             changed = True
     if not changed:
         return jsonify({"error": "Section not found"}), 404
-    _snapshot_and_write(TODO_FILE, todos)
+    if _USE_DB:
+        _db.bulk_update_todos(user["id"], [t for t in todos if t.get("section") == new_name])
+    else:
+        _snapshot_and_write(TODO_FILE, todos)
     return jsonify({"ok": True})
 
 
 @app.route("/api/sections/reorder", methods=["POST"])
 def reorder_section():
     """Move a section (and all its todos) before another section."""
+    user = get_current_user()
+    if _USE_DB and not user:
+        return jsonify({"error": "Not authenticated"}), 401
     data = request.json
     section = (data.get("section") or "").strip()
     before_section = data.get("before_section")  # None = move to end
@@ -1219,8 +1283,13 @@ def reorder_section():
     if not section:
         return jsonify({"error": "section required"}), 400
 
-    active = _parse_todo_file(TODO_FILE)
-    completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+    if _USE_DB:
+        all_todos = _db.get_todos(user["id"])
+        active = [t for t in all_todos if t["status"] != "completed"]
+        completed = [t for t in all_todos if t["status"] == "completed"]
+    else:
+        active = _parse_todo_file(TODO_FILE)
+        completed = _parse_todo_file(_completed_file_path(TODO_FILE))
 
     # Build current section order
     sections_order = []
@@ -1258,7 +1327,12 @@ def reorder_section():
     for s in sections_order:
         rebuilt.extend(section_groups.get(s, []))
 
-    _snapshot_and_write(TODO_FILE, rebuilt + completed)
+    if _USE_DB:
+        for i, t in enumerate(rebuilt):
+            t["position"] = i
+        _db.bulk_update_todos(user["id"], rebuilt)
+    else:
+        _snapshot_and_write(TODO_FILE, rebuilt + completed)
     return jsonify({"ok": True})
 
 
