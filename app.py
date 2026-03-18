@@ -281,7 +281,43 @@ class MCPManager:
         return "\n".join(parts) if parts else json.dumps({"result": "ok"})
 
 
-_mcp_manager: MCPManager | None = None
+_mcp_managers: dict[str, MCPManager] = {}  # user_id -> MCPManager
+_mcp_managers_lock = threading.Lock()
+
+
+def _get_mcp_manager(user_id: str | None = None) -> MCPManager | None:
+    """Get or lazily create an MCPManager for the given user.
+
+    Loads server definitions from the registry and credentials from the
+    user's DB config (or file config in non-DB mode).
+    """
+    if not ClientSessionGroup:
+        return None
+    uid = user_id or "local"
+    with _mcp_managers_lock:
+        if uid in _mcp_managers:
+            return _mcp_managers[uid]
+    # Load registry + user tokens outside the lock (IO)
+    registry = _load_mcp_registry()
+    if not registry:
+        return None
+    if _USE_DB and user_id and user_id != "local":
+        config = _db.get_config(user_id)
+    else:
+        config = _load_config()
+    tokens = config.get("tokens", {})
+    mcp_configs = _build_mcp_configs_from_registry(registry, tokens)
+    if not mcp_configs:
+        return None
+    mgr = MCPManager()
+    mgr.start(mcp_configs, tokens)
+    with _mcp_managers_lock:
+        # Double-check another thread didn't create one while we were building
+        if uid in _mcp_managers:
+            mgr.stop()
+            return _mcp_managers[uid]
+        _mcp_managers[uid] = mgr
+    return mgr
 
 
 def _completed_file_path(path: str) -> str:
@@ -407,6 +443,56 @@ def _load_config() -> dict:
             return json.load(f)
     except (json.JSONDecodeError, OSError):
         return {}
+
+
+def _load_mcp_registry() -> dict:
+    """Load MCP server registry from mcp-servers/registry.json."""
+    registry_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "mcp-servers", "registry.json")
+    if not os.path.exists(registry_path):
+        return {}
+    try:
+        with open(registry_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _build_mcp_configs_from_registry(registry: dict, tokens: dict) -> dict:
+    """Convert registry.json entries + user tokens into MCPManager-compatible server_configs."""
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    server_configs = {}
+    for name, entry in registry.items():
+        server_type = entry.get("type", "stdio")
+        if server_type == "stdio":
+            env = dict(entry.get("static_env", {}))
+            for field in entry.get("credential_fields", []):
+                key = field["key"]
+                if key in tokens:
+                    env[key] = tokens[key]
+            # Resolve relative paths in args against app directory
+            args = []
+            for arg in entry.get("args", []):
+                if not arg.startswith("-") and not os.path.isabs(arg):
+                    resolved = os.path.join(app_dir, arg)
+                    if os.path.exists(resolved):
+                        args.append(resolved)
+                    else:
+                        args.append(arg)
+                else:
+                    args.append(arg)
+            server_configs[name] = {
+                "type": "stdio",
+                "command": entry["command"],
+                "args": args,
+                "env": env,
+            }
+        elif server_type in ("sse", "http"):
+            server_configs[name] = {
+                "type": "sse",
+                "url": entry["url"],
+            }
+    return server_configs
 
 
 def _save_config(data: dict) -> None:
@@ -1308,11 +1394,20 @@ def _execute_tool(name: str, input_data: dict, todo_id: str | None,
     depth = agent_context.get("depth", 0) if agent_context else 0
     prefix = f"[tool d={depth}]"
     print(f"{prefix} {name}({json.dumps(input_data)[:200]})")
+
+    # Resolve user_id from agent context for DB-aware operations
+    user_id = None
+    if agent_context and agent_context.get("job_id"):
+        user_id = _jobs.get(agent_context["job_id"], {}).get("user_id")
+
     try:
         if name == "read_todos":
-            active = _parse_todo_file(TODO_FILE)
-            completed = _parse_todo_file(_completed_file_path(TODO_FILE))
-            todos = active + completed
+            if _USE_DB and user_id:
+                todos = _db.get_todos(user_id)
+            else:
+                active = _parse_todo_file(TODO_FILE)
+                completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+                todos = active + completed
             status_filter = input_data.get("status_filter", "all")
             if status_filter == "open":
                 todos = [t for t in todos if t["status"] != "completed"]
@@ -1322,57 +1417,87 @@ def _execute_tool(name: str, input_data: dict, todo_id: str | None,
 
         elif name == "update_todo":
             tid = input_data["todo_id"]
-            active = _parse_todo_file(TODO_FILE)
-            completed = _parse_todo_file(_completed_file_path(TODO_FILE))
-            todos = active + completed
-            for t in todos:
-                if t["id"] == tid:
-                    for field in ("title", "description", "status", "priority", "section"):
-                        if field in input_data:
-                            val = input_data[field]
-                            if field == "status" and val not in ("open", "completed"):
-                                continue
-                            if field == "priority" and val not in VALID_PRIORITIES:
-                                continue
-                            t[field] = val.strip() if isinstance(val, str) else val
-                    _snapshot_and_write(TODO_FILE, todos)
-                    return json.dumps(t, ensure_ascii=False)
-            return json.dumps({"error": f"Todo {tid} not found"})
+            if _USE_DB and user_id:
+                fields = {}
+                for k in ("title", "description", "status", "priority", "section"):
+                    if k in input_data:
+                        val = input_data[k]
+                        if k == "status" and val not in ("open", "completed"):
+                            continue
+                        if k == "priority" and val not in VALID_PRIORITIES:
+                            continue
+                        fields[k] = val.strip() if isinstance(val, str) else val
+                result = _db.update_todo(user_id, tid, **fields)
+                if not result:
+                    return json.dumps({"error": f"Todo {tid} not found"})
+                return json.dumps(result, ensure_ascii=False)
+            else:
+                active = _parse_todo_file(TODO_FILE)
+                completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+                todos = active + completed
+                for t in todos:
+                    if t["id"] == tid:
+                        for field in ("title", "description", "status", "priority", "section"):
+                            if field in input_data:
+                                val = input_data[field]
+                                if field == "status" and val not in ("open", "completed"):
+                                    continue
+                                if field == "priority" and val not in VALID_PRIORITIES:
+                                    continue
+                                t[field] = val.strip() if isinstance(val, str) else val
+                        _snapshot_and_write(TODO_FILE, todos)
+                        return json.dumps(t, ensure_ascii=False)
+                return json.dumps({"error": f"Todo {tid} not found"})
 
         elif name == "create_todo":
-            active = _parse_todo_file(TODO_FILE)
-            completed = _parse_todo_file(_completed_file_path(TODO_FILE))
-            todos = active + completed
-            new_todo = {
-                "id": str(uuid.uuid4())[:8],
-                "title": input_data.get("title", "").strip(),
-                "description": input_data.get("description", "").strip(),
-                "status": "open",
-                "priority": input_data.get("priority", DEFAULT_PRIORITY),
-                "section": input_data.get("section", "").strip(),
-            }
-            if not new_todo["title"]:
+            title = (input_data.get("title") or "").strip()
+            if not title:
                 return json.dumps({"error": "Title is required"})
-            todos.append(new_todo)
-            _snapshot_and_write(TODO_FILE, todos)
-            return json.dumps(new_todo, ensure_ascii=False)
+            if _USE_DB and user_id:
+                new_todo = _db.create_todo(
+                    user_id, title,
+                    description=(input_data.get("description") or "").strip(),
+                    priority=input_data.get("priority", DEFAULT_PRIORITY),
+                    section=(input_data.get("section") or "").strip(),
+                )
+                return json.dumps(new_todo, ensure_ascii=False)
+            else:
+                active = _parse_todo_file(TODO_FILE)
+                completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+                todos = active + completed
+                new_todo = {
+                    "id": str(uuid.uuid4())[:8],
+                    "title": title,
+                    "description": (input_data.get("description") or "").strip(),
+                    "status": "open",
+                    "priority": input_data.get("priority", DEFAULT_PRIORITY),
+                    "section": (input_data.get("section") or "").strip(),
+                }
+                todos.append(new_todo)
+                _snapshot_and_write(TODO_FILE, todos)
+                return json.dumps(new_todo, ensure_ascii=False)
 
         elif name == "search_todos":
             query = input_data.get("query", "").lower()
-            active = _parse_todo_file(TODO_FILE)
-            completed = _parse_todo_file(_completed_file_path(TODO_FILE))
-            results = []
-            for t in active + completed:
-                if (query in t.get("title", "").lower() or
-                        query in t.get("description", "").lower()):
-                    results.append(t)
+            if _USE_DB and user_id:
+                results = _db.search_todos(user_id, query)
+            else:
+                active = _parse_todo_file(TODO_FILE)
+                completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+                results = [t for t in active + completed
+                           if query in t.get("title", "").lower()
+                           or query in t.get("description", "").lower()]
             return json.dumps(results, ensure_ascii=False)
 
         elif name == "read_chat_history":
             tid = input_data.get("todo_id", todo_id)
-            chats = _load_chats()
-            chat = chats.get(tid, {"messages": []})
-            return json.dumps(chat.get("messages", [])[-20:], ensure_ascii=False)
+            if _USE_DB:
+                messages = _db.get_messages(tid)
+                return json.dumps(messages[-20:], ensure_ascii=False)
+            else:
+                chats = _load_chats()
+                chat = chats.get(tid, {"messages": []})
+                return json.dumps(chat.get("messages", [])[-20:], ensure_ascii=False)
 
         elif name == "spawn_agents":
             if not agent_context:
@@ -1381,7 +1506,10 @@ def _execute_tool(name: str, input_data: dict, todo_id: str | None,
             print(f"[spawn_agents] Received {len(agents)} agent(s): {[a.get('label', '?') for a in agents]}")
             if not agents:
                 return json.dumps({"error": "No agents specified"})
-            config = _load_config()
+            if _USE_DB and user_id:
+                config = _db.get_config(user_id)
+            else:
+                config = _load_config()
             max_subagents = config.get("max_subagents", 10)
             if len(agents) > max_subagents:
                 return json.dumps({"error": f"Maximum {max_subagents} parallel agents"})
@@ -1392,8 +1520,12 @@ def _execute_tool(name: str, input_data: dict, todo_id: str | None,
 
         else:
             # Delegate to MCP if it's an MCP tool
-            if _mcp_manager and _mcp_manager.is_mcp_tool(name):
-                return _mcp_manager.call_tool(name, input_data)
+            user_id = None
+            if agent_context and agent_context.get("job_id"):
+                user_id = _jobs.get(agent_context["job_id"], {}).get("user_id")
+            mgr = _get_mcp_manager(user_id)
+            if mgr and mgr.is_mcp_tool(name):
+                return mgr.call_tool(name, input_data)
             return json.dumps({"error": f"Unknown tool: {name}"})
 
     except Exception as exc:
@@ -1462,8 +1594,9 @@ def _run_subagent(job_id: str, todo_id: str | None, provider: dict,
         system_prompt = _build_system_prompt(todo_id)
         messages_api = [{"role": "user", "content": prompt}]
         tools = _get_tool_definitions(depth)
-        if _mcp_manager:
-            tools = tools + _mcp_manager.get_tool_definitions()
+        mgr = _get_mcp_manager(job.get("user_id"))
+        if mgr:
+            tools = tools + mgr.get_tool_definitions()
         agent_ctx = {"job_id": job_id, "provider": provider, "depth": depth}
 
         if ptype == "anthropic":
@@ -1623,11 +1756,12 @@ def _strip_think_tags(text: str) -> str:
     return re.sub(r'<think>[\s\S]*?</think>\s*', '', text).strip()
 
 
-def _openai_tool_defs(depth: int = 0) -> list[dict]:
+def _openai_tool_defs(depth: int = 0, user_id: str | None = None) -> list[dict]:
     """Convert Anthropic-format tool definitions to OpenAI function-calling format."""
     tools = _get_tool_definitions(depth)
-    if _mcp_manager:
-        tools = tools + _mcp_manager.get_tool_definitions()
+    mgr = _get_mcp_manager(user_id)
+    if mgr:
+        tools = tools + mgr.get_tool_definitions()
     return [{
         "type": "function",
         "function": {
@@ -1693,6 +1827,7 @@ class ChatAgent:
         self.ptype = provider.get("type", "local")
         self.model = provider.get("model", "claude-sonnet-4-20250514")
         self.depth = depth
+        self.user_id = _jobs.get(job_id, {}).get("user_id")
         self.assistant_text_lines: list[str] = []
         self.total_input_tokens = 0
         self.total_output_tokens = 0
@@ -1725,12 +1860,13 @@ class ChatAgent:
 
     def _get_tools_anthropic(self) -> list[dict]:
         tools = _get_tool_definitions(self.depth)
-        if _mcp_manager:
-            tools = tools + _mcp_manager.get_tool_definitions()
+        mgr = _get_mcp_manager(self.user_id)
+        if mgr:
+            tools = tools + mgr.get_tool_definitions()
         return tools
 
     def _get_tools_openai(self) -> list[dict]:
-        return _openai_tool_defs(self.depth)
+        return _openai_tool_defs(self.depth, self.user_id)
 
     def _persist_response(self) -> None:
         """Persist assistant response to chats/DB and mark unread."""
@@ -2107,7 +2243,8 @@ def _run_claude_chat_job(job_id: str, message: str, cwd: str,
                          conversation_id: str | None = None,
                          todo_id: str | None = None):
     """Dispatcher: route to the active provider via ChatAgent, or local CLI fallback."""
-    name, provider = _get_active_provider()
+    user_id = _jobs.get(job_id, {}).get("user_id")
+    name, provider = _get_active_provider(user_id)
     ptype = provider.get("type", "local")
     if ptype in ("anthropic", "openai_compat"):
         agent = ChatAgent(job_id, todo_id, provider)
@@ -2451,8 +2588,12 @@ def get_config():
 @app.route("/api/config", methods=["PUT"])
 def put_config():
     """Update server config."""
+    user = get_current_user()
     data = request.json or {}
-    config = _load_config()
+    if _USE_DB and user:
+        config = _db.get_config(user["id"])
+    else:
+        config = _load_config()
     # Merge provided fields (legacy + new)
     for key in ("anthropic_api_key", "model", "mcp_servers", "openai_compat", "active_provider", "subagents_enabled", "max_subagents"):
         if key in data:
@@ -2473,32 +2614,47 @@ def put_config():
         config["providers"] = existing
     if "tokens" in data and isinstance(data["tokens"], dict):
         config.setdefault("tokens", {}).update(data["tokens"])
-    _save_config(config)
+    if _USE_DB and user:
+        _db.save_config(user["id"], **{k: v for k, v in config.items()
+                        if k in ("providers", "active_provider", "tokens",
+                                 "subagents_enabled", "max_subagents")})
+    else:
+        _save_config(config)
     return jsonify({"ok": True})
 
 
 @app.route("/api/mcp/status")
 def mcp_status():
-    """Return status of all MCP servers."""
-    if not _mcp_manager:
+    """Return status of all MCP servers for the current user."""
+    user = get_current_user()
+    user_id = user["id"] if user else None
+    mgr = _get_mcp_manager(user_id)
+    if not mgr:
         return jsonify({"servers": [], "available": bool(ClientSessionGroup)})
-    status = _mcp_manager.get_status()
-    servers = [{"name": name, **info} for name, info in status.items()]
+    registry = _load_mcp_registry()
+    status = mgr.get_status()
+    servers = []
+    for name, info in status.items():
+        entry = {"name": name, **info}
+        if name in registry:
+            entry["label"] = registry[name].get("label", name)
+        servers.append(entry)
     return jsonify({"servers": servers, "available": True})
 
 
 @app.route("/api/mcp/reconnect", methods=["POST"])
 def mcp_reconnect():
-    """Restart all MCP server connections."""
-    global _mcp_manager
-    if _mcp_manager:
-        _mcp_manager.stop()
-    config = _load_config()
-    mcp_configs = config.get("mcp_servers", {})
-    if mcp_configs and ClientSessionGroup:
-        _mcp_manager = MCPManager()
-        _mcp_manager.start(mcp_configs, config.get("tokens", {}))
-    return jsonify({"ok": True})
+    """Restart MCP server connections for the current user."""
+    user = get_current_user()
+    user_id = user["id"] if user else None
+    uid = user_id or "local"
+    with _mcp_managers_lock:
+        old = _mcp_managers.pop(uid, None)
+    if old:
+        old.stop()
+    # Next call to _get_mcp_manager will lazy-create a fresh one
+    mgr = _get_mcp_manager(user_id)
+    return jsonify({"ok": True, "connected": mgr is not None})
 
 
 # ---------------------------------------------------------------------------
@@ -3794,6 +3950,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
     <div id="git-log-list" style="max-height:200px;overflow-y:auto;margin-bottom:8px"></div>
     <div class="settings-actions">
+      <button class="btn btn-sm" onclick="_logout()" style="border:1px solid var(--border);color:#ef4444;margin-right:auto">Logout</button>
       <button class="btn btn-sm" onclick="hideSettings()" style="border:1px solid var(--border)">Cancel</button>
       <button class="btn btn-sm btn-primary" onclick="saveSettings()">Save</button>
     </div>
@@ -4932,6 +5089,12 @@ async function _loadMcpStatus() {
   } catch {
     container.innerHTML = '<div style="font-size:0.75rem;color:var(--subtle)">Failed to load MCP status.</div>';
   }
+}
+
+async function _logout() {
+  if (!confirm('Log out?')) return;
+  await fetch('/api/auth/logout', { method: 'POST' });
+  window.location.reload();
 }
 
 async function _refreshMcp() {
@@ -7538,15 +7701,15 @@ if __name__ == "__main__":
     if not _USE_DB:
         _ensure_config_dir()
 
-    # Start MCP servers (only in the reloader's main process to avoid double-init)
-    if os.environ.get("WERKZEUG_RUN_MAIN") == "true" or not os.environ.get("WERKZEUG_RUN_MAIN"):
-        config = _load_config()
-        mcp_servers = config.get("mcp_servers", {})
-        if mcp_servers and ClientSessionGroup:
-            _mcp_manager = MCPManager()
-            _mcp_manager.start(mcp_servers, config.get("tokens", {}))
-            import atexit
-            atexit.register(_mcp_manager.stop)
+    # MCP servers are initialized lazily per-user on first access.
+    # Register cleanup handler for all managers.
+    import atexit
+    def _shutdown_all_mcp():
+        with _mcp_managers_lock:
+            for mgr in _mcp_managers.values():
+                mgr.stop()
+            _mcp_managers.clear()
+    atexit.register(_shutdown_all_mcp)
 
     # Recover any existing tmux sessions from a previous server run
     _tmux_recover_sessions()

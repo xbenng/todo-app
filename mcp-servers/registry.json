@@ -1,0 +1,42 @@
+{
+  "slack": {
+    "label": "Slack",
+    "type": "stdio",
+    "command": "node",
+    "args": ["mcp-servers/slack/node_modules/slack-mcp-server/bin/index.js", "--transport", "stdio"],
+    "credential_fields": [
+      {"key": "SLACK_MCP_XOXC_TOKEN", "label": "XOXC Token", "type": "password"},
+      {"key": "SLACK_MCP_XOXD_TOKEN", "label": "XOXD Token", "type": "password"}
+    ],
+    "static_env": {"SLACK_MCP_ADD_MESSAGE_TOOL": "true"}
+  },
+  "imap": {
+    "label": "Email (IMAP)",
+    "type": "stdio",
+    "command": "node",
+    "args": ["mcp-servers/imap/dist/index.js"],
+    "credential_fields": []
+  },
+  "caldav": {
+    "label": "Calendar (CalDAV)",
+    "type": "stdio",
+    "command": "mcp-caldav",
+    "args": [],
+    "credential_fields": []
+  },
+  "smartsheet": {
+    "label": "Smartsheet",
+    "type": "stdio",
+    "command": "node",
+    "args": ["mcp-servers/smartsheet/dist/index.js"],
+    "credential_fields": [
+      {"key": "SMARTSHEET_ACCESS_TOKEN", "label": "Access Token", "type": "password"}
+    ]
+  },
+  "atlassian": {
+    "label": "Atlassian (Jira/Confluence)",
+    "type": "sse",
+    "url": "https://mcp.atlassian.com/v1/sse",
+    "credential_fields": []
+  }
+}
