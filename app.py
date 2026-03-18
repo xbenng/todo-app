@@ -4675,7 +4675,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <span style="font-size:0.82rem;font-weight:600">MCP Servers</span>
       <button class="btn btn-sm" onclick="_refreshMcp()" style="border:1px solid var(--border);font-size:0.7rem;padding:2px 8px">Reconnect</button>
     </div>
-    <div id="mcp-server-list" style="margin-bottom:8px"></div>
+    <div id="mcp-server-list" style="margin-bottom:8px;position:relative;min-height:30px">
+      <div id="mcp-loading" style="display:none;position:absolute;inset:0;background:rgba(30,30,30,0.5);align-items:center;justify-content:center;border-radius:6px;z-index:10"><l-bouncy size="20" speed="1.75" color="var(--accent)"></l-bouncy></div>
+    </div>
     <div style="display:flex;align-items:center;gap:8px;margin:4px 0">
       <input type="checkbox" id="mcp-auto-approve-all" onchange="_toggleAutoApproveAll(this.checked)" style="margin:0;width:auto;flex-shrink:0">
       <span style="font-size:0.82rem;font-weight:600;cursor:pointer" onclick="document.getElementById('mcp-auto-approve-all').click()">Bypass tool approvals</span>
@@ -5954,7 +5956,7 @@ async function _clearMcpCredential(serverName) {
   for (const f of (server.credential_fields || [])) {
     tokens[f.key] = '';
   }
-  try {
+  _mcpAction(async () => {
     await fetch('/api/config', {
       method: 'PUT',
       headers: {'Content-Type': 'application/json'},
@@ -5962,7 +5964,7 @@ async function _clearMcpCredential(serverName) {
     });
     showToast(serverName + ' disconnected');
     await _refreshMcp();
-  } catch { showToast('Failed to disconnect', true); }
+  });
 }
 
 async function _saveMcpConfig(serverName) {
@@ -5979,14 +5981,13 @@ async function _saveMcpConfig(serverName) {
     }
   }
   if (!hasChange) { showToast('No changes to save'); return; }
-  try {
+  _mcpAction(async () => {
     await fetch('/api/config', {
       method: 'PUT',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({tokens})
     });
     showToast('Credentials saved');
-    // Reconnect so the server picks up new credentials
     const configEl = document.getElementById('mcp-config-' + serverName);
     if (configEl) configEl.style.display = 'none';
     await _refreshMcp();
@@ -6085,7 +6086,7 @@ async function _addMcpAccount(serverName) {
     else config[f.key] = el.value.trim();
   }
   if (!config.name && !config.user) { showToast('Name is required', true); return; }
-  try {
+  _mcpAction(async () => {
     const res = await fetch('/api/mcp/accounts/' + serverName, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
@@ -6099,7 +6100,7 @@ async function _addMcpAccount(serverName) {
       const data = await res.json();
       showToast(data.error || 'Failed', true);
     }
-  } catch { showToast('Failed to add account', true); }
+  });
 }
 
 async function _startOAuth(serverName, providerId, accountId) {
@@ -6120,8 +6121,10 @@ async function _startOAuth(serverName, providerId, accountId) {
 window.addEventListener('message', async (e) => {
   if (e.data && e.data.type === 'oauth_complete') {
     showToast('Account connected');
+    _mcpLoading(true);
     await _loadMcpStatus();
-    // Re-open accounts panel for any server that has one open
+    _mcpLoading(false);
+    // Re-open panels that were open
     document.querySelectorAll('[id^="mcp-accounts-"]').forEach(el => {
       if (el.style.display !== 'none') {
         const name = el.id.replace('mcp-accounts-', '');
@@ -6133,28 +6136,37 @@ window.addEventListener('message', async (e) => {
 
 async function _deleteMcpAccount(serverName, accountId) {
   if (!confirm('Delete this account?')) return;
-  try {
+  _mcpAction(async () => {
     const res = await fetch('/api/mcp/accounts/' + serverName + '/' + accountId, { method: 'DELETE' });
     if (res.ok) {
       showToast('Account deleted');
       await _loadMcpStatus();
       _toggleMcpPanel(serverName, 'accounts');
     }
-  } catch { showToast('Failed to delete', true); }
+  });
+}
+
+function _mcpLoading(show) {
+  const el = document.getElementById('mcp-loading');
+  if (el) el.style.display = show ? 'flex' : 'none';
+}
+
+async function _mcpAction(fn) {
+  _mcpLoading(true);
+  try { await fn(); } finally { _mcpLoading(false); }
 }
 
 async function _toggleMcpServer(name, enabled) {
-  try {
+  _mcpAction(async () => {
     await fetch('/api/mcp/servers', {
       method: 'PUT',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({server: name, enabled})
     });
     showToast(enabled ? name + ' enabled' : name + ' disabled');
-    // Wait for server to connect before reloading
     if (enabled) await new Promise(r => setTimeout(r, 3000));
     await _loadMcpStatus();
-  } catch { showToast('Failed to toggle server', true); }
+  });
 }
 
 async function _setMcpTool(server, tool, disabled, autoApproved) {
@@ -6261,12 +6273,15 @@ async function _logout() {
 
 async function _refreshMcp() {
   showToast('Reconnecting MCP servers...');
+  _mcpLoading(true);
   try {
     await fetch('/api/mcp/reconnect', { method: 'POST' });
     await _loadMcpStatus();
     showToast('MCP reconnected');
   } catch {
     showToast('Failed to reconnect MCP', true);
+  } finally {
+    _mcpLoading(false);
   }
 }
 
