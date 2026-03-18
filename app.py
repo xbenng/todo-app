@@ -401,15 +401,15 @@ def _check_tool_permission(user_id: str, tool_name: str, input_data: dict,
     # Emit approval request to the job's SSE stream
     job_id = agent_context.get("job_id") if agent_context else None
     if job_id and job_id in _jobs:
-        approval_msg = json.dumps({
+        approval_obj = {
             "__tool_approval__": True,
             "approval_id": approval_id,
             "tool": tool_name,
             "tool_display": bare_tool,
             "server": server_name,
             "args": input_data,
-        })
-        _jobs[job_id]["output_lines"].append(approval_msg)
+        }
+        _jobs[job_id]["output_lines"].append(approval_obj)
 
     # Block until user responds (timeout after 5 minutes)
     event.wait(timeout=300)
@@ -1386,7 +1386,7 @@ def _run_claude_job(job_id: str, prompt: str, cwd: str):
 # Server-side agentic loop (Anthropic SDK)
 # ---------------------------------------------------------------------------
 
-def _get_tool_definitions(depth: int = 0) -> list[dict]:
+def _get_tool_definitions(depth: int = 0, user_id: str | None = None) -> list[dict]:
     """Return Claude API tool definitions for server-side tools."""
     tools = [
         {
@@ -1457,7 +1457,10 @@ def _get_tool_definitions(depth: int = 0) -> list[dict]:
             }
         },
     ]
-    config = _load_config()
+    if _USE_DB and user_id and user_id != "local":
+        config = _db.get_config(user_id)
+    else:
+        config = _load_config()
     if depth < 2 and config.get("subagents_enabled", True):
         tools.append({
             "name": "spawn_agents",
@@ -1701,7 +1704,7 @@ def _run_subagent(job_id: str, todo_id: str | None, provider: dict,
     try:
         system_prompt = _build_system_prompt(todo_id, job.get("user_id"))
         messages_api = [{"role": "user", "content": prompt}]
-        tools = _get_tool_definitions(depth)
+        tools = _get_tool_definitions(depth, job.get("user_id"))
         tools = tools + _get_mcp_tools(job.get("user_id"))
         agent_ctx = {"job_id": job_id, "provider": provider, "depth": depth}
 
@@ -1879,7 +1882,7 @@ def _strip_think_tags(text: str) -> str:
 
 def _openai_tool_defs(depth: int = 0, user_id: str | None = None) -> list[dict]:
     """Convert Anthropic-format tool definitions to OpenAI function-calling format."""
-    tools = _get_tool_definitions(depth)
+    tools = _get_tool_definitions(depth, user_id)
     tools = tools + _get_mcp_tools(user_id)
     return [{
         "type": "function",
@@ -1978,7 +1981,7 @@ class ChatAgent:
         return messages
 
     def _get_tools_anthropic(self) -> list[dict]:
-        tools = _get_tool_definitions(self.depth)
+        tools = _get_tool_definitions(self.depth, self.user_id)
         tools = tools + _get_mcp_tools(self.user_id)
         return tools
 
@@ -5392,9 +5395,24 @@ async function _setMcpTool(server, tool, disabled, autoApproved) {
 }
 
 function _showToolApproval(data, todoId) {
+  // Show toast so user notices even if chat isn't open
+  showToast(data.server + '.' + data.tool_display + ' needs approval — open chat to respond');
   const streamEl = document.getElementById('chat-assistant-streaming');
-  if (!streamEl) return;
+  if (!streamEl) {
+    // Chat not open — store for rendering when chat is opened
+    const session = _chatSessions[todoId];
+    if (session) {
+      if (!session._pendingApprovals) session._pendingApprovals = [];
+      session._pendingApprovals.push(data);
+    }
+    return;
+  }
+  _renderToolApprovalCard(data, streamEl);
+}
+
+function _renderToolApprovalCard(data, container) {
   const div = document.createElement('div');
+  div.id = 'tool-approval-' + data.approval_id;
   div.style.cssText = 'background:rgba(79,110,247,0.08);border:1px solid var(--accent);border-radius:8px;padding:10px 12px;margin:6px 0;font-size:0.8rem';
   const argsStr = Object.entries(data.args || {}).map(([k,v]) => esc(k) + ': ' + esc(typeof v === 'string' ? v : JSON.stringify(v)).slice(0,80)).join('<br>');
   div.innerHTML = '<div style="font-weight:600;margin-bottom:6px">' + esc(data.server) + '.' + esc(data.tool_display) + ' wants to run</div>'
@@ -5404,19 +5422,24 @@ function _showToolApproval(data, todoId) {
     + '<button onclick="_respondToolApproval(\'' + esc(data.approval_id) + '\',true,true,this)" style="background:#22c55e;color:#fff;border:none;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:0.75rem">Always Allow</button>'
     + '<button onclick="_respondToolApproval(\'' + esc(data.approval_id) + '\',false,false,this)" style="background:none;border:1px solid #ef4444;color:#ef4444;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:0.75rem">Deny</button>'
     + '</div>';
-  streamEl.appendChild(div);
+  container.appendChild(div);
   const log = document.getElementById('chat-log');
   if (log) log.scrollTop = log.scrollHeight;
 }
 
 async function _respondToolApproval(approvalId, approved, alwaysAllow, btn) {
-  // Disable all buttons in the parent
-  const parent = btn.closest('div').parentElement;
-  parent.querySelectorAll('button').forEach(b => { b.disabled = true; b.style.opacity = '0.4'; });
-  const statusDiv = document.createElement('div');
-  statusDiv.style.cssText = 'font-size:0.7rem;color:var(--subtle);margin-top:4px';
-  statusDiv.textContent = approved ? (alwaysAllow ? 'Always allowed' : 'Approved') : 'Denied';
-  parent.appendChild(statusDiv);
+  const card = document.getElementById('tool-approval-' + approvalId);
+  // Disable all buttons in the card
+  if (card) {
+    card.querySelectorAll('button').forEach(b => { b.disabled = true; b.style.opacity = '0.4'; });
+    card.style.borderColor = approved ? '#22c55e' : '#ef4444';
+    card.style.background = approved ? 'rgba(34,197,94,0.06)' : 'rgba(239,68,68,0.06)';
+    const statusDiv = document.createElement('div');
+    statusDiv.style.cssText = 'font-size:0.7rem;margin-top:4px';
+    statusDiv.style.color = approved ? '#22c55e' : '#ef4444';
+    statusDiv.textContent = approved ? (alwaysAllow ? 'Always allowed' : 'Approved') : 'Denied';
+    card.appendChild(statusDiv);
+  }
   try {
     await fetch('/api/mcp/approve', {
       method: 'POST',
@@ -5739,6 +5762,15 @@ function _showChatOverlay(todoId) {
   requestAnimationFrame(() => overlay.classList.add('visible'));
 
   _renderChatLog(todoId);
+  // Flush any pending tool approvals that arrived while chat was closed
+  const session = _chatSessions[todoId];
+  if (session && session._pendingApprovals && session._pendingApprovals.length > 0) {
+    const streamEl = document.getElementById('chat-assistant-streaming');
+    if (streamEl) {
+      session._pendingApprovals.forEach(a => _renderToolApprovalCard(a, streamEl));
+      session._pendingApprovals = [];
+    }
+  }
   const input = document.getElementById('chat-input');
   input.value = '';
   input.focus();
