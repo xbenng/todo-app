@@ -1597,8 +1597,8 @@ class ChatAgent:
                 chat["unread"] = True
                 chats[self.todo_id] = chat
                 _save_chats(chats)
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"[persist] ERROR saving chat for {self.todo_id}: {exc}")
 
     # ------------------------------------------------------------------
     # Anthropic provider
@@ -4835,8 +4835,7 @@ async function startChatBackground(todoId) {
   // Start /ea workon in background without opening the chat panel
   await _loadChatSession(todoId);
   let session = _chatSessions[todoId];
-  const hasAssistantMsg = session && session.messages.some(m => m.role === 'assistant');
-  const isNew = !session || (!hasAssistantMsg && !session.conversationId && !session.streamingJobId);
+  const isNew = !session || session.messages.length === 0;
   if (!session) {
     _chatSessions[todoId] = { conversationId: null, messages: [], streamingText: '', streamingJobId: null };
     session = _chatSessions[todoId];
@@ -4865,8 +4864,6 @@ async function startChatBackground(todoId) {
     }
     return;
   }
-  session.messages = [];
-  fetch('/api/chats/' + todoId, { method: 'DELETE' }).catch(() => {});
   const msg = '/ea workon ' + todoId;
   session.messages.push({ role: 'user', content: msg });
   session.streamingJobId = 'pending';
@@ -4898,8 +4895,7 @@ async function openChat(todoId, conversationId) {
   // Load persisted chat from server
   await _loadChatSession(todoId);
   let session = _chatSessions[todoId];
-  const hasAssistantMsg = session && session.messages.some(m => m.role === 'assistant');
-  const isNew = !session || (!hasAssistantMsg && !session.conversationId && !session.streamingJobId);
+  const isNew = !session || session.messages.length === 0;
   if (!session) {
     _chatSessions[todoId] = { conversationId: conversationId || null, messages: [], streamingText: '', streamingJobId: null };
     session = _chatSessions[todoId];
@@ -4909,9 +4905,6 @@ async function openChat(todoId, conversationId) {
   _showChatOverlay(todoId);
   // Auto-send /ea workon for brand-new chats (no conversationId = not resuming)
   if (isNew && !conversationId) {
-    // Clear stale user-only messages from prior failed attempts
-    session.messages = [];
-    fetch('/api/chats/' + todoId, { method: 'DELETE' }).catch(() => {});
     const msg = '/ea workon ' + todoId;
     session.messages.push({ role: 'user', content: msg });
     session.streamingJobId = 'pending';
