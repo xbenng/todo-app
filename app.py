@@ -2560,21 +2560,24 @@ def _get_active_provider(user_id: str | None = None) -> tuple[str, dict]:
             "api_key": config["anthropic_api_key"],
             "model": config.get("model", "claude-sonnet-4-20250514"),
         }
-    return "local", {"type": "local"}
+    return "none", {"type": "none"}
 
 
 def _run_claude_chat_job(job_id: str, message: str, cwd: str,
                          conversation_id: str | None = None,
                          todo_id: str | None = None):
-    """Dispatcher: route to the active provider via ChatAgent, or local CLI fallback."""
+    """Dispatcher: route to the active provider. Only uses local CLI if explicitly selected."""
     user_id = _jobs.get(job_id, {}).get("user_id")
     name, provider = _get_active_provider(user_id)
-    ptype = provider.get("type", "local")
+    ptype = provider.get("type", "")
     if ptype in ("anthropic", "openai_compat"):
         agent = ChatAgent(job_id, todo_id, provider)
         agent.run(message)
-    else:
+    elif ptype == "local":
         _run_chat_local(job_id, message, cwd, conversation_id, todo_id)
+    else:
+        _jobs[job_id]["output_lines"].append("error: No provider configured. Go to Settings to set up a provider.")
+        _jobs[job_id]["status"] = "error"
 
 
 def _start_claude_chat_job(label: str, job_key: str, message: str, cwd: str,
