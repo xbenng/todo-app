@@ -5991,7 +5991,7 @@ async function _saveMcpConfig(serverName) {
     const configEl = document.getElementById('mcp-config-' + serverName);
     if (configEl) configEl.style.display = 'none';
     await _refreshMcp();
-  } catch { showToast('Failed to save', true); }
+  });
 }
 
 async function _loadMcpAccounts(serverName) {
