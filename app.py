@@ -5316,6 +5316,12 @@ function toggleItemDesc(id) {
   } else {
     expandedItems.add(id);
     el.classList.add('item-expanded');
+    // Clear unread when item is expanded (user is viewing it)
+    if (_chatUnread.has(id)) {
+      _chatUnread.delete(id);
+      fetch('/api/chats/' + id + '/read', { method: 'POST' }).catch(() => {});
+      _updateSpinnersInPlace();
+    }
   }
   updateSimpleBtn();
 }
@@ -8231,8 +8237,27 @@ function _flushPendingMarkRead() {
   }
 }
 
+let _lastSelectedTodoId = null;
+
 function applySelection() {
   _flushPendingMarkRead();
+
+  // Clear unread on the previously selected item if it was expanded
+  if (_lastSelectedTodoId && _chatUnread.has(_lastSelectedTodoId) && expandedItems.has(_lastSelectedTodoId)) {
+    _chatUnread.delete(_lastSelectedTodoId);
+    fetch('/api/chats/' + _lastSelectedTodoId + '/read', { method: 'POST' }).catch(() => {});
+    _updateSpinnersInPlace();
+  }
+
+  // Track the current selection
+  const curIdx = selectedIdx;
+  if (curIdx >= 1 && curIdx <= visibleIds.length) {
+    const curId = visibleIds[curIdx - 1];
+    _lastSelectedTodoId = curId.startsWith('__section__:') ? null : curId;
+  } else {
+    _lastSelectedTodoId = null;
+  }
+
   // Collapse previous preview-expanded item
   if (previewExpandedId) {
     const prevEl = document.querySelector(`.todo-item[data-todo-id="${previewExpandedId}"]`);
