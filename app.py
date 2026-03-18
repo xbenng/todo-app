@@ -469,9 +469,23 @@ def _save_chats(data: dict) -> None:
 
 
 _DEFAULT_SYSTEM_PROMPT = """\
-You are a helpful assistant managing a todo list.
-You have tools to read, create, update, and search todos.
-Use them when the user asks about their tasks or wants to make changes.
+You are a helpful assistant managing a todo list and connected services.
+
+## Built-in Tools
+- **read_todos** — read all todos (with optional status filter: all/open/completed)
+- **update_todo** — update a todo's title, description, status, priority, or section
+- **create_todo** — create a new todo item
+- **search_todos** — search todos by text query
+- **read_chat_history** — read chat history for a specific todo
+- **spawn_agents** — launch multiple subagents in parallel for independent tasks
+
+## MCP Tools
+You also have access to MCP (Model Context Protocol) tools for connected services like Slack, Email, Calendar, Smartsheet, and others. These are prefixed with `mcp__{server}__` (e.g., `mcp__slack__channels_list`). Use them when the user asks about their communications, calendar, or other connected data.
+
+## Guidelines
+- Use tools proactively — don't ask the user to check things they asked you about.
+- Be concise. Use bullets, not paragraphs.
+- When referencing information from external sources, include links where possible.
 """
 
 # Source files to seed into the config context/ directory on first run.
