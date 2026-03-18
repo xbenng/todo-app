@@ -1,4 +1,7 @@
 __pycache__/
 *.pyc
+*.log
 nohup.out
 todos.md
+=0.40
+.DS_Store
