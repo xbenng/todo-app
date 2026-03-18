@@ -5924,7 +5924,8 @@ function _renderMcpConfig(serverName) {
         + (connected ? 'Reconnect with ' : 'Connect with ') + esc(p.label) + '</button>';
     });
     if (fields.some(f => f.has_value)) {
-      html += '<div style="font-size:0.7rem;color:#22c55e;margin-bottom:8px">Connected</div>';
+      html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px"><span style="font-size:0.7rem;color:#22c55e">Connected</span>'
+        + '<button class="mcp-tool-btn danger" onclick="_clearMcpCredential(\'' + esc(serverName) + '\')" style="font-size:0.65rem">Disconnect</button></div>';
     }
     html += '<details style="margin-bottom:8px"><summary style="font-size:0.72rem;color:var(--subtle);cursor:pointer">Or enter token manually</summary><div style="margin-top:6px">';
   }
@@ -5942,6 +5943,26 @@ function _renderMcpConfig(serverName) {
     html += '</div></details>';
   }
   el.innerHTML = html;
+}
+
+async function _clearMcpCredential(serverName) {
+  if (!confirm('Disconnect ' + serverName + '?')) return;
+  if (!_mcpStatusData) return;
+  const server = _mcpStatusData.servers.find(s => s.name === serverName);
+  if (!server) return;
+  const tokens = {};
+  for (const f of (server.credential_fields || [])) {
+    tokens[f.key] = '';
+  }
+  try {
+    await fetch('/api/config', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({tokens})
+    });
+    showToast(serverName + ' disconnected');
+    await _refreshMcp();
+  } catch { showToast('Failed to disconnect', true); }
 }
 
 async function _saveMcpConfig(serverName) {
