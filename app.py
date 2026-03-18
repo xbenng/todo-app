@@ -48,15 +48,50 @@ try:
 except ImportError:
     ClientSessionGroup = None
 
+import db as _db
+
 app = Flask(__name__)
 sock = Sock(app)
 TODO_FILE = "todos.md"
 
-# Undo stack: each entry is (active_todos_list, completed_todos_list)
-_undo_stack: deque[tuple[list[dict], list[dict]]] = deque(maxlen=30)
+# Database mode flag — set to True when DATABASE_URL is configured
+_USE_DB = False
 
-# job_id -> {id, label, job_key, status, output_lines, proc, created_at}
+# Undo stack: per-user when DB mode, global when file mode
+_undo_stack: deque[tuple[list[dict], list[dict]]] = deque(maxlen=30)
+_undo_stacks: dict[str, deque] = {}  # user_id -> deque
+
+# job_id -> {id, label, job_key, status, output_lines, proc, created_at, user_id}
 _jobs: dict[str, dict] = {}
+
+
+def get_current_user() -> dict | None:
+    """Extract user from session cookie or Authorization header.
+
+    Returns {"id": ..., "email": ..., "name": ...} or None.
+    In file mode (_USE_DB=False), returns a stub user.
+    """
+    if not _USE_DB:
+        return {"id": "local", "email": "local", "name": "Local User"}
+
+    # Check cookie first
+    token = request.cookies.get("session_token")
+    # Fall back to Authorization header
+    if not token:
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            token = auth[7:]
+    if not token:
+        return None
+    return _db.get_session_user(token)
+
+
+def require_user():
+    """Get current user or abort with 401."""
+    user = get_current_user()
+    if not user:
+        return None
+    return user
 # session_id -> {id, todo_id, title, tmux_target, alive, created_at, needs_auto_send, resume_id}
 _pty_sessions: dict[str, dict] = {}
 
@@ -553,17 +588,90 @@ def _snapshot_and_write(path: str, todos: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Auth routes
+# ---------------------------------------------------------------------------
+
+
+@app.route("/api/auth/register", methods=["POST"])
+def auth_register():
+    if not _USE_DB:
+        return jsonify({"error": "Auth not available in file mode"}), 400
+    data = request.json or {}
+    email = (data.get("email") or "").strip()
+    password = data.get("password") or ""
+    name = (data.get("name") or "").strip()
+    if not email or not password:
+        return jsonify({"error": "Email and password required"}), 400
+    if len(password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters"}), 400
+    try:
+        user = _db.create_user(email, password, name or None)
+    except Exception as exc:
+        if "unique" in str(exc).lower() or "duplicate" in str(exc).lower():
+            return jsonify({"error": "Email already registered"}), 409
+        return jsonify({"error": str(exc)}), 500
+    token = _db.create_session(user["id"])
+    resp = jsonify({"user": user})
+    resp.set_cookie("session_token", token, httponly=True, samesite="Lax",
+                     max_age=60 * 60 * 24 * 30)  # 30 days
+    return resp
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def auth_login():
+    if not _USE_DB:
+        return jsonify({"error": "Auth not available in file mode"}), 400
+    data = request.json or {}
+    email = (data.get("email") or "").strip()
+    password = data.get("password") or ""
+    user = _db.verify_user(email, password)
+    if not user:
+        return jsonify({"error": "Invalid email or password"}), 401
+    token = _db.create_session(user["id"])
+    resp = jsonify({"user": user})
+    resp.set_cookie("session_token", token, httponly=True, samesite="Lax",
+                     max_age=60 * 60 * 24 * 30)
+    return resp
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def auth_logout():
+    token = request.cookies.get("session_token")
+    if token and _USE_DB:
+        _db.delete_session(token)
+    resp = jsonify({"ok": True})
+    resp.delete_cookie("session_token")
+    return resp
+
+
+@app.route("/api/auth/me")
+def auth_me():
+    user = get_current_user()
+    if not user:
+        return jsonify({"error": "Not authenticated"}), 401
+    return jsonify({"user": user})
+
+
+# ---------------------------------------------------------------------------
 # API routes
 # ---------------------------------------------------------------------------
 
 
 @app.route("/")
 def index():
+    user = get_current_user()
+    if _USE_DB and not user:
+        return Response(LOGIN_PAGE, mimetype="text/html")
     return Response(HTML_PAGE, mimetype="text/html")
 
 
 @app.route("/api/todos", methods=["GET"])
 def get_todos():
+    user = get_current_user()
+    if _USE_DB and not user:
+        return jsonify({"error": "Not authenticated"}), 401
+    if _USE_DB:
+        return jsonify(_db.get_todos(user["id"]))
     active = _parse_todo_file(TODO_FILE)
     completed = _parse_todo_file(_completed_file_path(TODO_FILE))
     return jsonify(active + completed)
@@ -571,7 +679,22 @@ def get_todos():
 
 @app.route("/api/todos", methods=["POST"])
 def add_todo():
+    user = get_current_user()
+    if _USE_DB and not user:
+        return jsonify({"error": "Not authenticated"}), 401
     data = request.json
+    if _USE_DB:
+        title = (data.get("title") or "").strip()
+        if not title:
+            return jsonify({"error": "Title is required"}), 400
+        todo = _db.create_todo(
+            user["id"], title,
+            description=(data.get("description") or "").strip(),
+            priority=data.get("priority", DEFAULT_PRIORITY),
+            section=(data.get("section") or "").strip(),
+        )
+        return jsonify(todo), 201
+
     active = _parse_todo_file(TODO_FILE)
     completed = _parse_todo_file(_completed_file_path(TODO_FILE))
     todos = active + completed
@@ -601,8 +724,26 @@ def add_todo():
 
 
 @app.route("/api/todos/<todo_id>", methods=["PUT"])
-def update_todo(todo_id):
+def update_todo_route(todo_id):
+    user = get_current_user()
+    if _USE_DB and not user:
+        return jsonify({"error": "Not authenticated"}), 401
     data = request.json
+    if _USE_DB:
+        fields = {}
+        for k in ("title", "description", "status", "priority", "section"):
+            if k in data:
+                val = data[k]
+                if k == "status" and val not in ("open", "completed"):
+                    continue
+                if k == "priority" and val not in VALID_PRIORITIES:
+                    continue
+                fields[k] = val.strip() if isinstance(val, str) else val
+        result = _db.update_todo(user["id"], todo_id, **fields)
+        if not result:
+            return jsonify({"error": "Not found"}), 404
+        return jsonify(result)
+
     active = _parse_todo_file(TODO_FILE)
     completed = _parse_todo_file(_completed_file_path(TODO_FILE))
     todos = active + completed
@@ -641,7 +782,14 @@ def mark_read(todo_id):
 
 
 @app.route("/api/todos/<todo_id>", methods=["DELETE"])
-def delete_todo(todo_id):
+def delete_todo_route(todo_id):
+    user = get_current_user()
+    if _USE_DB and not user:
+        return jsonify({"error": "Not authenticated"}), 401
+    if _USE_DB:
+        if not _db.delete_todo(user["id"], todo_id):
+            return jsonify({"error": "Not found"}), 404
+        return jsonify({"ok": True})
     active = _parse_todo_file(TODO_FILE)
     completed = _parse_todo_file(_completed_file_path(TODO_FILE))
     todos = active + completed
@@ -1585,18 +1733,20 @@ class ChatAgent:
         return _openai_tool_defs(self.depth)
 
     def _persist_response(self) -> None:
-        """Persist assistant response to chats file and mark unread."""
+        """Persist assistant response to chats/DB and mark unread."""
         if self.todo_id and self.assistant_text_lines:
             try:
-                chats = _load_chats()
-                chat = chats.get(self.todo_id, {"conversationId": None, "messages": []})
-                chat["messages"].append({
-                    "role": "assistant",
-                    "content": "\n".join(self.assistant_text_lines)
-                })
-                chat["unread"] = True
-                chats[self.todo_id] = chat
-                _save_chats(chats)
+                content = "\n".join(self.assistant_text_lines)
+                if _USE_DB:
+                    user_id = self.job.get("user_id")
+                    _db.add_message(self.todo_id, user_id, "assistant", content)
+                else:
+                    chats = _load_chats()
+                    chat = chats.get(self.todo_id, {"conversationId": None, "messages": []})
+                    chat["messages"].append({"role": "assistant", "content": content})
+                    chat["unread"] = True
+                    chats[self.todo_id] = chat
+                    _save_chats(chats)
             except Exception as exc:
                 print(f"[persist] ERROR saving chat for {self.todo_id}: {exc}")
 
@@ -1918,9 +2068,12 @@ def _run_chat_local(job_id: str, message: str, cwd: str,
         _jobs[job_id]["status"] = "error"
 
 
-def _get_active_provider() -> tuple[str, dict]:
+def _get_active_provider(user_id: str | None = None) -> tuple[str, dict]:
     """Return (provider_name, provider_config) for the active provider."""
-    config = _load_config()
+    if _USE_DB and user_id:
+        config = _db.get_config(user_id)
+    else:
+        config = _load_config()
     active = config.get("active_provider", "")
 
     # Explicit local CLI selection
@@ -1965,7 +2118,8 @@ def _run_claude_chat_job(job_id: str, message: str, cwd: str,
 
 def _start_claude_chat_job(label: str, job_key: str, message: str, cwd: str,
                            conversation_id: str | None = None,
-                           todo_id: str | None = None) -> str:
+                           todo_id: str | None = None,
+                           user_id: str | None = None) -> str:
     """Start a headless Claude chat job; return job_id. No dedup — each message is a new job."""
     job_id = str(uuid.uuid4())[:8]
     _jobs[job_id] = {
@@ -1978,6 +2132,7 @@ def _start_claude_chat_job(label: str, job_key: str, message: str, cwd: str,
         "created_at": time.time(),
         "conversation_id": conversation_id,
         "todo_id": todo_id,
+        "user_id": user_id,
     }
     t = threading.Thread(target=_run_claude_chat_job,
                          args=(job_id, message, cwd, conversation_id, todo_id), daemon=True)
@@ -2142,8 +2297,15 @@ def start_in_tmux(todo_id):
 @app.route("/api/todos/<todo_id>/chat", methods=["POST"])
 def chat_with_todo(todo_id):
     """Send a chat message for a todo item, optionally resuming a conversation."""
-    todos = _parse_todo_file(TODO_FILE)
-    todo = next((t for t in todos if t["id"] == todo_id), None)
+    user = get_current_user()
+    if _USE_DB and not user:
+        return jsonify({"error": "Not authenticated"}), 401
+
+    if _USE_DB:
+        todo = _db.get_todo(user["id"], todo_id)
+    else:
+        todos = _parse_todo_file(TODO_FILE)
+        todo = next((t for t in todos if t["id"] == todo_id), None)
     if not todo:
         return jsonify({"error": "Todo not found"}), 404
 
@@ -2152,15 +2314,17 @@ def chat_with_todo(todo_id):
     if not message:
         return jsonify({"error": "message is required"}), 400
 
-    # Server owns conversation state — read conversation_id from file
-    chats = _load_chats()
-    chat = chats.get(todo_id, {"conversationId": None, "messages": []})
-    conversation_id = chat.get("conversationId")
-
-    # Persist user message immediately
-    chat["messages"].append({"role": "user", "content": message})
-    chats[todo_id] = chat
-    _save_chats(chats)
+    if _USE_DB:
+        _db.add_message(todo_id, user["id"], "user", message)
+        meta = _db.get_chat_meta(todo_id)
+        conversation_id = meta["conversation_id"] if meta else None
+    else:
+        chats = _load_chats()
+        chat = chats.get(todo_id, {"conversationId": None, "messages": []})
+        conversation_id = chat.get("conversationId")
+        chat["messages"].append({"role": "user", "content": message})
+        chats[todo_id] = chat
+        _save_chats(chats)
 
     todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
 
@@ -2171,6 +2335,7 @@ def chat_with_todo(todo_id):
         cwd=todo_dir,
         conversation_id=conversation_id,
         todo_id=todo_id,
+        user_id=user["id"] if user else None,
     )
     return jsonify({"job_id": job_id, "conversation_id": conversation_id})
 
@@ -2178,8 +2343,17 @@ def chat_with_todo(todo_id):
 @app.route("/api/chats/<todo_id>")
 def get_chat(todo_id):
     """Return the persisted chat session for a todo item, plus any running job."""
-    chats = _load_chats()
-    chat = chats.get(todo_id, {"conversationId": None, "messages": []})
+    user = get_current_user()
+    if _USE_DB:
+        messages = _db.get_messages(todo_id) if user else []
+        meta = _db.get_chat_meta(todo_id)
+        chat = {
+            "conversationId": meta["conversation_id"] if meta else None,
+            "messages": messages,
+        }
+    else:
+        chats = _load_chats()
+        chat = chats.get(todo_id, {"conversationId": None, "messages": []})
     # Check for the most recent running chat job for this todo
     job_key = f"chat-{todo_id}"
     latest_job = None
@@ -2195,15 +2369,21 @@ def get_chat(todo_id):
 @app.route("/api/chats/<todo_id>", methods=["DELETE"])
 def delete_chat(todo_id):
     """Clear the persisted chat session for a todo item."""
-    chats = _load_chats()
-    chats.pop(todo_id, None)
-    _save_chats(chats)
+    if _USE_DB:
+        _db.delete_messages(todo_id)
+    else:
+        chats = _load_chats()
+        chats.pop(todo_id, None)
+        _save_chats(chats)
     return jsonify({"ok": True})
 
 
 @app.route("/api/chats/unread")
 def get_unread_chats():
     """Return list of todo_ids with unread chat responses."""
+    user = get_current_user()
+    if _USE_DB and user:
+        return jsonify(list(_db.get_unread_todo_ids(user["id"])))
     chats = _load_chats()
     return jsonify([tid for tid, c in chats.items() if c.get("unread")])
 
@@ -2211,11 +2391,14 @@ def get_unread_chats():
 @app.route("/api/chats/<todo_id>/read", methods=["POST"])
 def mark_chat_read(todo_id):
     """Mark a chat as read."""
-    chats = _load_chats()
-    chat = chats.get(todo_id)
-    if chat and chat.get("unread"):
-        chat["unread"] = False
-        _save_chats(chats)
+    if _USE_DB:
+        _db.mark_chat_read(todo_id)
+    else:
+        chats = _load_chats()
+        chat = chats.get(todo_id)
+        if chat and chat.get("unread"):
+            chat["unread"] = False
+            _save_chats(chats)
     return jsonify({"ok": True})
 
 
@@ -2235,7 +2418,11 @@ def _redact_key(key: str) -> str:
 @app.route("/api/config", methods=["GET"])
 def get_config():
     """Return server config with API keys redacted."""
-    config = _load_config()
+    user = get_current_user()
+    if _USE_DB and user:
+        config = _db.get_config(user["id"])
+    else:
+        config = _load_config()
     safe = dict(config)
     # Redact legacy flat keys
     if "anthropic_api_key" in safe and safe["anthropic_api_key"]:
@@ -2312,6 +2499,33 @@ def mcp_reconnect():
         _mcp_manager = MCPManager()
         _mcp_manager.start(mcp_configs, config.get("tokens", {}))
     return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Version history (DB-backed)
+# ---------------------------------------------------------------------------
+
+
+@app.route("/api/history")
+def get_history():
+    """Return recent version history for the current user."""
+    user = get_current_user()
+    if not _USE_DB or not user:
+        return jsonify({"entries": []})
+    entries = _db.get_history(user["id"])
+    return jsonify({"entries": entries})
+
+
+@app.route("/api/history/<int:history_id>/restore", methods=["POST"])
+def restore_history(history_id):
+    """Restore a todo from a history snapshot."""
+    user = get_current_user()
+    if not _USE_DB or not user:
+        return jsonify({"error": "Not available"}), 400
+    result = _db.restore_todo(user["id"], history_id)
+    if not result:
+        return jsonify({"error": "History entry not found"}), 404
+    return jsonify(result)
 
 
 # ---------------------------------------------------------------------------
@@ -2784,6 +2998,83 @@ def kill_job(job_id):
 # ---------------------------------------------------------------------------
 # Embedded HTML UI
 # ---------------------------------------------------------------------------
+
+LOGIN_PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Login — Todo App</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+         background: #0f1117; color: #e2e8f0; display: flex; justify-content: center;
+         align-items: center; min-height: 100vh; }
+  .card { background: #1a1d2e; border-radius: 12px; padding: 32px; width: 360px;
+          box-shadow: 0 8px 32px rgba(0,0,0,0.4); }
+  h1 { font-size: 1.3rem; margin-bottom: 24px; text-align: center; }
+  label { display: block; font-size: 0.82rem; font-weight: 600; margin: 12px 0 4px; }
+  input { width: 100%; padding: 8px 12px; border: 1px solid #2d3348; border-radius: 6px;
+          background: #0f1117; color: #e2e8f0; font-size: 0.9rem; font-family: inherit; }
+  input:focus { outline: none; border-color: #4f6ef7; }
+  button { width: 100%; padding: 10px; margin-top: 20px; border: none; border-radius: 6px;
+           background: #4f6ef7; color: white; font-size: 0.9rem; font-weight: 600;
+           cursor: pointer; font-family: inherit; }
+  button:hover { background: #3a5bd9; }
+  .error { color: #ef4444; font-size: 0.8rem; margin-top: 8px; display: none; }
+  .toggle { text-align: center; margin-top: 16px; font-size: 0.8rem; }
+  .toggle a { color: #4f6ef7; cursor: pointer; text-decoration: none; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1 id="form-title">Sign In</h1>
+  <form id="auth-form" onsubmit="return handleAuth(event)">
+    <div id="name-field" style="display:none">
+      <label for="name">Name</label>
+      <input type="text" id="name" placeholder="Your name">
+    </div>
+    <label for="email">Email</label>
+    <input type="email" id="email" required placeholder="you@example.com">
+    <label for="password">Password</label>
+    <input type="password" id="password" required placeholder="Password" minlength="6">
+    <div class="error" id="error"></div>
+    <button type="submit" id="submit-btn">Sign In</button>
+  </form>
+  <div class="toggle">
+    <span id="toggle-text">Don't have an account?</span>
+    <a onclick="toggleMode()"><span id="toggle-link">Register</span></a>
+  </div>
+</div>
+<script>
+let isRegister = false;
+function toggleMode() {
+  isRegister = !isRegister;
+  document.getElementById('form-title').textContent = isRegister ? 'Register' : 'Sign In';
+  document.getElementById('submit-btn').textContent = isRegister ? 'Create Account' : 'Sign In';
+  document.getElementById('name-field').style.display = isRegister ? 'block' : 'none';
+  document.getElementById('toggle-text').textContent = isRegister ? 'Already have an account?' : "Don't have an account?";
+  document.getElementById('toggle-link').textContent = isRegister ? 'Sign In' : 'Register';
+  document.getElementById('error').style.display = 'none';
+}
+async function handleAuth(e) {
+  e.preventDefault();
+  const errEl = document.getElementById('error');
+  errEl.style.display = 'none';
+  const body = { email: document.getElementById('email').value, password: document.getElementById('password').value };
+  if (isRegister) body.name = document.getElementById('name').value;
+  try {
+    const res = await fetch('/api/auth/' + (isRegister ? 'register' : 'login'), {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!res.ok) { errEl.textContent = data.error || 'Failed'; errEl.style.display = 'block'; return; }
+    window.location.reload();
+  } catch { errEl.textContent = 'Network error'; errEl.style.display = 'block'; }
+}
+</script>
+</body>
+</html>"""
+
 
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
@@ -7231,13 +7522,21 @@ if __name__ == "__main__":
 
     TODO_FILE = args.todo_file
 
-    # Create file if it doesn't exist
-    if not os.path.exists(TODO_FILE):
-        _write_todo_file(TODO_FILE, [])
-        print(f"Created new todo file: {TODO_FILE}")
+    # Initialize database if DATABASE_URL is set
+    database_url = os.environ.get("DATABASE_URL")
+    if database_url:
+        _db.init(database_url)
+        _USE_DB = True
+        print(f"Database connected: {database_url.split('@')[-1] if '@' in database_url else database_url}")
+    else:
+        # File mode — create file if it doesn't exist
+        if not os.path.exists(TODO_FILE):
+            _write_todo_file(TODO_FILE, [])
+            print(f"Created new todo file: {TODO_FILE}")
 
     # Ensure config directory exists (migrates flat file if needed, seeds context)
-    _ensure_config_dir()
+    if not _USE_DB:
+        _ensure_config_dir()
 
     # Start MCP servers (only in the reloader's main process to avoid double-init)
     if os.environ.get("WERKZEUG_RUN_MAIN") == "true" or not os.environ.get("WERKZEUG_RUN_MAIN"):
