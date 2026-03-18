@@ -6578,12 +6578,6 @@ async function startChatBackground(todoId) {
 }
 
 async function openChat(todoId, conversationId) {
-  // Clear chat unread immediately (user is looking at it)
-  if (_chatUnread.has(todoId)) {
-    _chatUnread.delete(todoId);
-    fetch('/api/chats/' + todoId + '/read', { method: 'POST' }).catch(() => {});
-    _updateSpinnersInPlace();
-  }
   // Defer title updated mark-read until navigating away
   _pendingMarkRead = todoId;
   // Load persisted chat from server
@@ -6983,10 +6977,8 @@ function _chatStreamDone(todoId, error, assistantText) {
     session.messages.push({ role: 'assistant', content: assistantText });
   }
 
-  // If chat panel is open for this item, mark as read; otherwise it stays unread
+  // If chat panel is open for this item, re-render the log
   if (_activeChatTodoId === todoId) {
-    _chatUnread.delete(todoId);
-    fetch('/api/chats/' + todoId + '/read', { method: 'POST' }).catch(() => {});
     _renderChatLog(todoId);
   }
 
