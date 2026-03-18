@@ -317,7 +317,7 @@ def _get_mcp_manager(user_id: str | None = None) -> MCPManager | None:
         enabled_servers = {name for name, p in prefs.items() if p["enabled"]}
         if not enabled_servers:
             return None  # No servers enabled
-    mcp_configs = _build_mcp_configs_from_registry(registry, tokens, enabled_servers)
+    mcp_configs = _build_mcp_configs_from_registry(registry, tokens, enabled_servers, user_id)
     if not mcp_configs:
         return None
     mgr = MCPManager()
@@ -559,8 +559,85 @@ def _load_mcp_registry() -> dict:
         return {}
 
 
+import tempfile as _tempfile
+
+# Track per-user temp dirs for config files (cleaned up on manager stop)
+_user_temp_dirs: dict[str, str] = {}
+
+
+def _write_server_accounts(user_id: str, server_name: str, entry: dict) -> dict:
+    """Write per-user account configs to temp files. Returns extra env vars to set."""
+    if not _USE_DB or not user_id or user_id == "local":
+        return {}
+    if "account_fields" not in entry:
+        return {}
+    accounts = _db.get_server_accounts(user_id, server_name)
+    if not accounts:
+        return {}
+
+    uid = user_id
+    if uid not in _user_temp_dirs:
+        _user_temp_dirs[uid] = _tempfile.mkdtemp(prefix=f"mcp-{uid[:8]}-")
+
+    config_format = entry.get("config_format", "")
+    config_env = entry.get("config_env", "")
+    extra_env = {}
+
+    if config_format == "imap":
+        # IMAP: write accounts.json + .key file under a fake HOME
+        home_dir = os.path.join(_user_temp_dirs[uid], f"imap-{server_name}")
+        imap_dir = os.path.join(home_dir, ".imap-mcp")
+        os.makedirs(imap_dir, exist_ok=True)
+        # Generate encryption key if not exists
+        key_path = os.path.join(imap_dir, ".key")
+        if not os.path.exists(key_path):
+            import secrets as _secrets
+            with open(key_path, "w") as f:
+                f.write(_secrets.token_hex(32))
+        # Read the key for encrypting passwords
+        with open(key_path) as f:
+            enc_key = bytes.fromhex(f.read().strip())
+        # Write accounts with encrypted passwords
+        import hashlib
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        imap_accounts = []
+        for acct in accounts:
+            cfg = dict(acct["config"])
+            cfg.setdefault("id", acct["id"])
+            cfg.setdefault("tls", True)
+            cfg.setdefault("port", 993)
+            # Encrypt password
+            if "password" in cfg and cfg["password"]:
+                iv = os.urandom(16)
+                # Pad to 16 bytes
+                pw = cfg["password"].encode()
+                pad_len = 16 - (len(pw) % 16)
+                pw_padded = pw + bytes([pad_len] * pad_len)
+                cipher = Cipher(algorithms.AES(enc_key), modes.CBC(iv))
+                enc = cipher.encryptor()
+                encrypted = enc.update(pw_padded) + enc.finalize()
+                cfg["password"] = iv.hex() + ":" + encrypted.hex()
+            imap_accounts.append(cfg)
+        with open(os.path.join(imap_dir, "accounts.json"), "w") as f:
+            json.dump(imap_accounts, f)
+        extra_env["HOME"] = home_dir
+
+    elif config_format == "caldav":
+        # CalDAV: write accounts.json, set CALDAV_ACCOUNTS_CONFIG
+        caldav_dir = os.path.join(_user_temp_dirs[uid], f"caldav-{server_name}")
+        os.makedirs(caldav_dir, exist_ok=True)
+        caldav_accounts = [acct["config"] for acct in accounts]
+        config_path = os.path.join(caldav_dir, "accounts.json")
+        with open(config_path, "w") as f:
+            json.dump({"accounts": caldav_accounts}, f)
+        extra_env[config_env] = config_path
+
+    return extra_env
+
+
 def _build_mcp_configs_from_registry(registry: dict, tokens: dict,
-                                     enabled_servers: set | None = None) -> dict:
+                                     enabled_servers: set | None = None,
+                                     user_id: str | None = None) -> dict:
     """Convert registry.json entries + user tokens into MCPManager-compatible server_configs."""
     app_dir = os.path.dirname(os.path.abspath(__file__))
     server_configs = {}
@@ -574,6 +651,9 @@ def _build_mcp_configs_from_registry(registry: dict, tokens: dict,
                 key = field["key"]
                 if key in tokens:
                     env[key] = tokens[key]
+            # Write per-user account configs if needed
+            extra_env = _write_server_accounts(user_id, name, entry)
+            env.update(extra_env)
             # Resolve relative paths in args against app directory
             args = []
             for arg in entry.get("args", []):
@@ -2841,6 +2921,10 @@ def mcp_status():
     for name, reg_entry in registry.items():
         pref = prefs.get(name, {})
         cred_fields = reg_entry.get("credential_fields", [])
+        acct_fields = reg_entry.get("account_fields", [])
+        acct_count = 0
+        if acct_fields and _USE_DB and user_id and user_id != "local":
+            acct_count = len(_db.get_server_accounts(user_id, name))
         entry = {
             "name": name,
             "label": reg_entry.get("label", name),
@@ -2851,6 +2935,8 @@ def mcp_status():
                 {**f, "has_value": bool(user_tokens.get(f["key"]))}
                 for f in cred_fields
             ],
+            "account_fields": acct_fields,
+            "account_count": acct_count,
         }
         if name in connected_status:
             entry["connected"] = connected_status[name].get("connected", False)
@@ -2959,6 +3045,87 @@ def mcp_set_tool():
         _db.set_tool_disabled(user["id"], server, tool, data["disabled"])
     if "auto_approved" in data:
         _db.set_tool_auto_approved(user["id"], server, tool, data["auto_approved"])
+    return jsonify({"ok": True})
+
+
+@app.route("/api/mcp/accounts/<server_name>", methods=["GET"])
+def mcp_get_accounts(server_name):
+    """Get all accounts for a server."""
+    user = get_current_user()
+    if not user or not _USE_DB:
+        return jsonify({"error": "Not authenticated"}), 401
+    accounts = _db.get_server_accounts(user["id"], server_name)
+    # Redact passwords
+    for acct in accounts:
+        cfg = acct["config"]
+        for k in list(cfg.keys()):
+            if "password" in k.lower() and cfg[k]:
+                cfg[k] = "***"
+    return jsonify({"accounts": accounts})
+
+
+@app.route("/api/mcp/accounts/<server_name>", methods=["POST"])
+def mcp_add_account(server_name):
+    """Add an account for a server."""
+    user = get_current_user()
+    if not user or not _USE_DB:
+        return jsonify({"error": "Not authenticated"}), 401
+    registry = _load_mcp_registry()
+    if server_name not in registry:
+        return jsonify({"error": f"Unknown server: {server_name}"}), 400
+    data = request.json or {}
+    acct = _db.add_server_account(user["id"], server_name, data)
+    # Reconnect to pick up new account
+    uid = user["id"]
+    with _mcp_managers_lock:
+        old = _mcp_managers.pop(uid, None)
+    if old:
+        old.stop()
+    return jsonify(acct), 201
+
+
+@app.route("/api/mcp/accounts/<server_name>/<account_id>", methods=["PUT"])
+def mcp_update_account(server_name, account_id):
+    """Update an account."""
+    user = get_current_user()
+    if not user or not _USE_DB:
+        return jsonify({"error": "Not authenticated"}), 401
+    data = request.json or {}
+    # Merge: don't overwrite password with redacted value
+    existing = _db.get_server_accounts(user["id"], server_name)
+    old = next((a for a in existing if a["id"] == account_id), None)
+    if old:
+        merged = dict(old["config"])
+        for k, v in data.items():
+            if "password" in k.lower() and v == "***":
+                continue  # Skip redacted
+            merged[k] = v
+        data = merged
+    if not _db.update_server_account(user["id"], account_id, data):
+        return jsonify({"error": "Not found"}), 404
+    # Reconnect
+    uid = user["id"]
+    with _mcp_managers_lock:
+        old_mgr = _mcp_managers.pop(uid, None)
+    if old_mgr:
+        old_mgr.stop()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/mcp/accounts/<server_name>/<account_id>", methods=["DELETE"])
+def mcp_delete_account(server_name, account_id):
+    """Delete an account."""
+    user = get_current_user()
+    if not user or not _USE_DB:
+        return jsonify({"error": "Not authenticated"}), 401
+    if not _db.delete_server_account(user["id"], account_id):
+        return jsonify({"error": "Not found"}), 404
+    # Reconnect
+    uid = user["id"]
+    with _mcp_managers_lock:
+        old = _mcp_managers.pop(uid, None)
+    if old:
+        old.stop()
     return jsonify({"ok": True})
 
 
@@ -5427,13 +5594,18 @@ async function _loadMcpStatus() {
         const allSet = s.credential_fields.every(f => f.has_value);
         html += '<button class="mcp-tool-btn" onclick="_toggleMcpPanel(\'' + esc(s.name) + '\',\'config\')" style="font-size:0.65rem;' + (allSet ? '' : 'color:#f59e0b;border-color:#f59e0b') + '">Config</button>';
       }
+      if (s.account_fields && s.account_fields.length > 0) {
+        const acctLabel = s.account_count > 0 ? 'Accounts (' + s.account_count + ')' : 'Accounts';
+        html += '<button class="mcp-tool-btn" onclick="_toggleMcpPanel(\'' + esc(s.name) + '\',\'accounts\')" style="font-size:0.65rem;' + (s.account_count === 0 ? 'color:#f59e0b;border-color:#f59e0b' : '') + '">' + acctLabel + '</button>';
+      }
       if (s.enabled && s.connected) {
         html += '<button class="mcp-tool-btn" onclick="_toggleMcpPanel(\'' + esc(s.name) + '\',\'tools\')" style="font-size:0.65rem">Tools</button>';
       }
       html += '</div>';
       // Config panel (credentials)
-      const configId = 'mcp-config-' + s.name;
-      html += '<div id="' + configId + '" class="mcp-tools-list" style="display:none"></div>';
+      html += '<div id="mcp-config-' + s.name + '" class="mcp-tools-list" style="display:none"></div>';
+      // Accounts panel
+      html += '<div id="mcp-accounts-' + s.name + '" class="mcp-tools-list" style="display:none"></div>';
       // Tools panel
       if (s.enabled && s.connected) {
         html += '<div id="' + expandId + '" class="mcp-tools-list" style="display:none">Loading...</div>';
@@ -5472,19 +5644,19 @@ function _renderMcpTools(server) {
 }
 
 function _toggleMcpPanel(serverName, panel) {
-  const configEl = document.getElementById('mcp-config-' + serverName);
-  const toolsEl = document.getElementById('mcp-tools-' + serverName);
-  if (panel === 'config') {
-    if (toolsEl) toolsEl.style.display = 'none';
-    if (configEl) {
-      const show = configEl.style.display === 'none';
-      configEl.style.display = show ? 'block' : 'none';
-      if (show) _renderMcpConfig(serverName);
-    }
-  } else {
-    if (configEl) configEl.style.display = 'none';
-    if (toolsEl) {
-      toolsEl.style.display = toolsEl.style.display === 'none' ? 'block' : 'none';
+  const panels = ['config', 'accounts', 'tools'];
+  for (const p of panels) {
+    const el = document.getElementById('mcp-' + p + '-' + serverName);
+    if (!el) continue;
+    if (p === panel) {
+      const show = el.style.display === 'none';
+      el.style.display = show ? 'block' : 'none';
+      if (show) {
+        if (p === 'config') _renderMcpConfig(serverName);
+        if (p === 'accounts') _loadMcpAccounts(serverName);
+      }
+    } else {
+      el.style.display = 'none';
     }
   }
 }
@@ -5537,6 +5709,102 @@ async function _saveMcpConfig(serverName) {
     if (configEl) configEl.style.display = 'none';
     await _refreshMcp();
   } catch { showToast('Failed to save', true); }
+}
+
+async function _loadMcpAccounts(serverName) {
+  const el = document.getElementById('mcp-accounts-' + serverName);
+  if (!el || !_mcpStatusData) return;
+  const server = _mcpStatusData.servers.find(s => s.name === serverName);
+  if (!server) return;
+  const fields = server.account_fields || [];
+  try {
+    const res = await fetch('/api/mcp/accounts/' + serverName);
+    const data = await res.json();
+    const accounts = data.accounts || [];
+    let html = '';
+    // Existing accounts
+    accounts.forEach(acct => {
+      html += '<div style="border:1px solid var(--border);border-radius:6px;padding:8px;margin-bottom:8px">';
+      html += '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">';
+      html += '<strong style="font-size:0.78rem;flex:1">' + esc(acct.config.name || acct.config.user || acct.id.slice(0,8)) + '</strong>';
+      html += '<button class="mcp-tool-btn danger" onclick="_deleteMcpAccount(\'' + esc(serverName) + '\',\'' + esc(acct.id) + '\')">Delete</button>';
+      html += '</div>';
+      fields.forEach(f => {
+        if (f.key === 'name') return; // already shown as header
+        const val = acct.config[f.key];
+        const display = f.type === 'password' ? (val ? '***' : 'Not set') : (val != null ? String(val) : '');
+        html += '<div style="font-size:0.72rem;color:var(--subtle);padding:1px 0"><span style="color:var(--muted)">' + esc(f.label) + ':</span> ' + esc(display) + '</div>';
+      });
+      html += '</div>';
+    });
+    // Add account form
+    html += '<div style="border:1px dashed var(--border);border-radius:6px;padding:8px;margin-top:4px">';
+    html += '<div style="font-size:0.75rem;font-weight:600;margin-bottom:6px">Add Account</div>';
+    fields.forEach(f => {
+      const fid = 'mcp-acct-' + serverName + '-' + f.key;
+      if (f.type === 'boolean') {
+        html += '<label style="display:flex;align-items:center;gap:6px;font-size:0.72rem;margin-bottom:4px;cursor:pointer">';
+        html += '<input id="' + fid + '" type="checkbox"' + (f.default ? ' checked' : '') + '>';
+        html += esc(f.label) + '</label>';
+      } else if (f.type === 'select') {
+        html += '<label style="font-size:0.72rem;color:var(--subtle);display:block;margin-bottom:2px">' + esc(f.label) + '</label>';
+        html += '<select id="' + fid + '" style="width:100%;padding:4px 8px;font-size:0.78rem;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--fg);margin-bottom:6px;box-sizing:border-box">';
+        (f.options || []).forEach(o => { html += '<option' + (o === f.default ? ' selected' : '') + '>' + esc(o) + '</option>'; });
+        html += '</select>';
+      } else {
+        html += '<label style="font-size:0.72rem;color:var(--subtle);display:block;margin-bottom:2px">' + esc(f.label) + '</label>';
+        html += '<input id="' + fid + '" type="' + (f.type === 'password' ? 'password' : f.type === 'number' ? 'number' : 'text') + '"';
+        if (f.placeholder) html += ' placeholder="' + esc(f.placeholder) + '"';
+        if (f.default != null && f.type === 'number') html += ' value="' + f.default + '"';
+        html += ' style="width:100%;padding:4px 8px;font-size:0.78rem;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--fg);margin-bottom:6px;box-sizing:border-box">';
+      }
+    });
+    html += '<button onclick="_addMcpAccount(\'' + esc(serverName) + '\')" style="background:var(--accent);color:#fff;border:none;padding:4px 14px;border-radius:6px;cursor:pointer;font-size:0.75rem">Add</button>';
+    html += '</div>';
+    el.innerHTML = html;
+  } catch { el.innerHTML = '<div style="color:var(--subtle)">Failed to load accounts.</div>'; }
+}
+
+async function _addMcpAccount(serverName) {
+  if (!_mcpStatusData) return;
+  const server = _mcpStatusData.servers.find(s => s.name === serverName);
+  if (!server) return;
+  const config = {};
+  for (const f of (server.account_fields || [])) {
+    const el = document.getElementById('mcp-acct-' + serverName + '-' + f.key);
+    if (!el) continue;
+    if (f.type === 'boolean') config[f.key] = el.checked;
+    else if (f.type === 'number') config[f.key] = parseInt(el.value) || f.default || 0;
+    else config[f.key] = el.value.trim();
+  }
+  if (!config.name && !config.user) { showToast('Name is required', true); return; }
+  try {
+    const res = await fetch('/api/mcp/accounts/' + serverName, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(config)
+    });
+    if (res.ok) {
+      showToast('Account added');
+      await _loadMcpStatus();
+      _toggleMcpPanel(serverName, 'accounts');
+    } else {
+      const data = await res.json();
+      showToast(data.error || 'Failed', true);
+    }
+  } catch { showToast('Failed to add account', true); }
+}
+
+async function _deleteMcpAccount(serverName, accountId) {
+  if (!confirm('Delete this account?')) return;
+  try {
+    const res = await fetch('/api/mcp/accounts/' + serverName + '/' + accountId, { method: 'DELETE' });
+    if (res.ok) {
+      showToast('Account deleted');
+      await _loadMcpStatus();
+      _toggleMcpPanel(serverName, 'accounts');
+    }
+  } catch { showToast('Failed to delete', true); }
 }
 
 async function _toggleMcpServer(name, enabled) {

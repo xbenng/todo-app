@@ -21,14 +21,34 @@
       "imap_add_spam_domain", "imap_remove_spam_domain",
       "imap_add_whitelist_domain", "imap_list_spam_domains",
       "imap_add_account", "imap_remove_account"
-    ]
+    ],
+    "account_fields": [
+      {"key": "name", "label": "Account Name", "type": "text", "required": true},
+      {"key": "host", "label": "IMAP Host", "type": "text", "required": true, "placeholder": "imap.gmail.com"},
+      {"key": "port", "label": "Port", "type": "number", "default": 993},
+      {"key": "user", "label": "Username", "type": "text", "required": true},
+      {"key": "password", "label": "Password", "type": "password", "required": true},
+      {"key": "tls", "label": "Use TLS", "type": "boolean", "default": true}
+    ],
+    "config_env": "HOME",
+    "config_path": ".imap-mcp/accounts.json",
+    "config_format": "imap"
   },
   "caldav": {
     "label": "Calendar (CalDAV)",
     "type": "stdio",
     "command": "mcp-caldav",
     "args": [],
-    "credential_fields": []
+    "credential_fields": [],
+    "account_fields": [
+      {"key": "name", "label": "Account Name", "type": "text", "required": true},
+      {"key": "url", "label": "CalDAV URL", "type": "text", "required": true, "placeholder": "https://caldav.example.com/user/calendar/"},
+      {"key": "auth_type", "label": "Auth Type", "type": "select", "options": ["basic", "oauth"], "default": "basic"},
+      {"key": "username", "label": "Username", "type": "text"},
+      {"key": "password", "label": "Password", "type": "password"}
+    ],
+    "config_env": "CALDAV_ACCOUNTS_CONFIG",
+    "config_format": "caldav"
   },
   "smartsheet": {
     "label": "Smartsheet",

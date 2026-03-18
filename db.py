@@ -118,6 +118,26 @@ def _run_migrations():
                 """)
                 print("[db] Created user_mcp_preferences table")
 
+            # Migration: user_server_accounts table
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables WHERE table_name = 'user_server_accounts'
+                )
+            """)
+            if not cur.fetchone()[0]:
+                cur.execute("""
+                    CREATE TABLE user_server_accounts (
+                        id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        server_name TEXT NOT NULL,
+                        config      JSONB NOT NULL DEFAULT '{}',
+                        created_at  TIMESTAMPTZ DEFAULT now(),
+                        updated_at  TIMESTAMPTZ DEFAULT now()
+                    );
+                    CREATE INDEX idx_server_accounts_user ON user_server_accounts(user_id, server_name);
+                """)
+                print("[db] Created user_server_accounts table")
+
             # Migration: auto_approve_all column on user_configs
             cur.execute("""
                 SELECT EXISTS (
@@ -780,3 +800,54 @@ def set_tool_auto_approved(user_id: str, server_name: str, tool_name: str, auto_
                        WHERE user_id = %s AND server_name = %s""",
                     (tool_name, user_id, server_name),
                 )
+
+
+# ---------------------------------------------------------------------------
+# Server Accounts (per-user, per-server configs like IMAP/CalDAV accounts)
+# ---------------------------------------------------------------------------
+
+def get_server_accounts(user_id: str, server_name: str) -> list[dict]:
+    """Get all accounts for a user+server. Returns list of {id, config}."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, config FROM user_server_accounts WHERE user_id = %s AND server_name = %s ORDER BY created_at",
+                (user_id, server_name),
+            )
+            return [{"id": str(r[0]), "config": r[1] or {}} for r in cur.fetchall()]
+
+
+def add_server_account(user_id: str, server_name: str, config: dict) -> dict:
+    """Add an account. Returns {id, config}."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO user_server_accounts (user_id, server_name, config)
+                   VALUES (%s, %s, %s) RETURNING id""",
+                (user_id, server_name, json.dumps(config)),
+            )
+            account_id = str(cur.fetchone()[0])
+            return {"id": account_id, "config": config}
+
+
+def update_server_account(user_id: str, account_id: str, config: dict) -> bool:
+    """Update an account's config. Returns True if found."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE user_server_accounts SET config = %s, updated_at = now()
+                   WHERE id = %s AND user_id = %s""",
+                (json.dumps(config), account_id, user_id),
+            )
+            return cur.rowcount > 0
+
+
+def delete_server_account(user_id: str, account_id: str) -> bool:
+    """Delete an account. Returns True if found."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM user_server_accounts WHERE id = %s AND user_id = %s",
+                (account_id, user_id),
+            )
+            return cur.rowcount > 0
