@@ -2177,10 +2177,16 @@ class ChatAgent:
 
     def _build_history(self, message: str) -> list[dict]:
         """Build messages array from persisted history + new message."""
-        chats = _load_chats()
-        chat = chats.get(self.todo_id, {"messages": []}) if self.todo_id else {"messages": []}
+        if _USE_DB and self.todo_id:
+            raw_messages = _db.get_messages(self.todo_id)
+        elif self.todo_id:
+            chats = _load_chats()
+            chat = chats.get(self.todo_id, {"messages": []})
+            raw_messages = chat.get("messages", [])
+        else:
+            raw_messages = []
         messages = []
-        for m in chat.get("messages", []):
+        for m in raw_messages:
             role = m.get("role", "user")
             content = m.get("content", "")
             if role in ("user", "assistant") and isinstance(content, str) and content.strip():
