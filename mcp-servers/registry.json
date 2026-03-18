@@ -44,6 +44,7 @@
         "scope": "https://mail.google.com/ https://www.googleapis.com/auth/userinfo.email",
         "account_template": {
           "name": "{email}",
+          "user": "{email}",
           "host": "imap.gmail.com",
           "port": 993,
           "tls": true,

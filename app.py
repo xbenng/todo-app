@@ -3333,9 +3333,10 @@ def _handle_oauth_callback():
                 email = info_resp.json().get("email", "")
         except Exception:
             pass
-        if email and "{email}" in template.get("url", ""):
-            template["url"] = template["url"].replace("{email}", email)
-        template["name"] = email.split("@")[0] if email else provider_id
+        if email:
+            for k, v in template.items():
+                if isinstance(v, str) and "{email}" in v:
+                    template[k] = v.replace("{email}", email)
         template["oauth_token"] = oauth_token
         _db.add_server_account(user_id, server, template)
     # Reconnect MCP
