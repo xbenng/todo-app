@@ -5316,12 +5316,8 @@ function toggleItemDesc(id) {
   } else {
     expandedItems.add(id);
     el.classList.add('item-expanded');
-    // Clear unread when item is expanded (user is viewing it)
-    if (_chatUnread.has(id)) {
-      _chatUnread.delete(id);
-      fetch('/api/chats/' + id + '/read', { method: 'POST' }).catch(() => {});
-      _updateSpinnersInPlace();
-    }
+    // Track that user viewed this item (unread cleared on deselect)
+    _viewedItems.add(id);
   }
   updateSimpleBtn();
 }
@@ -8230,13 +8226,15 @@ function _flushPendingMarkRead() {
 }
 
 let _lastSelectedTodoId = null;
+let _viewedItems = new Set(); // items that have been expanded while selected
 
 function applySelection() {
   _flushPendingMarkRead();
 
-  // Clear unread on the previously selected item if it was expanded
-  if (_lastSelectedTodoId && _chatUnread.has(_lastSelectedTodoId) && expandedItems.has(_lastSelectedTodoId)) {
+  // Clear unread on the previously selected item if it was ever expanded during this selection
+  if (_lastSelectedTodoId && _chatUnread.has(_lastSelectedTodoId) && _viewedItems.has(_lastSelectedTodoId)) {
     _chatUnread.delete(_lastSelectedTodoId);
+    _viewedItems.delete(_lastSelectedTodoId);
     fetch('/api/chats/' + _lastSelectedTodoId + '/read', { method: 'POST' }).catch(() => {});
     _updateSpinnersInPlace();
   }
