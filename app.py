@@ -2842,14 +2842,32 @@ def get_chat(todo_id):
 
 @app.route("/api/chats/<todo_id>", methods=["DELETE"])
 def delete_chat(todo_id):
-    """Clear the persisted chat session for a todo item."""
+    """Restart chat — starts a new conversation, preserving old messages."""
     if _USE_DB:
-        _db.delete_messages(todo_id)
+        _db.restart_conversation(todo_id)
     else:
         chats = _load_chats()
         chats.pop(todo_id, None)
         _save_chats(chats)
     return jsonify({"ok": True})
+
+
+@app.route("/api/chats/<todo_id>/conversations")
+def get_conversations(todo_id):
+    """List all conversations for a todo."""
+    if not _USE_DB:
+        return jsonify({"conversations": []})
+    convs = _db.get_conversations(todo_id)
+    return jsonify({"conversations": convs})
+
+
+@app.route("/api/chats/<todo_id>/conversations/<int:conv_num>")
+def get_conversation(todo_id, conv_num):
+    """Get messages from a specific past conversation."""
+    if not _USE_DB:
+        return jsonify({"messages": []})
+    messages = _db.get_conversation_messages(todo_id, conv_num)
+    return jsonify({"messages": messages})
 
 
 @app.route("/api/chats/unread")
@@ -6662,6 +6680,55 @@ function _renderChatLog(todoId) {
   log.scrollTop = log.scrollHeight;
 }
 
+async function _showChatHistory() {
+  const todoId = _activeChatTodoId;
+  if (!todoId) return;
+  const log = document.getElementById('chat-log');
+  if (!log) return;
+  try {
+    const res = await fetch('/api/chats/' + todoId + '/conversations');
+    const data = await res.json();
+    const convs = data.conversations || [];
+    if (convs.length <= 1) { showToast('No previous conversations'); return; }
+    let html = '<div style="padding:8px"><div style="font-size:0.82rem;font-weight:600;margin-bottom:8px;color:#e2e8f0">Previous Conversations</div>';
+    convs.forEach(c => {
+      const date = new Date(c.started).toLocaleDateString(undefined, {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+      const isCurrent = c.num === convs[0].num;
+      html += '<div style="display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:6px;cursor:pointer;margin-bottom:4px;'
+        + (isCurrent ? 'background:rgba(79,110,247,0.15);border:1px solid var(--accent)' : 'background:rgba(255,255,255,0.05);border:1px solid transparent')
+        + '" onclick="' + (isCurrent ? '_loadChatSession(\'' + todoId + '\').then(()=>{_renderChatLog(\'' + todoId + '\')})' : '_loadConversation(\'' + todoId + '\',' + c.num + ')') + '">'
+        + '<div style="flex:1"><div style="font-size:0.78rem;color:#e2e8f0">' + date + '</div>'
+        + '<div style="font-size:0.68rem;color:var(--subtle)">' + c.message_count + ' messages</div></div>'
+        + (isCurrent ? '<span style="font-size:0.65rem;color:var(--accent)">current</span>' : '')
+        + '</div>';
+    });
+    html += '</div>';
+    log.innerHTML = html;
+  } catch { showToast('Failed to load history', true); }
+}
+
+async function _loadConversation(todoId, convNum) {
+  try {
+    const res = await fetch('/api/chats/' + todoId + '/conversations/' + convNum);
+    const data = await res.json();
+    const log = document.getElementById('chat-log');
+    if (!log) return;
+    let html = '<div style="padding:4px 8px;font-size:0.7rem;color:var(--subtle);cursor:pointer" onclick="_loadChatSession(\'' + todoId + '\').then(()=>{_renderChatLog(\'' + todoId + '\')})">&larr; Back to current</div>';
+    (data.messages || []).forEach((msg, i) => {
+      if (i > 0 && msg.role === 'user') html += '<hr class="chat-turn-sep">';
+      if (msg.role === 'user') {
+        html += '<div class="chat-user-line">&gt; ' + esc(msg.content) + '</div>';
+      } else {
+        html += '<div class="chat-assistant-block">' + renderMd(msg.content) + '</div>';
+      }
+    });
+    if (!data.messages || data.messages.length === 0) {
+      html += '<div style="color:var(--subtle);padding:8px">No messages in this conversation.</div>';
+    }
+    log.innerHTML = html;
+  } catch { showToast('Failed to load conversation', true); }
+}
+
 async function restartChat() {
   const todoId = _activeChatTodoId;
   if (!todoId) return;
@@ -6674,20 +6741,8 @@ async function restartChat() {
   _renderChatLog(todoId);
   _syncChatSendBtn(todoId);
   fetch('/api/chats/' + todoId, { method: 'DELETE' }).catch(() => {});
-  // Auto-send /ea workon
-  const msg = '/ea workon ' + todoId;
-  const s = _chatSessions[todoId];
-  s.messages.push({ role: 'user', content: msg });
-  s.streamingJobId = 'pending';
-  _syncChatSendBtn(todoId);
-  _renderChatLog(todoId);
-  try {
-    const res = await fetch(API + '/' + todoId + '/chat', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ message: msg }),
-    });
-    if (!res.ok) { _chatStreamDone(todoId, 'Failed to send'); return; }
+  showToast('New conversation started');
+}
     const data = await res.json();
     _streamChatResponse(todoId, data.job_id);
   } catch (e) {
@@ -8859,6 +8914,7 @@ window.addEventListener('scroll', () => {
       <span id="chat-provider-badge" style="font-size:0.65rem;color:rgba(255,255,255,0.45);background:rgba(255,255,255,0.08);padding:2px 7px;border-radius:4px;white-space:nowrap;flex-shrink:0;opacity:0;transition:opacity 0.15s" onmouseenter="this.style.opacity='1'" onmouseleave="this.style.opacity='0'"></span>
       <button onclick="if(_activeChatTodoId){document.getElementById('chat-input').value='/ea checkon '+_activeChatTodoId;sendChatMessage(_activeChatTodoId)}" style="background:rgba(255,255,255,0.1);border:none;color:#e2e8f0;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem" onmousedown="event.stopPropagation()">Check On</button>
       <button onclick="if(_activeChatTodoId){document.getElementById('chat-input').value='/compact';sendChatMessage(_activeChatTodoId)}" style="background:rgba(255,255,255,0.1);border:none;color:#e2e8f0;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem" onmousedown="event.stopPropagation()">Compact</button>
+      <button onclick="_showChatHistory()" style="background:rgba(255,255,255,0.1);border:none;color:#e2e8f0;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem" onmousedown="event.stopPropagation()">History</button>
       <button onclick="restartChat()" style="background:rgba(255,255,255,0.1);border:none;color:#e2e8f0;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem" onmousedown="event.stopPropagation()">Restart</button>
     </div>
     <div id="chat-log" class="chat-log"></div>

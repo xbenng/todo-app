@@ -149,6 +149,20 @@ def _run_migrations():
                 cur.execute("ALTER TABLE user_configs ADD COLUMN auto_approve_all BOOLEAN DEFAULT FALSE")
                 print("[db] Added auto_approve_all to user_configs")
 
+            # Migration: conversation_num on messages + current_conversation on chats
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.columns
+                    WHERE table_name = 'messages' AND column_name = 'conversation_num'
+                )
+            """)
+            if not cur.fetchone()[0]:
+                cur.execute("""
+                    ALTER TABLE messages ADD COLUMN conversation_num INT DEFAULT 0;
+                    ALTER TABLE chats ADD COLUMN current_conversation INT DEFAULT 0;
+                """)
+                print("[db] Added conversation_num to messages, current_conversation to chats")
+
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -543,34 +557,81 @@ def restore_todo(user_id: str, history_id: int) -> dict | None:
 # ---------------------------------------------------------------------------
 
 def get_messages(todo_id: str, limit: int = 100) -> list[dict]:
-    """Get chat messages for a todo."""
+    """Get chat messages for the current conversation of a todo."""
     with _conn() as conn:
         with conn.cursor() as cur:
+            cur.execute("SELECT current_conversation FROM chats WHERE todo_id = %s", (todo_id,))
+            row = cur.fetchone()
+            conv_num = row[0] if row and row[0] is not None else 0
             cur.execute(
-                "SELECT role, content, created_at FROM messages WHERE todo_id = %s ORDER BY created_at LIMIT %s",
-                (todo_id, limit),
+                """SELECT role, content, created_at FROM messages
+                   WHERE todo_id = %s AND conversation_num = %s
+                   ORDER BY created_at LIMIT %s""",
+                (todo_id, conv_num, limit),
             )
             return [{"role": r[0], "content": r[1], "created_at": r[2].isoformat()} for r in cur.fetchall()]
 
 
 def add_message(todo_id: str, user_id: str, role: str, content: str):
-    """Add a chat message."""
+    """Add a chat message to the current conversation."""
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO messages (todo_id, user_id, role, content) VALUES (%s, %s, %s, %s)",
-                (todo_id, user_id, role, content),
-            )
-            # Ensure chat metadata row exists
-            cur.execute(
-                """INSERT INTO chats (todo_id, user_id, unread) VALUES (%s, %s, %s)
-                   ON CONFLICT (todo_id) DO UPDATE SET unread = EXCLUDED.unread""",
+                """INSERT INTO chats (todo_id, user_id, unread, current_conversation)
+                   VALUES (%s, %s, %s, 0)
+                   ON CONFLICT (todo_id) DO UPDATE SET unread = EXCLUDED.unread
+                   RETURNING current_conversation""",
                 (todo_id, user_id, role == "assistant"),
             )
+            conv_num = cur.fetchone()[0] or 0
+            cur.execute(
+                "INSERT INTO messages (todo_id, user_id, role, content, conversation_num) VALUES (%s, %s, %s, %s, %s)",
+                (todo_id, user_id, role, content, conv_num),
+            )
+
+
+def restart_conversation(todo_id: str):
+    """Start a new conversation for a todo (preserves old messages)."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE chats SET current_conversation = COALESCE(current_conversation, 0) + 1,
+                   unread = FALSE, conversation_id = NULL
+                   WHERE todo_id = %s""",
+                (todo_id,),
+            )
+
+
+def get_conversations(todo_id: str) -> list[dict]:
+    """List all conversations for a todo (newest first)."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT conversation_num, MIN(created_at) as started, MAX(created_at) as last_msg,
+                          COUNT(*) as message_count
+                   FROM messages WHERE todo_id = %s
+                   GROUP BY conversation_num ORDER BY conversation_num DESC""",
+                (todo_id,),
+            )
+            return [{"num": r[0], "started": r[1].isoformat(), "last_msg": r[2].isoformat(),
+                     "message_count": r[3]} for r in cur.fetchall()]
+
+
+def get_conversation_messages(todo_id: str, conversation_num: int, limit: int = 100) -> list[dict]:
+    """Get messages from a specific conversation."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT role, content, created_at FROM messages
+                   WHERE todo_id = %s AND conversation_num = %s
+                   ORDER BY created_at LIMIT %s""",
+                (todo_id, conversation_num, limit),
+            )
+            return [{"role": r[0], "content": r[1], "created_at": r[2].isoformat()} for r in cur.fetchall()]
 
 
 def delete_messages(todo_id: str):
-    """Delete all messages for a todo (restart chat)."""
+    """Delete all messages for a todo."""
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM messages WHERE todo_id = %s", (todo_id,))
