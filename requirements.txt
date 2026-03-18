@@ -1,4 +1,7 @@
 flask>=3.0
+flask-sock>=0.7
 anthropic>=0.40
 openai>=1.0
 mcp>=1.20
+psycopg2-binary>=2.9
+bcrypt>=4.0
