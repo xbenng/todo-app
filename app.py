@@ -1711,6 +1711,10 @@ def _execute_tool(name: str, input_data: dict, todo_id: str | None,
     if agent_context and agent_context.get("job_id"):
         user_id = _jobs.get(agent_context["job_id"], {}).get("user_id")
 
+    # In DB mode, require user_id — never fall through to file-based operations
+    if _USE_DB and not user_id and name not in ("spawn_agents",):
+        return json.dumps({"error": "Not authenticated"})
+
     try:
         if name == "read_todos":
             if _USE_DB and user_id:
