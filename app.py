@@ -2833,15 +2833,24 @@ def mcp_status():
         prefs = _db.get_mcp_preferences(user_id)
         config = _db.get_config(user_id)
         auto_approve_all = config.get("auto_approve_all", False)
+    # Get user tokens to show which credentials are set
+    user_tokens = {}
+    if _USE_DB and user_id and user_id != "local":
+        user_tokens = config.get("tokens", {})
     servers = []
     for name, reg_entry in registry.items():
         pref = prefs.get(name, {})
+        cred_fields = reg_entry.get("credential_fields", [])
         entry = {
             "name": name,
             "label": reg_entry.get("label", name),
             "enabled": pref.get("enabled", False),
             "disabled_tools": pref.get("disabled_tools", []),
             "auto_approved_tools": pref.get("auto_approved_tools", []),
+            "credential_fields": [
+                {**f, "has_value": bool(user_tokens.get(f["key"]))}
+                for f in cred_fields
+            ],
         }
         if name in connected_status:
             entry["connected"] = connected_status[name].get("connected", False)
@@ -5414,10 +5423,18 @@ async function _loadMcpStatus() {
         + '<span class="mcp-dot ' + dot + '"></span>'
         + '<strong style="flex-shrink:0">' + esc(s.label || s.name) + '</strong>'
         + '<span style="color:var(--subtle);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(info) + '</span>';
+      if (s.credential_fields && s.credential_fields.length > 0) {
+        const allSet = s.credential_fields.every(f => f.has_value);
+        html += '<button class="mcp-tool-btn" onclick="_toggleMcpPanel(\'' + esc(s.name) + '\',\'config\')" style="font-size:0.65rem;' + (allSet ? '' : 'color:#f59e0b;border-color:#f59e0b') + '">Config</button>';
+      }
       if (s.enabled && s.connected) {
-        html += '<button class="mcp-tool-btn" onclick="document.getElementById(\'' + expandId + '\').style.display=document.getElementById(\'' + expandId + '\').style.display===\'none\'?\'block\':\'none\'" style="font-size:0.65rem">Tools</button>';
+        html += '<button class="mcp-tool-btn" onclick="_toggleMcpPanel(\'' + esc(s.name) + '\',\'tools\')" style="font-size:0.65rem">Tools</button>';
       }
       html += '</div>';
+      // Config panel (credentials)
+      const configId = 'mcp-config-' + s.name;
+      html += '<div id="' + configId + '" class="mcp-tools-list" style="display:none"></div>';
+      // Tools panel
       if (s.enabled && s.connected) {
         html += '<div id="' + expandId + '" class="mcp-tools-list" style="display:none">Loading...</div>';
       }
@@ -5442,18 +5459,84 @@ function _renderMcpTools(server) {
   }
   el.innerHTML = tools.map(tool => {
     const t = typeof tool === 'string' ? tool : tool.name;
-    const desc = typeof tool === 'object' ? (tool.description || '') : '';
     const isDis = disabled.has(t);
     const isAuto = autoApproved.has(t);
     const sn = esc(server.name);
     const tn = esc(t);
     return '<div class="mcp-tool-row" style="' + (isDis ? 'opacity:0.5' : '') + '">'
-      + '<span class="tool-name" title="' + esc(desc) + '">' + tn + '</span>'
+      + '<span class="tool-name">' + tn + '</span>'
       + '<button class="mcp-tool-btn' + (isAuto ? ' active' : '') + '" onclick="_setMcpToolInline(this,\'' + sn + '\',\'' + tn + '\',null,' + !isAuto + ')" title="Auto-approve this tool">Auto</button>'
       + '<button class="mcp-tool-btn danger' + (isDis ? ' active' : '') + '" onclick="_setMcpToolInline(this,\'' + sn + '\',\'' + tn + '\',' + !isDis + ',null)" title="Disable this tool">Off</button>'
-      + '</div>'
-      + (desc ? '<div style="padding:0 0 4px 0;font-size:0.65rem;color:var(--subtle);line-height:1.3">' + esc(desc) + '</div>' : '');
+      + '</div>';
   }).join('');
+}
+
+function _toggleMcpPanel(serverName, panel) {
+  const configEl = document.getElementById('mcp-config-' + serverName);
+  const toolsEl = document.getElementById('mcp-tools-' + serverName);
+  if (panel === 'config') {
+    if (toolsEl) toolsEl.style.display = 'none';
+    if (configEl) {
+      const show = configEl.style.display === 'none';
+      configEl.style.display = show ? 'block' : 'none';
+      if (show) _renderMcpConfig(serverName);
+    }
+  } else {
+    if (configEl) configEl.style.display = 'none';
+    if (toolsEl) {
+      toolsEl.style.display = toolsEl.style.display === 'none' ? 'block' : 'none';
+    }
+  }
+}
+
+function _renderMcpConfig(serverName) {
+  const el = document.getElementById('mcp-config-' + serverName);
+  if (!el || !_mcpStatusData) return;
+  const server = _mcpStatusData.servers.find(s => s.name === serverName);
+  if (!server) return;
+  const fields = server.credential_fields || [];
+  if (fields.length === 0) {
+    el.innerHTML = '<div style="color:var(--subtle)">No configuration needed.</div>';
+    return;
+  }
+  el.innerHTML = fields.map(f => {
+    const fid = 'mcp-cred-' + serverName + '-' + f.key;
+    return '<div style="margin-bottom:8px">'
+      + '<label for="' + fid + '" style="font-size:0.72rem;color:var(--subtle);display:block;margin-bottom:2px">' + esc(f.label || f.key) + '</label>'
+      + '<input id="' + fid + '" type="' + (f.type === 'password' ? 'password' : 'text') + '" '
+      + 'placeholder="' + (f.has_value ? '(saved)' : 'Not set') + '" '
+      + 'style="width:100%;padding:4px 8px;font-size:0.78rem;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--fg);box-sizing:border-box">'
+      + '</div>';
+  }).join('')
+    + '<button onclick="_saveMcpConfig(\'' + esc(serverName) + '\')" style="background:var(--accent);color:#fff;border:none;padding:4px 14px;border-radius:6px;cursor:pointer;font-size:0.75rem">Save</button>';
+}
+
+async function _saveMcpConfig(serverName) {
+  if (!_mcpStatusData) return;
+  const server = _mcpStatusData.servers.find(s => s.name === serverName);
+  if (!server) return;
+  const tokens = {};
+  let hasChange = false;
+  for (const f of (server.credential_fields || [])) {
+    const input = document.getElementById('mcp-cred-' + serverName + '-' + f.key);
+    if (input && input.value.trim()) {
+      tokens[f.key] = input.value.trim();
+      hasChange = true;
+    }
+  }
+  if (!hasChange) { showToast('No changes to save'); return; }
+  try {
+    await fetch('/api/config', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({tokens})
+    });
+    showToast('Credentials saved');
+    // Reconnect so the server picks up new credentials
+    const configEl = document.getElementById('mcp-config-' + serverName);
+    if (configEl) configEl.style.display = 'none';
+    await _refreshMcp();
+  } catch { showToast('Failed to save', true); }
 }
 
 async function _toggleMcpServer(name, enabled) {
