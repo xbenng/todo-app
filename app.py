@@ -3235,11 +3235,16 @@ def mcp_oauth_start():
         "client_id": client_id,
         "redirect_uri": redirect_uri,
         "response_type": "code",
-        "scope": provider["scope"],
-        "access_type": "offline",
-        "prompt": "consent",
         "state": state,
     }
+    if provider.get("scope"):
+        params["scope"] = provider["scope"]
+    if provider.get("user_scope"):
+        params["user_scope"] = provider["user_scope"]
+    if not provider.get("user_scope"):
+        # Google-style: request offline access for refresh tokens
+        params["access_type"] = "offline"
+        params["prompt"] = "consent"
     auth_url = provider["auth_uri"] + "?" + urllib.parse.urlencode(params)
     return jsonify({"auth_url": auth_url})
 
@@ -3301,44 +3306,57 @@ def _handle_oauth_callback():
     if resp.status_code != 200:
         return f"<html><body><h3>Token exchange failed</h3><pre>{resp.text}</pre><script>setTimeout(()=>window.close(),5000)</script></body></html>"
     token_data = resp.json()
-    # Build oauth_token in the format the CalDAV server expects
-    oauth_token = {
-        "token": token_data.get("access_token"),
-        "refresh_token": token_data.get("refresh_token"),
-        "token_uri": provider["token_uri"],
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "scopes": provider["scope"].split(),
-        "expiry": (datetime.now(timezone.utc) +
-                   timedelta(seconds=token_data.get("expires_in", 3600))).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-    }
-    # Store in DB
-    if account_id:
-        # Update existing account
-        accounts = _db.get_server_accounts(user_id, server)
-        acct = next((a for a in accounts if a["id"] == account_id), None)
-        if acct:
-            cfg = dict(acct["config"])
-            cfg["oauth_token"] = oauth_token
-            _db.update_server_account(user_id, account_id, cfg)
+    # Extract the access token — support nested paths like "authed_user.access_token"
+    token_path = provider.get("token_path", "access_token")
+    access_token = token_data
+    for key in token_path.split("."):
+        access_token = access_token.get(key) if isinstance(access_token, dict) else None
+    if not access_token:
+        return f"<html><body><h3>No access token in response</h3><pre>{json.dumps(token_data, indent=2)}</pre></body></html>", 400
+    # Check if this provider stores as a credential (e.g., Slack xoxp)
+    store_as = provider.get("store_as")
+    if store_as:
+        # Store directly as a user credential token
+        config = _db.get_config(user_id)
+        tokens = config.get("tokens", {})
+        tokens[store_as] = access_token
+        _db.save_config(user_id, tokens=tokens)
     else:
-        # Create new account from template
-        template = dict(provider.get("account_template", {}))
-        # Get email from Google userinfo API
-        email = ""
-        try:
-            info_resp = _requests.get("https://www.googleapis.com/oauth2/v2/userinfo",
-                                       headers={"Authorization": f"Bearer {oauth_token['token']}"})
-            if info_resp.status_code == 200:
-                email = info_resp.json().get("email", "")
-        except Exception:
-            pass
-        if email:
-            for k, v in template.items():
-                if isinstance(v, str) and "{email}" in v:
-                    template[k] = v.replace("{email}", email)
-        template["oauth_token"] = oauth_token
-        _db.add_server_account(user_id, server, template)
+        # Standard flow: build oauth_token and store on an account
+        oauth_token = {
+            "token": access_token,
+            "refresh_token": token_data.get("refresh_token"),
+            "token_uri": provider["token_uri"],
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "scopes": provider.get("scope", "").split(),
+            "expiry": (datetime.now(timezone.utc) +
+                       timedelta(seconds=token_data.get("expires_in", 3600))).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        }
+        if account_id:
+            accounts = _db.get_server_accounts(user_id, server)
+            acct = next((a for a in accounts if a["id"] == account_id), None)
+            if acct:
+                cfg = dict(acct["config"])
+                cfg["oauth_token"] = oauth_token
+                _db.update_server_account(user_id, account_id, cfg)
+        else:
+            template = dict(provider.get("account_template", {}))
+            # Try to get email for template substitution
+            email = ""
+            try:
+                info_resp = _requests.get("https://www.googleapis.com/oauth2/v2/userinfo",
+                                           headers={"Authorization": f"Bearer {access_token}"})
+                if info_resp.status_code == 200:
+                    email = info_resp.json().get("email", "")
+            except Exception:
+                pass
+            if email:
+                for k, v in template.items():
+                    if isinstance(v, str) and "{email}" in v:
+                        template[k] = v.replace("{email}", email)
+            template["oauth_token"] = oauth_token
+            _db.add_server_account(user_id, server, template)
     # Reconnect MCP
     with _mcp_managers_lock:
         old = _mcp_managers.pop(user_id, None)
