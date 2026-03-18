@@ -2774,6 +2774,17 @@ def mcp_status():
             entry["tool_count"] = connected_status[name].get("tool_count", 0)
             if "error" in connected_status[name]:
                 entry["error"] = connected_status[name]["error"]
+            # Include tool names for this server
+            if mgr and entry["connected"]:
+                prefix = f"mcp__{name}__"
+                # Get global excludes from registry
+                global_excludes = set(reg_entry.get("exclude_tools", []))
+                entry["tools"] = [
+                    t["name"][len(prefix):]
+                    for t in mgr.get_tool_definitions()
+                    if t["name"].startswith(prefix)
+                    and t["name"][len(prefix):] not in global_excludes
+                ]
         else:
             entry["connected"] = False
         servers.append(entry)
@@ -4171,13 +4182,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
       <span style="font-size:0.82rem;font-weight:600">MCP Servers</span>
       <button class="btn btn-sm" onclick="_refreshMcp()" style="border:1px solid var(--border);font-size:0.7rem;padding:2px 8px">Reconnect</button>
-      <span style="flex:1"></span>
-      <label style="display:flex;align-items:center;gap:4px;font-size:0.7rem;color:var(--subtle);cursor:pointer;margin:0">
-        <input type="checkbox" id="mcp-auto-approve-all" onchange="_toggleAutoApproveAll(this.checked)">
-        Auto-approve all
-      </label>
     </div>
     <div id="mcp-server-list" style="margin-bottom:8px"></div>
+    <div style="display:flex;align-items:center;gap:8px;margin:4px 0">
+      <input type="checkbox" id="mcp-auto-approve-all" onchange="_toggleAutoApproveAll(this.checked)" style="margin:0;width:auto;flex-shrink:0">
+      <span style="font-size:0.82rem;font-weight:600;cursor:pointer" onclick="document.getElementById('mcp-auto-approve-all').click()">Bypass tool approvals</span>
+    </div>
+    <div class="settings-hint" style="margin-top:2px">Skip approval prompts and allow the model to run all MCP tools automatically.</div>
     <hr style="border:none;border-top:1px solid var(--border);margin:16px 0 12px">
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
       <span style="font-size:0.82rem;font-weight:600">Version History</span>
@@ -5347,23 +5358,24 @@ async function _loadMcpStatus() {
 function _renderMcpTools(server) {
   const el = document.getElementById('mcp-tools-' + server.name);
   if (!el) return;
-  // Get tool list from the manager (we have tool_count but need names)
-  // Use the status data disabled/auto_approved lists
+  const tools = server.tools || [];
   const disabled = new Set(server.disabled_tools || []);
   const autoApproved = new Set(server.auto_approved_tools || []);
-  // We need tool names — fetch from job definitions or hardcode from status
-  // For now, show the preference controls we have
-  let html = '';
-  if (disabled.size > 0) {
-    html += '<div style="margin-bottom:4px;color:var(--subtle)">Disabled: ' + [...disabled].map(t => '<span style="background:rgba(239,68,68,0.1);padding:1px 4px;border-radius:3px;margin:0 2px">' + esc(t) + ' <button class="mcp-tool-btn" onclick="_setMcpTool(\'' + esc(server.name) + '\',\'' + esc(t) + '\',false,null)" style="font-size:0.6rem;padding:0 3px;margin-left:2px">x</button></span>').join('') + '</div>';
+  if (tools.length === 0) {
+    el.innerHTML = '<div style="color:var(--subtle)">No tools available.</div>';
+    return;
   }
-  if (autoApproved.size > 0) {
-    html += '<div style="margin-bottom:4px;color:var(--subtle)">Auto-approved: ' + [...autoApproved].map(t => '<span style="background:rgba(34,197,94,0.1);padding:1px 4px;border-radius:3px;margin:0 2px">' + esc(t) + ' <button class="mcp-tool-btn" onclick="_setMcpTool(\'' + esc(server.name) + '\',\'' + esc(t) + '\',null,false)" style="font-size:0.6rem;padding:0 3px;margin-left:2px">x</button></span>').join('') + '</div>';
-  }
-  if (!html) {
-    html = '<div style="color:var(--subtle)">' + server.tool_count + ' tools active. Tool permissions are managed via approval prompts during chat.</div>';
-  }
-  el.innerHTML = html;
+  el.innerHTML = tools.map(t => {
+    const isDis = disabled.has(t);
+    const isAuto = autoApproved.has(t);
+    const sn = esc(server.name);
+    const tn = esc(t);
+    return '<div class="mcp-tool-row" style="' + (isDis ? 'opacity:0.5' : '') + '">'
+      + '<span class="tool-name" title="' + tn + '">' + tn + '</span>'
+      + '<button class="mcp-tool-btn' + (isAuto ? ' active' : '') + '" onclick="_setMcpToolInline(this,\'' + sn + '\',\'' + tn + '\',null,' + !isAuto + ')" title="Auto-approve">Auto</button>'
+      + '<button class="mcp-tool-btn danger' + (isDis ? ' active' : '') + '" onclick="_setMcpToolInline(this,\'' + sn + '\',\'' + tn + '\',' + !isDis + ',null)" title="Disable tool">Off</button>'
+      + '</div>';
+  }).join('');
 }
 
 async function _toggleMcpServer(name, enabled) {
@@ -5390,21 +5402,30 @@ async function _setMcpTool(server, tool, disabled, autoApproved) {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(body)
     });
-    await _loadMcpStatus();
   } catch { showToast('Failed to update tool', true); }
 }
 
+async function _setMcpToolInline(btn, server, tool, disabled, autoApproved) {
+  // Toggle UI immediately without collapsing the panel
+  btn.classList.toggle('active');
+  if (disabled !== null) {
+    const row = btn.closest('.mcp-tool-row');
+    if (row) row.style.opacity = disabled ? '0.5' : '1';
+  }
+  await _setMcpTool(server, tool, disabled, autoApproved);
+}
+
 function _showToolApproval(data, todoId) {
+  // Always store on session so it survives chat close/reopen
+  const session = _chatSessions[todoId];
+  if (session) {
+    if (!session._activeApprovals) session._activeApprovals = {};
+    session._activeApprovals[data.approval_id] = data;
+  }
   // Show toast so user notices even if chat isn't open
-  showToast(data.server + '.' + data.tool_display + ' needs approval — open chat to respond');
   const streamEl = document.getElementById('chat-assistant-streaming');
   if (!streamEl) {
-    // Chat not open — store for rendering when chat is opened
-    const session = _chatSessions[todoId];
-    if (session) {
-      if (!session._pendingApprovals) session._pendingApprovals = [];
-      session._pendingApprovals.push(data);
-    }
+    showToast(data.server + '.' + data.tool_display + ' needs approval — open chat to respond');
     return;
   }
   _renderToolApprovalCard(data, streamEl);
@@ -5439,6 +5460,13 @@ async function _respondToolApproval(approvalId, approved, alwaysAllow, btn) {
     statusDiv.style.color = approved ? '#22c55e' : '#ef4444';
     statusDiv.textContent = approved ? (alwaysAllow ? 'Always allowed' : 'Approved') : 'Denied';
     card.appendChild(statusDiv);
+  }
+  // Remove from active approvals so it doesn't re-render on chat reopen
+  if (_activeChatTodoId) {
+    const session = _chatSessions[_activeChatTodoId];
+    if (session && session._activeApprovals) {
+      delete session._activeApprovals[approvalId];
+    }
   }
   try {
     await fetch('/api/mcp/approve', {
@@ -5762,15 +5790,6 @@ function _showChatOverlay(todoId) {
   requestAnimationFrame(() => overlay.classList.add('visible'));
 
   _renderChatLog(todoId);
-  // Flush any pending tool approvals that arrived while chat was closed
-  const session = _chatSessions[todoId];
-  if (session && session._pendingApprovals && session._pendingApprovals.length > 0) {
-    const streamEl = document.getElementById('chat-assistant-streaming');
-    if (streamEl) {
-      session._pendingApprovals.forEach(a => _renderToolApprovalCard(a, streamEl));
-      session._pendingApprovals = [];
-    }
-  }
   const input = document.getElementById('chat-input');
   input.value = '';
   input.focus();
@@ -5832,11 +5851,19 @@ function _renderChatLog(todoId) {
     html += '<div id="chat-spinner" style="margin-top:4px"><l-bouncy size="20" speed="1.75" color="var(--accent)"></l-bouncy></div>';
   }
   log.innerHTML = html;
-  // If streaming, populate the streaming div with current partial text
-  if (session.streamingJobId && session.streamingText) {
+  // If streaming, populate the streaming div with current partial text + pending approvals
+  if (session.streamingJobId) {
     const streamEl = document.getElementById('chat-assistant-streaming');
     if (streamEl) {
-      streamEl.innerHTML = '<div class="chat-assistant-block">' + renderMd(session.streamingText) + '</div>';
+      if (session.streamingText) {
+        streamEl.innerHTML = '<div class="chat-assistant-block">' + renderMd(session.streamingText) + '</div>';
+      }
+      // Re-render any active (unanswered) approval cards
+      if (session._activeApprovals) {
+        for (const data of Object.values(session._activeApprovals)) {
+          _renderToolApprovalCard(data, streamEl);
+        }
+      }
     }
   }
   log.scrollTop = log.scrollHeight;
