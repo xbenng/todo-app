@@ -38,7 +38,7 @@ import struct
 import select as _select
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, Response
 from flask_sock import Sock
 
@@ -3198,7 +3198,11 @@ def mcp_oauth_start():
     sig = hmac.new(_OAUTH_SECRET.encode(), state_data.encode(), hashlib.sha256).hexdigest()[:16]
     state = base64.urlsafe_b64encode(f"{sig}:{state_data}".encode()).decode()
     # Build redirect URI from request host
-    redirect_uri = f"{request.scheme}://{request.host}/api/mcp/oauth/callback"
+    domain = os.environ.get("DOMAIN_NAME")
+    if domain:
+        redirect_uri = f"https://{domain}/api/mcp/oauth/callback"
+    else:
+        redirect_uri = f"{request.scheme}://{request.host}/api/mcp/oauth/callback"
     params = {
         "client_id": client_id,
         "redirect_uri": redirect_uri,
@@ -3215,6 +3219,15 @@ def mcp_oauth_start():
 @app.route("/api/mcp/oauth/callback")
 def mcp_oauth_callback():
     """OAuth callback. Exchanges code for tokens, stores in DB, closes popup."""
+    try:
+        return _handle_oauth_callback()
+    except Exception as exc:
+        import traceback
+        tb = traceback.format_exc()
+        return f"<html><body><h3>Error</h3><pre>{tb}</pre></body></html>", 500
+
+
+def _handle_oauth_callback():
     code = request.args.get("code", "")
     state_b64 = request.args.get("state", "")
     error = request.args.get("error", "")
@@ -3243,7 +3256,11 @@ def mcp_oauth_callback():
     if not provider:
         return "Unknown provider", 400
     client_id, client_secret = _resolve_oauth_creds(provider)
-    redirect_uri = f"{request.scheme}://{request.host}/api/mcp/oauth/callback"
+    domain = os.environ.get("DOMAIN_NAME")
+    if domain:
+        redirect_uri = f"https://{domain}/api/mcp/oauth/callback"
+    else:
+        redirect_uri = f"{request.scheme}://{request.host}/api/mcp/oauth/callback"
     # Exchange code for tokens
     import requests as _requests
     resp = _requests.post(provider["token_uri"], data={
@@ -3257,7 +3274,6 @@ def mcp_oauth_callback():
         return f"<html><body><h3>Token exchange failed</h3><pre>{resp.text}</pre><script>setTimeout(()=>window.close(),5000)</script></body></html>"
     token_data = resp.json()
     # Build oauth_token in the format the CalDAV server expects
-    from datetime import timezone
     oauth_token = {
         "token": token_data.get("access_token"),
         "refresh_token": token_data.get("refresh_token"),
@@ -3280,10 +3296,10 @@ def mcp_oauth_callback():
     else:
         # Create new account from template
         template = dict(provider.get("account_template", {}))
-        # Try to get email from Google's token info
+        # Get email from Google userinfo API
         email = ""
         try:
-            info_resp = _requests.get("https://www.googleapis.com/oauth2/v1/userinfo",
+            info_resp = _requests.get("https://www.googleapis.com/oauth2/v2/userinfo",
                                        headers={"Authorization": f"Bearer {oauth_token['token']}"})
             if info_resp.status_code == 200:
                 email = info_resp.json().get("email", "")
