@@ -6743,12 +6743,6 @@ async function restartChat() {
   fetch('/api/chats/' + todoId, { method: 'DELETE' }).catch(() => {});
   showToast('New conversation started');
 }
-    const data = await res.json();
-    _streamChatResponse(todoId, data.job_id);
-  } catch (e) {
-    _chatStreamDone(todoId, 'Network error');
-  }
-}
 
 function minimizeChat() {
   _flushPendingMarkRead();
