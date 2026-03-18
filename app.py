@@ -5059,10 +5059,29 @@ function minimizeChat() {
   _activeChatTodoId = null;
 }
 
+let _stopConfirmTimer = null;
+let _stopConfirmTodoId = null;
+
 function chatSendOrStop(todoId) {
   const session = _chatSessions[todoId];
   if (session && session.streamingJobId) {
-    stopChat(todoId);
+    // Require double-press to stop
+    if (_stopConfirmTodoId === todoId && _stopConfirmTimer) {
+      clearTimeout(_stopConfirmTimer);
+      _stopConfirmTimer = null;
+      _stopConfirmTodoId = null;
+      stopChat(todoId);
+      _syncChatSendBtn(todoId);
+    } else {
+      _stopConfirmTodoId = todoId;
+      const btn = document.getElementById('chat-send-btn');
+      if (btn) { btn.textContent = 'Confirm Stop'; }
+      _stopConfirmTimer = setTimeout(() => {
+        _stopConfirmTimer = null;
+        _stopConfirmTodoId = null;
+        _syncChatSendBtn(todoId);
+      }, 2000);
+    }
   } else {
     sendChatMessage(todoId);
   }
