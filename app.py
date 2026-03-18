@@ -5313,6 +5313,12 @@ function toggleItemDesc(id) {
   if (expandedItems.has(id)) {
     expandedItems.delete(id);
     el.classList.remove('item-expanded');
+    // Clear unread when collapsing (user has seen it)
+    if (_chatUnread.has(id)) {
+      _chatUnread.delete(id);
+      fetch('/api/chats/' + id + '/read', { method: 'POST' }).catch(() => {});
+      _updateSpinnersInPlace();
+    }
   } else {
     expandedItems.add(id);
     el.classList.add('item-expanded');
