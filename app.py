@@ -5912,7 +5912,23 @@ function _renderMcpConfig(serverName) {
     el.innerHTML = '<div style="color:var(--subtle)">No configuration needed.</div>';
     return;
   }
-  el.innerHTML = fields.map(f => {
+  let html = '';
+  // OAuth connect buttons (for servers like Slack that use store_as)
+  const oauthProviders = server.oauth_providers || [];
+  if (oauthProviders.length > 0) {
+    oauthProviders.forEach(p => {
+      // Check if the credential this OAuth provides is already set
+      const storeKey = server.credential_fields.find(f => f.has_value);
+      const connected = !!storeKey;
+      html += '<button onclick="_startOAuth(\'' + esc(serverName) + '\',\'' + esc(p.id) + '\',\'\')" style="background:#4285f4;color:#fff;border:none;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:0.78rem;margin-bottom:10px;width:100%">'
+        + (connected ? 'Reconnect with ' : 'Connect with ') + esc(p.label) + '</button>';
+    });
+    if (fields.some(f => f.has_value)) {
+      html += '<div style="font-size:0.7rem;color:#22c55e;margin-bottom:8px">Connected</div>';
+    }
+    html += '<details style="margin-bottom:8px"><summary style="font-size:0.72rem;color:var(--subtle);cursor:pointer">Or enter token manually</summary><div style="margin-top:6px">';
+  }
+  html += fields.map(f => {
     const fid = 'mcp-cred-' + serverName + '-' + f.key;
     return '<div style="margin-bottom:8px">'
       + '<label for="' + fid + '" style="font-size:0.72rem;color:var(--subtle);display:block;margin-bottom:2px">' + esc(f.label || f.key) + '</label>'
@@ -5922,6 +5938,10 @@ function _renderMcpConfig(serverName) {
       + '</div>';
   }).join('')
     + '<button onclick="_saveMcpConfig(\'' + esc(serverName) + '\')" style="background:var(--accent);color:#fff;border:none;padding:4px 14px;border-radius:6px;cursor:pointer;font-size:0.75rem">Save</button>';
+  if (oauthProviders.length > 0) {
+    html += '</div></details>';
+  }
+  el.innerHTML = html;
 }
 
 async function _saveMcpConfig(serverName) {
