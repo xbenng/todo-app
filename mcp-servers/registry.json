@@ -48,7 +48,22 @@
       {"key": "password", "label": "Password", "type": "password"}
     ],
     "config_env": "CALDAV_ACCOUNTS_CONFIG",
-    "config_format": "caldav"
+    "config_format": "caldav",
+    "oauth_providers": [
+      {
+        "id": "google",
+        "label": "Google Calendar",
+        "client_id_env": "GOOGLE_CALDAV_CLIENT_ID",
+        "client_secret_env": "GOOGLE_CALDAV_CLIENT_SECRET",
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "scope": "https://www.googleapis.com/auth/calendar",
+        "account_template": {
+          "auth_type": "oauth",
+          "url": "https://apidata.googleusercontent.com/caldav/v2/{email}/events/"
+        }
+      }
+    ]
   },
   "smartsheet": {
     "label": "Smartsheet",

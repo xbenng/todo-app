@@ -623,10 +623,21 @@ def _write_server_accounts(user_id: str, server_name: str, entry: dict) -> dict:
         extra_env["HOME"] = home_dir
 
     elif config_format == "caldav":
-        # CalDAV: write accounts.json, set CALDAV_ACCOUNTS_CONFIG
+        # CalDAV: write accounts.json + OAuth token files, set CALDAV_ACCOUNTS_CONFIG
         caldav_dir = os.path.join(_user_temp_dirs[uid], f"caldav-{server_name}")
         os.makedirs(caldav_dir, exist_ok=True)
-        caldav_accounts = [acct["config"] for acct in accounts]
+        caldav_accounts = []
+        for acct in accounts:
+            cfg = dict(acct["config"])
+            # Write OAuth token file if present
+            oauth_token = cfg.pop("oauth_token", None)
+            if oauth_token and cfg.get("auth_type") == "oauth":
+                acct_name = cfg.get("name", acct["id"][:8])
+                token_path = os.path.join(caldav_dir, f"{acct_name}_token.json")
+                with open(token_path, "w") as tf:
+                    json.dump(oauth_token, tf)
+                cfg["google_token_path"] = token_path
+            caldav_accounts.append(cfg)
         config_path = os.path.join(caldav_dir, "accounts.json")
         with open(config_path, "w") as f:
             json.dump({"accounts": caldav_accounts}, f)
@@ -2937,6 +2948,10 @@ def mcp_status():
             ],
             "account_fields": acct_fields,
             "account_count": acct_count,
+            "oauth_providers": [
+                {"id": p["id"], "label": p["label"]}
+                for p in reg_entry.get("oauth_providers", [])
+            ],
         }
         if name in connected_status:
             entry["connected"] = connected_status[name].get("connected", False)
@@ -3055,9 +3070,12 @@ def mcp_get_accounts(server_name):
     if not user or not _USE_DB:
         return jsonify({"error": "Not authenticated"}), 401
     accounts = _db.get_server_accounts(user["id"], server_name)
-    # Redact passwords
+    # Redact secrets, add oauth_connected flag
     for acct in accounts:
         cfg = acct["config"]
+        if "oauth_token" in cfg:
+            cfg["oauth_connected"] = True
+            del cfg["oauth_token"]
         for k in list(cfg.keys()):
             if "password" in k.lower() and cfg[k]:
                 cfg[k] = "***"
@@ -3127,6 +3145,155 @@ def mcp_delete_account(server_name, account_id):
     if old:
         old.stop()
     return jsonify({"ok": True})
+
+
+import hmac
+import hashlib
+import base64
+import urllib.parse
+
+_OAUTH_SECRET = os.environ.get("OAUTH_STATE_SECRET", "todo-app-oauth-state-secret")
+
+
+def _resolve_oauth_creds(provider: dict) -> tuple[str, str]:
+    """Resolve OAuth client_id and client_secret from env vars or direct values."""
+    client_id = provider.get("client_id") or os.environ.get(provider.get("client_id_env", ""), "")
+    client_secret = provider.get("client_secret") or os.environ.get(provider.get("client_secret_env", ""), "")
+    return client_id, client_secret
+
+
+@app.route("/api/mcp/oauth/start")
+def mcp_oauth_start():
+    """Start an OAuth flow. Returns {auth_url} for the UI to open in a popup."""
+    user = get_current_user()
+    if not user or not _USE_DB:
+        return jsonify({"error": "Not authenticated"}), 401
+    server = request.args.get("server", "")
+    provider_id = request.args.get("provider", "")
+    account_id = request.args.get("account_id", "")
+    registry = _load_mcp_registry()
+    if server not in registry:
+        return jsonify({"error": f"Unknown server: {server}"}), 400
+    providers = registry[server].get("oauth_providers", [])
+    provider = next((p for p in providers if p["id"] == provider_id), None)
+    if not provider:
+        return jsonify({"error": f"Unknown OAuth provider: {provider_id}"}), 400
+    client_id, client_secret = _resolve_oauth_creds(provider)
+    if not client_id:
+        return jsonify({"error": "OAuth client_id not configured (check env vars)"}), 500
+    # Build state (signed)
+    state_data = json.dumps({"user_id": user["id"], "server": server,
+                             "provider": provider_id, "account_id": account_id})
+    sig = hmac.new(_OAUTH_SECRET.encode(), state_data.encode(), hashlib.sha256).hexdigest()[:16]
+    state = base64.urlsafe_b64encode(f"{sig}:{state_data}".encode()).decode()
+    # Build redirect URI from request host
+    redirect_uri = f"{request.scheme}://{request.host}/api/mcp/oauth/callback"
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": provider["scope"],
+        "access_type": "offline",
+        "prompt": "consent",
+        "state": state,
+    }
+    auth_url = provider["auth_uri"] + "?" + urllib.parse.urlencode(params)
+    return jsonify({"auth_url": auth_url})
+
+
+@app.route("/api/mcp/oauth/callback")
+def mcp_oauth_callback():
+    """OAuth callback. Exchanges code for tokens, stores in DB, closes popup."""
+    code = request.args.get("code", "")
+    state_b64 = request.args.get("state", "")
+    error = request.args.get("error", "")
+    if error:
+        return f"<html><body><h3>OAuth Error: {error}</h3><script>window.close()</script></body></html>"
+    if not code or not state_b64:
+        return "Missing code or state", 400
+    # Validate state
+    try:
+        state_raw = base64.urlsafe_b64decode(state_b64).decode()
+        sig, state_data = state_raw.split(":", 1)
+        expected_sig = hmac.new(_OAUTH_SECRET.encode(), state_data.encode(), hashlib.sha256).hexdigest()[:16]
+        if not hmac.compare_digest(sig, expected_sig):
+            return "Invalid state signature", 400
+        state = json.loads(state_data)
+    except Exception:
+        return "Invalid state", 400
+    user_id = state["user_id"]
+    server = state["server"]
+    provider_id = state["provider"]
+    account_id = state.get("account_id", "")
+    # Look up OAuth provider config
+    registry = _load_mcp_registry()
+    providers = registry.get(server, {}).get("oauth_providers", [])
+    provider = next((p for p in providers if p["id"] == provider_id), None)
+    if not provider:
+        return "Unknown provider", 400
+    client_id, client_secret = _resolve_oauth_creds(provider)
+    redirect_uri = f"{request.scheme}://{request.host}/api/mcp/oauth/callback"
+    # Exchange code for tokens
+    import requests as _requests
+    resp = _requests.post(provider["token_uri"], data={
+        "code": code,
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "redirect_uri": redirect_uri,
+        "grant_type": "authorization_code",
+    })
+    if resp.status_code != 200:
+        return f"<html><body><h3>Token exchange failed</h3><pre>{resp.text}</pre><script>setTimeout(()=>window.close(),5000)</script></body></html>"
+    token_data = resp.json()
+    # Build oauth_token in the format the CalDAV server expects
+    from datetime import timezone
+    oauth_token = {
+        "token": token_data.get("access_token"),
+        "refresh_token": token_data.get("refresh_token"),
+        "token_uri": provider["token_uri"],
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "scopes": provider["scope"].split(),
+        "expiry": (datetime.now(timezone.utc) +
+                   timedelta(seconds=token_data.get("expires_in", 3600))).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+    }
+    # Store in DB
+    if account_id:
+        # Update existing account
+        accounts = _db.get_server_accounts(user_id, server)
+        acct = next((a for a in accounts if a["id"] == account_id), None)
+        if acct:
+            cfg = dict(acct["config"])
+            cfg["oauth_token"] = oauth_token
+            _db.update_server_account(user_id, account_id, cfg)
+    else:
+        # Create new account from template
+        template = dict(provider.get("account_template", {}))
+        # Try to get email from Google's token info
+        email = ""
+        try:
+            info_resp = _requests.get("https://www.googleapis.com/oauth2/v1/userinfo",
+                                       headers={"Authorization": f"Bearer {oauth_token['token']}"})
+            if info_resp.status_code == 200:
+                email = info_resp.json().get("email", "")
+        except Exception:
+            pass
+        if email and "{email}" in template.get("url", ""):
+            template["url"] = template["url"].replace("{email}", email)
+        template["name"] = email.split("@")[0] if email else provider_id
+        template["oauth_token"] = oauth_token
+        _db.add_server_account(user_id, server, template)
+    # Reconnect MCP
+    with _mcp_managers_lock:
+        old = _mcp_managers.pop(user_id, None)
+    if old:
+        old.stop()
+    return """<html><body style="font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+<div style="text-align:center"><h3>Connected!</h3><p>You can close this window.</p></div>
+<script>
+if(window.opener){window.opener.postMessage({type:'oauth_complete'},'*')}
+setTimeout(()=>window.close(),2000)
+</script></body></html>"""
 
 
 # ---------------------------------------------------------------------------
@@ -5722,45 +5889,70 @@ async function _loadMcpAccounts(serverName) {
     const data = await res.json();
     const accounts = data.accounts || [];
     let html = '';
+    const oauthProviders = server.oauth_providers || [];
     // Existing accounts
     accounts.forEach(acct => {
+      const isOAuth = acct.config.auth_type === 'oauth';
+      const hasToken = !!acct.config.oauth_connected;
       html += '<div style="border:1px solid var(--border);border-radius:6px;padding:8px;margin-bottom:8px">';
-      html += '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">';
+      html += '<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">';
       html += '<strong style="font-size:0.78rem;flex:1">' + esc(acct.config.name || acct.config.user || acct.id.slice(0,8)) + '</strong>';
+      if (isOAuth) {
+        const statusColor = hasToken ? '#22c55e' : '#f59e0b';
+        const statusText = hasToken ? 'Connected' : 'Not connected';
+        html += '<span style="font-size:0.65rem;color:' + statusColor + '">' + statusText + '</span>';
+        // Find the OAuth provider for reconnect
+        const prov = oauthProviders[0];
+        if (prov) {
+          html += '<button class="mcp-tool-btn" onclick="_startOAuth(\'' + esc(serverName) + '\',\'' + esc(prov.id) + '\',\'' + esc(acct.id) + '\')" style="font-size:0.65rem">' + (hasToken ? 'Reconnect' : 'Connect') + '</button>';
+        }
+      }
       html += '<button class="mcp-tool-btn danger" onclick="_deleteMcpAccount(\'' + esc(serverName) + '\',\'' + esc(acct.id) + '\')">Delete</button>';
       html += '</div>';
-      fields.forEach(f => {
-        if (f.key === 'name') return; // already shown as header
-        const val = acct.config[f.key];
-        const display = f.type === 'password' ? (val ? '***' : 'Not set') : (val != null ? String(val) : '');
-        html += '<div style="font-size:0.72rem;color:var(--subtle);padding:1px 0"><span style="color:var(--muted)">' + esc(f.label) + ':</span> ' + esc(display) + '</div>';
-      });
+      if (!isOAuth) {
+        fields.forEach(f => {
+          if (f.key === 'name') return;
+          const val = acct.config[f.key];
+          const display = f.type === 'password' ? (val ? '***' : 'Not set') : (val != null ? String(val) : '');
+          html += '<div style="font-size:0.72rem;color:var(--subtle);padding:1px 0"><span style="color:var(--muted)">' + esc(f.label) + ':</span> ' + esc(display) + '</div>';
+        });
+      } else {
+        if (acct.config.url) html += '<div style="font-size:0.72rem;color:var(--subtle);padding:1px 0">' + esc(acct.config.url) + '</div>';
+      }
       html += '</div>';
     });
-    // Add account form
-    html += '<div style="border:1px dashed var(--border);border-radius:6px;padding:8px;margin-top:4px">';
-    html += '<div style="font-size:0.75rem;font-weight:600;margin-bottom:6px">Add Account</div>';
-    fields.forEach(f => {
-      const fid = 'mcp-acct-' + serverName + '-' + f.key;
-      if (f.type === 'boolean') {
-        html += '<label style="display:flex;align-items:center;gap:6px;font-size:0.72rem;margin-bottom:4px;cursor:pointer">';
-        html += '<input id="' + fid + '" type="checkbox"' + (f.default ? ' checked' : '') + '>';
-        html += esc(f.label) + '</label>';
-      } else if (f.type === 'select') {
-        html += '<label style="font-size:0.72rem;color:var(--subtle);display:block;margin-bottom:2px">' + esc(f.label) + '</label>';
-        html += '<select id="' + fid + '" style="width:100%;padding:4px 8px;font-size:0.78rem;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--fg);margin-bottom:6px;box-sizing:border-box">';
-        (f.options || []).forEach(o => { html += '<option' + (o === f.default ? ' selected' : '') + '>' + esc(o) + '</option>'; });
-        html += '</select>';
-      } else {
-        html += '<label style="font-size:0.72rem;color:var(--subtle);display:block;margin-bottom:2px">' + esc(f.label) + '</label>';
-        html += '<input id="' + fid + '" type="' + (f.type === 'password' ? 'password' : f.type === 'number' ? 'number' : 'text') + '"';
-        if (f.placeholder) html += ' placeholder="' + esc(f.placeholder) + '"';
-        if (f.default != null && f.type === 'number') html += ' value="' + f.default + '"';
-        html += ' style="width:100%;padding:4px 8px;font-size:0.78rem;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--fg);margin-bottom:6px;box-sizing:border-box">';
-      }
-    });
-    html += '<button onclick="_addMcpAccount(\'' + esc(serverName) + '\')" style="background:var(--accent);color:#fff;border:none;padding:4px 14px;border-radius:6px;cursor:pointer;font-size:0.75rem">Add</button>';
-    html += '</div>';
+    // OAuth quick-connect buttons
+    if (oauthProviders.length > 0) {
+      oauthProviders.forEach(p => {
+        html += '<button onclick="_startOAuth(\'' + esc(serverName) + '\',\'' + esc(p.id) + '\',\'\')" style="background:#4285f4;color:#fff;border:none;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:0.78rem;margin-bottom:8px;width:100%">Connect with ' + esc(p.label) + '</button>';
+      });
+    }
+    // Manual add form (for non-OAuth)
+    if (fields.length > 0) {
+      html += '<details style="margin-top:4px"><summary style="font-size:0.72rem;color:var(--subtle);cursor:pointer">Add manually</summary>';
+      html += '<div style="border:1px dashed var(--border);border-radius:6px;padding:8px;margin-top:4px">';
+      fields.forEach(f => {
+        const fid = 'mcp-acct-' + serverName + '-' + f.key;
+        if (f.type === 'boolean') {
+          html += '<label style="display:flex;align-items:center;gap:6px;font-size:0.72rem;margin-bottom:4px;cursor:pointer">';
+          html += '<input id="' + fid + '" type="checkbox"' + (f.default ? ' checked' : '') + '>';
+          html += esc(f.label) + '</label>';
+        } else if (f.type === 'select') {
+          html += '<label style="font-size:0.72rem;color:var(--subtle);display:block;margin-bottom:2px">' + esc(f.label) + '</label>';
+          html += '<select id="' + fid + '" style="width:100%;padding:4px 8px;font-size:0.78rem;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--fg);margin-bottom:6px;box-sizing:border-box">';
+          (f.options || []).forEach(o => { html += '<option' + (o === f.default ? ' selected' : '') + '>' + esc(o) + '</option>'; });
+          html += '</select>';
+        } else {
+          html += '<label style="font-size:0.72rem;color:var(--subtle);display:block;margin-bottom:2px">' + esc(f.label) + '</label>';
+          html += '<input id="' + fid + '" type="' + (f.type === 'password' ? 'password' : f.type === 'number' ? 'number' : 'text') + '"';
+          if (f.placeholder) html += ' placeholder="' + esc(f.placeholder) + '"';
+          if (f.default != null && f.type === 'number') html += ' value="' + f.default + '"';
+          html += ' style="width:100%;padding:4px 8px;font-size:0.78rem;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--fg);margin-bottom:6px;box-sizing:border-box">';
+        }
+      });
+      html += '<button onclick="_addMcpAccount(\'' + esc(serverName) + '\')" style="background:var(--accent);color:#fff;border:none;padding:4px 14px;border-radius:6px;cursor:pointer;font-size:0.75rem">Add</button>';
+      html += '</div></details>';
+    }
     el.innerHTML = html;
   } catch { el.innerHTML = '<div style="color:var(--subtle)">Failed to load accounts.</div>'; }
 }
@@ -5794,6 +5986,35 @@ async function _addMcpAccount(serverName) {
     }
   } catch { showToast('Failed to add account', true); }
 }
+
+async function _startOAuth(serverName, providerId, accountId) {
+  try {
+    const params = new URLSearchParams({server: serverName, provider: providerId});
+    if (accountId) params.set('account_id', accountId);
+    const res = await fetch('/api/mcp/oauth/start?' + params);
+    const data = await res.json();
+    if (data.auth_url) {
+      window.open(data.auth_url, 'oauth', 'width=600,height=700');
+    } else {
+      showToast(data.error || 'Failed to start OAuth', true);
+    }
+  } catch { showToast('Failed to start OAuth', true); }
+}
+
+// Listen for OAuth completion from popup
+window.addEventListener('message', async (e) => {
+  if (e.data && e.data.type === 'oauth_complete') {
+    showToast('Account connected');
+    await _loadMcpStatus();
+    // Re-open accounts panel for any server that has one open
+    document.querySelectorAll('[id^="mcp-accounts-"]').forEach(el => {
+      if (el.style.display !== 'none') {
+        const name = el.id.replace('mcp-accounts-', '');
+        _loadMcpAccounts(name);
+      }
+    });
+  }
+});
 
 async function _deleteMcpAccount(serverName, accountId) {
   if (!confirm('Delete this account?')) return;
