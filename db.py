@@ -364,6 +364,18 @@ def get_todo(user_id: str, todo_id: str) -> dict | None:
                     "priority": r[4], "section": r[5], "position": r[6]}
 
 
+def get_todos_mtime(user_id: str) -> float:
+    """Get the most recent update timestamp across all todos for a user."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT EXTRACT(EPOCH FROM MAX(updated_at)) FROM todos WHERE user_id = %s",
+                (user_id,),
+            )
+            r = cur.fetchone()
+            return float(r[0]) if r and r[0] else 0.0
+
+
 def create_todo(user_id: str, title: str, description: str = "",
                 priority: str = "none", section: str = "") -> dict:
     """Create a new todo. Returns the new todo dict."""
@@ -657,6 +669,17 @@ def mark_chat_read(todo_id: str):
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute("UPDATE chats SET unread = FALSE WHERE todo_id = %s", (todo_id,))
+
+
+def mark_chat_unread(todo_id: str, user_id: str):
+    """Mark a todo's chat as unread (e.g., after a tool modifies the todo)."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO chats (todo_id, user_id, unread) VALUES (%s, %s, TRUE)
+                   ON CONFLICT (todo_id) DO UPDATE SET unread = TRUE""",
+                (todo_id, user_id),
+            )
 
 
 def get_unread_todo_ids(user_id: str) -> set[str]:

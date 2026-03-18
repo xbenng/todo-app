@@ -1482,7 +1482,13 @@ def reorder_section():
 
 @app.route("/api/todos/mtime", methods=["GET"])
 def get_mtime():
-    """Return the max modification time across both files for change detection."""
+    """Return the max modification time for change detection."""
+    if _USE_DB:
+        user = get_current_user()
+        if user:
+            mtime = _db.get_todos_mtime(user["id"])
+            return jsonify({"mtime": mtime})
+        return jsonify({"mtime": 0})
     mtime = 0
     for p in (TODO_FILE, _completed_file_path(TODO_FILE)):
         try:
@@ -1759,6 +1765,9 @@ def _execute_tool(name: str, input_data: dict, todo_id: str | None,
                 result = _db.update_todo(user_id, tid, **fields)
                 if not result:
                     return json.dumps({"error": f"Todo {tid} not found"})
+                # Mark chat unread so UI highlights the change
+                if agent_context:
+                    _db.mark_chat_unread(tid, user_id)
                 return json.dumps(result, ensure_ascii=False)
             else:
                 active = _parse_todo_file(TODO_FILE)
@@ -1789,6 +1798,9 @@ def _execute_tool(name: str, input_data: dict, todo_id: str | None,
                     priority=input_data.get("priority", DEFAULT_PRIORITY),
                     section=(input_data.get("section") or "").strip(),
                 )
+                # Mark chat unread so UI highlights the new item
+                if agent_context:
+                    _db.mark_chat_unread(new_todo["id"], user_id)
                 return json.dumps(new_todo, ensure_ascii=False)
             else:
                 active = _parse_todo_file(TODO_FILE)
