@@ -55,7 +55,7 @@ except ImportError:
 try:
     import asyncio
     from mcp import ClientSessionGroup, StdioServerParameters
-    from mcp.client.session_group import SseServerParameters
+    from mcp.client.session_group import SseServerParameters, StreamableHttpParameters
 except ImportError:
     ClientSessionGroup = None
 
@@ -207,18 +207,21 @@ class MCPManager:
         for server_name, config in server_configs.items():
             try:
                 self._pending_config_key = server_name
-                await self._connect_server(server_name, config)
+                await asyncio.wait_for(
+                    self._connect_server(server_name, config),
+                    timeout=30
+                )
                 tool_count = sum(1 for t in self._group.tools
                                  if t.startswith(f"mcp__{server_name}__"))
                 self._server_status[server_name] = {
                     "connected": True, "tool_count": tool_count
                 }
-                print(f"MCP connected: {server_name} ({tool_count} tools)")
+                print(f"MCP connected: {server_name} ({tool_count} tools)", flush=True)
             except Exception as exc:
                 self._server_status[server_name] = {
                     "connected": False, "error": str(exc)
                 }
-                print(f"MCP failed: {server_name}: {exc}")
+                print(f"MCP failed: {server_name}: {exc}", flush=True)
         self._pending_config_key = None
 
         # Rebuild cached tool definitions
@@ -246,8 +249,16 @@ class MCPManager:
                 args=config.get("args", []),
                 env=full_env,
             )
+        elif server_type == "streamable-http":
+            params = StreamableHttpParameters(
+                url=config["url"],
+                headers=config.get("headers"),
+            )
         elif server_type in ("sse", "http"):
-            params = SseServerParameters(url=config["url"])
+            params = SseServerParameters(
+                url=config["url"],
+                headers=config.get("headers"),
+            )
         else:
             raise ValueError(f"Unknown MCP server type: {server_type}")
 
@@ -735,11 +746,49 @@ def _build_mcp_configs_from_registry(registry: dict, tokens: dict,
                 "args": args,
                 "env": env,
             }
-        elif server_type in ("sse", "http"):
-            server_configs[name] = {
-                "type": "sse",
+        elif server_type in ("sse", "http", "streamable-http"):
+            cfg = {
+                "type": server_type,
                 "url": entry["url"],
             }
+            # Add Bearer token header if configured
+            bearer_key = entry.get("bearer_token")
+            if bearer_key and bearer_key in tokens:
+                oauth_token = tokens[bearer_key]
+                access_token = None
+                if isinstance(oauth_token, dict):
+                    # Full oauth_token object — refresh only if expired
+                    access_token = oauth_token.get("token")
+                    expiry_str = oauth_token.get("expiry", "")
+                    is_expired = False
+                    if expiry_str:
+                        try:
+                            expiry = datetime.fromisoformat(expiry_str.replace("Z", "+00:00"))
+                            is_expired = datetime.now(timezone.utc) >= expiry
+                        except Exception:
+                            pass
+                    if is_expired and oauth_token.get("refresh_token"):
+                        fresh = _refresh_oauth_token(oauth_token)
+                        if fresh:
+                            access_token = fresh
+                            oauth_token["token"] = fresh
+                            oauth_token["expiry"] = (datetime.now(timezone.utc) +
+                                                     timedelta(seconds=3600)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+                            if _USE_DB and user_id and user_id != "local":
+                                config = _db.get_config(user_id)
+                                db_tokens = config.get("tokens", {})
+                                db_tokens[bearer_key] = oauth_token
+                                _db.save_config(user_id, tokens=db_tokens)
+                elif isinstance(oauth_token, str):
+                    access_token = oauth_token
+                if access_token:
+                    cfg["headers"] = {"Authorization": f"Bearer {access_token}"}
+            # Add Basic auth header as fallback (only if no bearer token set)
+            if "headers" not in cfg:
+                basic_key = entry.get("basic_auth_token")
+                if basic_key and basic_key in tokens and tokens[basic_key]:
+                    cfg["headers"] = {"Authorization": f"Basic {tokens[basic_key]}"}
+            server_configs[name] = cfg
     return server_configs
 
 
@@ -3048,6 +3097,11 @@ def mcp_status():
                 {"id": p["id"], "label": p["label"]}
                 for p in reg_entry.get("oauth_providers", [])
             ],
+            "bearer_token_key": reg_entry.get("bearer_token", ""),
+            "bearer_connected": bool(
+                reg_entry.get("bearer_token") and
+                user_tokens.get(reg_entry.get("bearer_token"))
+            ),
         }
         if name in connected_status:
             entry["connected"] = connected_status[name].get("connected", False)
@@ -3277,9 +3331,20 @@ def mcp_oauth_start():
     client_id, client_secret = _resolve_oauth_creds(provider)
     if not client_id:
         return jsonify({"error": "OAuth client_id not configured (check env vars)"}), 500
-    # Build state (signed)
-    state_data = json.dumps({"user_id": user["id"], "server": server,
-                             "provider": provider_id, "account_id": account_id})
+    # PKCE support
+    code_verifier = ""
+    if provider.get("pkce"):
+        import secrets as _secrets
+        code_verifier = base64.urlsafe_b64encode(_secrets.token_bytes(32)).rstrip(b"=").decode()
+        code_challenge = base64.urlsafe_b64encode(
+            hashlib.sha256(code_verifier.encode()).digest()
+        ).rstrip(b"=").decode()
+    # Build state (signed) — include code_verifier for PKCE
+    state_payload = {"user_id": user["id"], "server": server,
+                     "provider": provider_id, "account_id": account_id}
+    if code_verifier:
+        state_payload["code_verifier"] = code_verifier
+    state_data = json.dumps(state_payload)
     sig = hmac.new(_OAUTH_SECRET.encode(), state_data.encode(), hashlib.sha256).hexdigest()[:16]
     state = base64.urlsafe_b64encode(f"{sig}:{state_data}".encode()).decode()
     # Build redirect URI from request host
@@ -3294,14 +3359,20 @@ def mcp_oauth_start():
         "response_type": "code",
         "state": state,
     }
+    if code_verifier:
+        params["code_challenge"] = code_challenge
+        params["code_challenge_method"] = "S256"
     if provider.get("scope"):
         params["scope"] = provider["scope"]
     if provider.get("user_scope"):
         params["user_scope"] = provider["user_scope"]
-    if not provider.get("user_scope"):
+    if not provider.get("user_scope") and not provider.get("pkce"):
         # Google-style: request offline access for refresh tokens
         params["access_type"] = "offline"
         params["prompt"] = "consent"
+    # Provider-specific extra params (e.g., Atlassian audience)
+    extra = provider.get("extra_auth_params", {})
+    params.update(extra)
     auth_url = provider["auth_uri"] + "?" + urllib.parse.urlencode(params)
     return jsonify({"auth_url": auth_url})
 
@@ -3353,13 +3424,18 @@ def _handle_oauth_callback():
         redirect_uri = f"{request.scheme}://{request.host}/api/mcp/oauth/callback"
     # Exchange code for tokens
     import requests as _requests
-    resp = _requests.post(provider["token_uri"], data={
+    token_payload = {
         "code": code,
         "client_id": client_id,
         "client_secret": client_secret,
         "redirect_uri": redirect_uri,
         "grant_type": "authorization_code",
-    })
+    }
+    # Include PKCE code_verifier if present in state
+    code_verifier = state.get("code_verifier")
+    if code_verifier:
+        token_payload["code_verifier"] = code_verifier
+    resp = _requests.post(provider["token_uri"], data=token_payload)
     if resp.status_code != 200:
         return f"<html><body><h3>Token exchange failed</h3><pre>{resp.text}</pre><script>setTimeout(()=>window.close(),5000)</script></body></html>"
     token_data = resp.json()
@@ -3372,11 +3448,28 @@ def _handle_oauth_callback():
         return f"<html><body><h3>No access token in response</h3><pre>{json.dumps(token_data, indent=2)}</pre></body></html>", 400
     # Check if this provider stores as a credential (e.g., Slack xoxp)
     store_as = provider.get("store_as")
+    store_as_oauth = provider.get("store_as_oauth")
     if store_as:
-        # Store directly as a user credential token
+        # Store directly as a user credential token (raw access token)
         config = _db.get_config(user_id)
         tokens = config.get("tokens", {})
         tokens[store_as] = access_token
+        _db.save_config(user_id, tokens=tokens)
+    elif store_as_oauth:
+        # Store full oauth_token object as a credential (supports refresh)
+        oauth_token = {
+            "token": access_token,
+            "refresh_token": token_data.get("refresh_token"),
+            "token_uri": provider["token_uri"],
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "scopes": provider.get("scope", "").split(),
+            "expiry": (datetime.now(timezone.utc) +
+                       timedelta(seconds=token_data.get("expires_in", 3600))).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        }
+        config = _db.get_config(user_id)
+        tokens = config.get("tokens", {})
+        tokens[store_as_oauth] = oauth_token
         _db.save_config(user_id, tokens=tokens)
     else:
         # Standard flow: build oauth_token and store on an account
@@ -5898,8 +5991,10 @@ async function _loadMcpStatus() {
         + '<span class="mcp-dot ' + dot + '"></span>'
         + '<strong style="flex-shrink:0">' + esc(s.label || s.name) + '</strong>'
         + '<span style="color:var(--subtle);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(info) + '</span>';
-      if (s.credential_fields && s.credential_fields.length > 0) {
-        const allSet = s.credential_fields.every(f => f.has_value);
+      const hasCredFields = s.credential_fields && s.credential_fields.length > 0;
+      const hasOAuth = s.oauth_providers && s.oauth_providers.length > 0;
+      if (hasCredFields || hasOAuth) {
+        const allSet = s.bearer_connected || (hasCredFields && s.credential_fields.every(f => f.has_value));
         html += '<button class="mcp-tool-btn" onclick="_toggleMcpPanel(\'' + esc(s.name) + '\',\'config\')" style="font-size:0.65rem;' + (allSet ? '' : 'color:#f59e0b;border-color:#f59e0b') + '">Config</button>';
       }
       if (s.account_fields && s.account_fields.length > 0) {
@@ -5975,39 +6070,41 @@ function _renderMcpConfig(serverName) {
   const server = _mcpStatusData.servers.find(s => s.name === serverName);
   if (!server) return;
   const fields = server.credential_fields || [];
-  if (fields.length === 0) {
+  const oauthProviders = server.oauth_providers || [];
+  if (fields.length === 0 && oauthProviders.length === 0) {
     el.innerHTML = '<div style="color:var(--subtle)">No configuration needed.</div>';
     return;
   }
   let html = '';
-  // OAuth connect buttons (for servers like Slack that use store_as)
-  const oauthProviders = server.oauth_providers || [];
+  // OAuth connect buttons
   if (oauthProviders.length > 0) {
     oauthProviders.forEach(p => {
-      // Check if the credential this OAuth provides is already set
-      const storeKey = server.credential_fields.find(f => f.has_value);
-      const connected = !!storeKey;
+      const connected = server.bearer_connected || fields.some(f => f.has_value);
       html += '<button onclick="_startOAuth(\'' + esc(serverName) + '\',\'' + esc(p.id) + '\',\'\')" style="background:#4285f4;color:#fff;border:none;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:0.78rem;margin-bottom:10px;width:100%">'
         + (connected ? 'Reconnect with ' : 'Connect with ') + esc(p.label) + '</button>';
     });
-    if (fields.some(f => f.has_value)) {
+    if (server.bearer_connected || fields.some(f => f.has_value)) {
       html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px"><span style="font-size:0.7rem;color:#22c55e">Connected</span>'
         + '<button class="mcp-tool-btn danger" onclick="_clearMcpCredential(\'' + esc(serverName) + '\')" style="font-size:0.65rem">Disconnect</button></div>';
     }
-    html += '<details style="margin-bottom:8px"><summary style="font-size:0.72rem;color:var(--subtle);cursor:pointer">Or enter token manually</summary><div style="margin-top:6px">';
+    if (fields.length > 0) {
+      html += '<details style="margin-bottom:8px"><summary style="font-size:0.72rem;color:var(--subtle);cursor:pointer">Or enter token manually</summary><div style="margin-top:6px">';
+    }
   }
-  html += fields.map(f => {
-    const fid = 'mcp-cred-' + serverName + '-' + f.key;
-    return '<div style="margin-bottom:8px">'
-      + '<label for="' + fid + '" style="font-size:0.72rem;color:var(--subtle);display:block;margin-bottom:2px">' + esc(f.label || f.key) + '</label>'
-      + '<input id="' + fid + '" type="' + (f.type === 'password' ? 'password' : 'text') + '" '
-      + 'placeholder="' + (f.has_value ? '(saved)' : 'Not set') + '" '
-      + 'style="width:100%;padding:4px 8px;font-size:0.78rem;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--fg);box-sizing:border-box">'
-      + '</div>';
-  }).join('')
-    + '<button onclick="_saveMcpConfig(\'' + esc(serverName) + '\')" style="background:var(--accent);color:#fff;border:none;padding:4px 14px;border-radius:6px;cursor:pointer;font-size:0.75rem">Save</button>';
-  if (oauthProviders.length > 0) {
-    html += '</div></details>';
+  if (fields.length > 0) {
+    html += fields.map(f => {
+      const fid = 'mcp-cred-' + serverName + '-' + f.key;
+      return '<div style="margin-bottom:8px">'
+        + '<label for="' + fid + '" style="font-size:0.72rem;color:var(--subtle);display:block;margin-bottom:2px">' + esc(f.label || f.key) + '</label>'
+        + '<input id="' + fid + '" type="' + (f.type === 'password' ? 'password' : 'text') + '" '
+        + 'placeholder="' + (f.has_value ? '(saved)' : 'Not set') + '" '
+        + 'style="width:100%;padding:4px 8px;font-size:0.78rem;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--fg);box-sizing:border-box">'
+        + '</div>';
+    }).join('')
+      + '<button onclick="_saveMcpConfig(\'' + esc(serverName) + '\')" style="background:var(--accent);color:#fff;border:none;padding:4px 14px;border-radius:6px;cursor:pointer;font-size:0.75rem">Save</button>';
+    if (oauthProviders.length > 0) {
+      html += '</div></details>';
+    }
   }
   el.innerHTML = html;
 }
@@ -6020,6 +6117,9 @@ async function _clearMcpCredential(serverName) {
   const tokens = {};
   for (const f of (server.credential_fields || [])) {
     tokens[f.key] = '';
+  }
+  if (server.bearer_token_key) {
+    tokens[server.bearer_token_key] = '';
   }
   _mcpAction(async () => {
     await fetch('/api/config', {

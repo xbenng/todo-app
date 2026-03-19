@@ -108,8 +108,16 @@
   },
   "atlassian": {
     "label": "Atlassian (Jira/Confluence)",
-    "type": "sse",
-    "url": "https://mcp.atlassian.com/v1/sse",
-    "credential_fields": []
+    "type": "stdio",
+    "command": "mcp-atlassian",
+    "args": ["--transport", "stdio"],
+    "credential_fields": [
+      {"key": "CONFLUENCE_URL", "label": "Confluence URL (e.g. https://site.atlassian.net/wiki)", "type": "text"},
+      {"key": "CONFLUENCE_USERNAME", "label": "Email", "type": "text"},
+      {"key": "CONFLUENCE_API_TOKEN", "label": "API Token", "type": "password"},
+      {"key": "JIRA_URL", "label": "Jira URL (e.g. https://site.atlassian.net)", "type": "text"},
+      {"key": "JIRA_USERNAME", "label": "Email", "type": "text"},
+      {"key": "JIRA_API_TOKEN", "label": "API Token", "type": "password"}
+    ]
   }
 }
