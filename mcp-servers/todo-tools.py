@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""MCP stdio server that proxies todo tools back to the todo-app HTTP API.
+"""MCP stdio server that proxies todo tools through the unified execute-tool endpoint.
 
-Launched by Claude CLI as a stdio subprocess. Receives the API base URL
-and auth token via environment variables.
+All calls route through _execute_tool on the server with as_agent=True,
+so writes correctly mark items as unread.
 """
 import json
 import os
 import urllib.request
 import urllib.error
+import urllib.parse
 
 from mcp.server.fastmcp import FastMCP
 
@@ -17,19 +18,19 @@ API_BASE = os.environ.get("TODO_API_BASE", "http://localhost:5222")
 AUTH_TOKEN = os.environ.get("TODO_AUTH_TOKEN", "")
 
 
-def _call_api(endpoint: str, method: str = "GET", data: dict | None = None) -> dict:
-    """Call the todo-app HTTP API."""
-    url = f"{API_BASE}{endpoint}"
+def _call_tool(tool_name: str, tool_input: dict) -> str:
+    """Call a tool via the unified execute-tool endpoint."""
+    url = f"{API_BASE}/api/execute-tool"
     headers = {"Content-Type": "application/json"}
     if AUTH_TOKEN:
         headers["Authorization"] = f"Bearer {AUTH_TOKEN}"
-    body = json.dumps(data).encode() if data else None
-    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    body = json.dumps({"tool": tool_name, "input": tool_input, "as_agent": True}).encode()
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req) as resp:
-            return json.loads(resp.read().decode())
+            return resp.read().decode()
     except urllib.error.HTTPError as e:
-        return {"error": f"HTTP {e.code}: {e.read().decode()[:200]}"}
+        return json.dumps({"error": f"HTTP {e.code}: {e.read().decode()[:200]}"})
 
 
 @mcp.tool()
@@ -40,11 +41,7 @@ def read_todos(status_filter: str = "open", detail: bool = False) -> str:
         status_filter: Filter by status - "all", "open", or "completed". Default: open
         detail: Include full descriptions. Default: false
     """
-    params = f"status={status_filter}"
-    if detail:
-        params += "&detail=true"
-    result = _call_api(f"/api/todos?{params}")
-    return json.dumps(result, ensure_ascii=False)
+    return _call_tool("read_todos", {"status_filter": status_filter, "detail": detail})
 
 
 @mcp.tool()
@@ -54,8 +51,7 @@ def get_todo(todo_id: str) -> str:
     Args:
         todo_id: The todo item ID
     """
-    result = _call_api(f"/api/todos/{urllib.parse.quote(todo_id)}")
-    return json.dumps(result, ensure_ascii=False)
+    return _call_tool("get_todo", {"todo_id": todo_id})
 
 
 @mcp.tool()
@@ -71,19 +67,18 @@ def update_todo(todo_id: str, title: str = "", description: str = "",
         priority: "high", "medium", "low", or "none" (leave empty to keep current)
         section: Section/category name (leave empty to keep current)
     """
-    data = {"todo_id": todo_id}
+    inp = {"todo_id": todo_id}
     if title:
-        data["title"] = title
+        inp["title"] = title
     if description:
-        data["description"] = description
+        inp["description"] = description
     if status:
-        data["status"] = status
+        inp["status"] = status
     if priority:
-        data["priority"] = priority
+        inp["priority"] = priority
     if section:
-        data["section"] = section
-    result = _call_api(f"/api/todos/{todo_id}", method="PUT", data=data)
-    return json.dumps(result, ensure_ascii=False)
+        inp["section"] = section
+    return _call_tool("update_todo", inp)
 
 
 @mcp.tool()
@@ -97,15 +92,14 @@ def create_todo(title: str, description: str = "", priority: str = "none",
         priority: "high", "medium", "low", or "none"
         section: Section/category name
     """
-    data = {"title": title}
+    inp = {"title": title}
     if description:
-        data["description"] = description
+        inp["description"] = description
     if priority:
-        data["priority"] = priority
+        inp["priority"] = priority
     if section:
-        data["section"] = section
-    result = _call_api("/api/todos", method="POST", data=data)
-    return json.dumps(result, ensure_ascii=False)
+        inp["section"] = section
+    return _call_tool("create_todo", inp)
 
 
 @mcp.tool()
@@ -115,11 +109,8 @@ def search_todos(query: str) -> str:
     Args:
         query: Search query text
     """
-    result = _call_api(f"/api/todos/search?q={urllib.parse.quote(query)}")
-    return json.dumps(result, ensure_ascii=False)
+    return _call_tool("search_todos", {"query": query})
 
-
-import urllib.parse
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")

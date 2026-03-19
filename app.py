@@ -162,7 +162,7 @@ class MCPManager:
         """Check if a tool name belongs to an MCP server."""
         return name in self._mcp_tool_names
 
-    def call_tool(self, name: str, arguments: dict, timeout: float = 120.0) -> str:
+    def call_tool(self, name: str, arguments: dict, timeout: float = 30.0) -> str:
         """Execute an MCP tool call synchronously from a Flask thread."""
         if not self._loop or not self._group:
             return json.dumps({"error": "MCP not initialized"})
@@ -1187,6 +1187,21 @@ def add_todo():
     return jsonify(new_todo), 201
 
 
+@app.route("/api/todos/<todo_id>", methods=["GET"])
+def get_single_todo(todo_id):
+    user = get_current_user()
+    if _USE_DB and not user:
+        return jsonify({"error": "Not authenticated"}), 401
+    if _USE_DB:
+        todo = _db.get_todo(user["id"], todo_id)
+    else:
+        todos = _parse_todo_file(TODO_FILE) + _parse_todo_file(_completed_file_path(TODO_FILE))
+        todo = next((t for t in todos if t["id"] == todo_id), None)
+    if not todo:
+        return jsonify({"error": "Not found"}), 404
+    return jsonify(todo)
+
+
 @app.route("/api/todos/<todo_id>", methods=["PUT"])
 def update_todo_route(todo_id):
     user = get_current_user()
@@ -1206,6 +1221,8 @@ def update_todo_route(todo_id):
         result = _db.update_todo(user["id"], todo_id, **fields)
         if not result:
             return jsonify({"error": "Not found"}), 404
+        if data.get("mark_unread"):
+            _db.mark_chat_unread(todo_id, user["id"])
         return jsonify(result)
 
     active = _parse_todo_file(TODO_FILE)
@@ -1576,56 +1593,99 @@ def reorder_section():
         return jsonify({"error": "section required"}), 400
 
     if _USE_DB:
-        all_todos = _db.get_todos(user["id"])
-        active = [t for t in all_todos if t["status"] != "completed"]
-        completed = [t for t in all_todos if t["status"] == "completed"]
+        # Get current section order from DB
+        sections = _db.get_sections(user["id"])
+        sections_order = [s["name"] for s in sections]
+        # Add section if not in DB yet
+        if section not in sections_order:
+            sections_order.append(section)
+        sections_order.remove(section)
+        if before_section is not None:
+            before_section = before_section.strip()
+            if before_section in sections_order:
+                idx = sections_order.index(before_section)
+                sections_order.insert(idx, section)
+            else:
+                sections_order.append(section)
+        else:
+            sections_order.append(section)
+        _db.reorder_sections(user["id"], sections_order)
     else:
         active = _parse_todo_file(TODO_FILE)
         completed = _parse_todo_file(_completed_file_path(TODO_FILE))
-
-    # Build current section order
-    sections_order = []
-    seen = set()
-    for t in active:
-        s = t.get("section", "")
-        if s not in seen:
-            sections_order.append(s)
-            seen.add(s)
-
-    if section not in sections_order:
-        return jsonify({"error": "Section not found"}), 404
-
-    # Remove the section from its current position
-    sections_order.remove(section)
-
-    # Insert before the target section, or at the end
-    if before_section is not None:
-        before_section = before_section.strip()
-        if before_section in sections_order:
-            idx = sections_order.index(before_section)
-            sections_order.insert(idx, section)
+        sections_order = []
+        seen = set()
+        for t in active:
+            s = t.get("section", "")
+            if s not in seen:
+                sections_order.append(s)
+                seen.add(s)
+        if section not in sections_order:
+            return jsonify({"error": "Section not found"}), 404
+        sections_order.remove(section)
+        if before_section is not None:
+            before_section = before_section.strip()
+            if before_section in sections_order:
+                idx = sections_order.index(before_section)
+                sections_order.insert(idx, section)
+            else:
+                sections_order.append(section)
         else:
             sections_order.append(section)
-    else:
-        sections_order.append(section)
-
-    # Rebuild the active list in the new section order
-    section_groups = {}
-    for t in active:
-        s = t.get("section", "")
-        section_groups.setdefault(s, []).append(t)
-
-    rebuilt = []
-    for s in sections_order:
-        rebuilt.extend(section_groups.get(s, []))
-
-    if _USE_DB:
-        for i, t in enumerate(rebuilt):
-            t["position"] = i
-        _db.bulk_update_todos(user["id"], rebuilt)
-    else:
+        section_groups = {}
+        for t in active:
+            section_groups.setdefault(t.get("section", ""), []).append(t)
+        rebuilt = []
+        for s in sections_order:
+            rebuilt.extend(section_groups.get(s, []))
         _snapshot_and_write(TODO_FILE, rebuilt + completed)
     return jsonify({"ok": True})
+
+
+@app.route("/api/sections", methods=["GET"])
+def get_sections():
+    """Return sections for the current user, ordered by position."""
+    user = get_current_user()
+    if not _USE_DB or not user:
+        return jsonify([])
+    return jsonify(_db.get_sections(user["id"]))
+
+
+@app.route("/api/sections", methods=["PUT"])
+def update_section():
+    """Update a section's directives."""
+    user = get_current_user()
+    if not _USE_DB or not user:
+        return jsonify({"error": "Not available"}), 400
+    data = request.json or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "name required"}), 400
+    _db.upsert_section(user["id"], name, directives=data.get("directives"))
+    return jsonify({"ok": True})
+
+
+@app.route("/api/execute-tool", methods=["POST"])
+def execute_tool_endpoint():
+    """Unified tool execution endpoint. Routes through _execute_tool with agent context."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"error": "Not authenticated"}), 401
+    data = request.json or {}
+    tool_name = data.get("tool")
+    tool_input = data.get("input", {})
+    as_agent = data.get("as_agent", False)
+    if not tool_name:
+        return jsonify({"error": "tool required"}), 400
+    agent_ctx = {"job_id": "__api__", "provider": {}, "depth": 0} if as_agent else None
+    # Ensure __api__ pseudo-job exists with user_id so _execute_tool can resolve it
+    if as_agent:
+        _jobs["__api__"] = {"user_id": user["id"]}
+    try:
+        result = _execute_tool(tool_name, tool_input, todo_id=None, agent_context=agent_ctx)
+        return app.response_class(result, mimetype="application/json")
+    finally:
+        _jobs.pop("__api__", None)
 
 
 @app.route("/api/todos/mtime", methods=["GET"])
@@ -1955,7 +2015,6 @@ def _execute_tool(name: str, input_data: dict, todo_id: str | None,
                 result = _db.update_todo(user_id, tid, **fields)
                 if not result:
                     return json.dumps({"error": f"Todo {tid} not found"})
-                # Mark chat unread so UI highlights the change
                 if agent_context:
                     _db.mark_chat_unread(tid, user_id)
                 return json.dumps(result, ensure_ascii=False)
@@ -1988,7 +2047,6 @@ def _execute_tool(name: str, input_data: dict, todo_id: str | None,
                     priority=input_data.get("priority", DEFAULT_PRIORITY),
                     section=(input_data.get("section") or "").strip(),
                 )
-                # Mark chat unread so UI highlights the new item
                 if agent_context:
                     _db.mark_chat_unread(new_todo["id"], user_id)
                 return json.dumps(new_todo, ensure_ascii=False)
@@ -2093,14 +2151,16 @@ def _execute_spawn_agents(agents: list[dict], agent_context: dict, todo_id: str 
             )
             futures[future] = label
 
-        for future in as_completed(futures, timeout=600):
+        subagent_timeout = config.get("subagent_timeout", 120)
+        for future in as_completed(futures, timeout=subagent_timeout + 30):
             try:
-                result = future.result(timeout=300)
+                result = future.result(timeout=subagent_timeout)
                 results.append(result)
             except Exception as exc:
                 results.append({
                     "label": futures[future], "result": "",
-                    "error": str(exc), "input_tokens": 0, "output_tokens": 0,
+                    "error": f"Timed out or failed: {str(exc)[:200]}",
+                    "input_tokens": 0, "output_tokens": 0,
                 })
 
     total_in = sum(r.get("input_tokens", 0) for r in results)
@@ -2606,8 +2666,8 @@ class ChatAgent:
                 self.total_output_tokens += response.usage.output_tokens
 
             if response.stop_reason == "tool_use":
-                tool_results = []
                 assistant_content = []
+                tool_blocks = []
                 for block in response.content:
                     if block.type == "text":
                         assistant_content.append({"type": "text", "text": block.text})
@@ -2616,13 +2676,29 @@ class ChatAgent:
                             "type": "tool_use", "id": block.id,
                             "name": block.name, "input": block.input
                         })
-                        result = _execute_tool(block.name, block.input, self.todo_id,
-                                              agent_context={"job_id": self.job_id, "provider": self.provider, "depth": self.depth})
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": result
-                        })
+                        tool_blocks.append(block)
+                # Execute tool calls in parallel
+                agent_ctx = {"job_id": self.job_id, "provider": self.provider, "depth": self.depth}
+                if len(tool_blocks) > 1:
+                    with ThreadPoolExecutor(max_workers=len(tool_blocks)) as ex:
+                        futures = {
+                            ex.submit(_execute_tool, b.name, b.input, self.todo_id, agent_ctx): b
+                            for b in tool_blocks
+                        }
+                        result_map = {}
+                        for f in as_completed(futures):
+                            b = futures[f]
+                            try:
+                                result_map[b.id] = f.result(timeout=60)
+                            except Exception as exc:
+                                result_map[b.id] = json.dumps({"error": str(exc)[:200]})
+                    tool_results = [{"type": "tool_result", "tool_use_id": b.id, "content": result_map[b.id]} for b in tool_blocks]
+                else:
+                    tool_results = [{
+                        "type": "tool_result",
+                        "tool_use_id": tool_blocks[0].id,
+                        "content": _execute_tool(tool_blocks[0].name, tool_blocks[0].input, self.todo_id, agent_ctx)
+                    }] if tool_blocks else []
                 messages.append({"role": "assistant", "content": assistant_content})
                 messages.append({"role": "user", "content": tool_results})
                 continue
@@ -2678,12 +2754,34 @@ class ChatAgent:
                 messages.append(assistant_msg)
                 for tc in msg.tool_calls:
                     self.emit(f"▶ {tc.function.name}...")
+                # Parse args for all tool calls
+                parsed_calls = []
+                for tc in msg.tool_calls:
                     try:
                         args = json.loads(tc.function.arguments)
                     except json.JSONDecodeError:
                         args = {}
-                    result = _execute_tool(tc.function.name, args, self.todo_id,
-                                          agent_context={"job_id": self.job_id, "provider": self.provider, "depth": self.depth})
+                    parsed_calls.append((tc, args))
+                # Execute in parallel if multiple
+                agent_ctx = {"job_id": self.job_id, "provider": self.provider, "depth": self.depth}
+                if len(parsed_calls) > 1:
+                    with ThreadPoolExecutor(max_workers=len(parsed_calls)) as ex:
+                        futures = {
+                            ex.submit(_execute_tool, tc.function.name, args, self.todo_id, agent_ctx): tc
+                            for tc, args in parsed_calls
+                        }
+                        result_map = {}
+                        for f in as_completed(futures):
+                            tc = futures[f]
+                            try:
+                                result_map[tc.id] = f.result(timeout=60)
+                            except Exception as exc:
+                                result_map[tc.id] = json.dumps({"error": str(exc)[:200]})
+                    for tc, _ in parsed_calls:
+                        messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_map[tc.id]})
+                else:
+                    tc, args = parsed_calls[0]
+                    result = _execute_tool(tc.function.name, args, self.todo_id, agent_ctx)
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
                 continue
             break  # No tool calls — done
@@ -5203,7 +5301,7 @@ async function pollForChanges() {
 
 function startPolling() {
   if (pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(pollForChanges, 1500);
+  pollTimer = setInterval(pollForChanges, 500);
 }
 
 function render() {
@@ -5248,7 +5346,7 @@ function render() {
       const hasTerminal = _termSessions[t.id] && _termSessions[t.id].alive;
       const hasChatStream = _chatSessions[t.id] && _chatSessions[t.id].streamingJobId;
       const hasUnreadChat = _chatUnread.has(t.id);
-      const hasUpdated = _parseTitle(t.title || '').hasUpdatedTag && !_seenUpdates.has(t.id);
+      const hasUpdated = _chatUnread.has(t.id);
       const isActive = hasTerminal || hasChatStream || hasUnreadChat || hasUpdated;
       if (!isActive) return 0;
       // Find most recent job for this todo
@@ -5262,7 +5360,7 @@ function render() {
   };
   const afterUnread = f => {
     if (!filterUnread) return f;
-    return f.filter(t => (_parseTitle(t.title || '').hasUpdatedTag && !_seenUpdates.has(t.id)) || _chatUnread.has(t.id));
+    return f.filter(t => _chatUnread.has(t.id));
   };
   const filteredActive = afterUnread(afterSessions(afterPriority(afterSearch(active))));
   const filteredCompleted = afterUnread(afterSessions(afterPriority(afterSearch(completed))));
@@ -5705,15 +5803,14 @@ function toggleItemDesc(id) {
     expandedItems.delete(id);
     el.classList.remove('item-expanded');
     // Clear unread when collapsing (user has seen it)
-    if (_chatUnread.has(id)) {
-      _chatUnread.delete(id);
-      fetch('/api/chats/' + id + '/read', { method: 'POST' }).catch(() => {});
-      _updateSpinnersInPlace();
+    if (_viewedItems.has(id)) {
+      _viewedItems.delete(id);
+      _clearUnread(id);
     }
   } else {
     expandedItems.add(id);
     el.classList.add('item-expanded');
-    // Track that user viewed this item (unread cleared on deselect)
+    // Track that user viewed this item
     _viewedItems.add(id);
   }
   updateSimpleBtn();
@@ -5726,7 +5823,6 @@ function toggleSectionCollapse(section) {
 }
 
 function collapseStep() {
-  _flushPendingMarkRead();
   // First collapse all items, then collapse all sections
   if (expandedItems.size > 0) {
     expandedItems.clear();
@@ -7177,7 +7273,6 @@ async function restartChat() {
 }
 
 function minimizeChat() {
-  _flushPendingMarkRead();
   const overlay = document.getElementById('chat-overlay');
   overlay.classList.remove('visible');
   document.body.style.overflow = '';
@@ -7835,10 +7930,8 @@ function _updateSpinnersInPlace() {
       if (existingJobSpinner) existingJobSpinner.remove();
     }
 
-    // Unread dot — chat unread OR updated tag unseen
-    const todo = allTodos.find(x => x.id === todoId);
-    const hasUpdatedTag = todo && _parseTitle(todo.title || '').hasUpdatedTag && !_seenUpdates.has(todoId);
-    const hasUnread = _chatUnread.has(todoId) || hasUpdatedTag;
+    // Unread dot — from agent tool writes only
+    const hasUnread = _chatUnread.has(todoId);
     const existingUnreadDot = titleEl.querySelector('.chat-unread-dot');
     if (hasUnread) {
       if (!existingUnreadDot) {
@@ -8092,13 +8185,7 @@ async function pollJobs() {
     } catch {}
     // Poll chat unread state
     try {
-      const uRes = await fetch('/api/chats/unread');
-      const unreadIds = await uRes.json();
-      const newSet = new Set(unreadIds);
-      if (_chatUnread.size !== newSet.size || [..._chatUnread].some(id => !newSet.has(id))) {
-        _chatUnread = newSet;
-        _updateSpinnersInPlace();
-      }
+      // Unread state is pushed via SSE streams — no polling needed
     } catch {}
   } catch {}
 }
@@ -8773,17 +8860,19 @@ function _flushPendingMarkRead() {
 }
 
 let _lastSelectedTodoId = null;
-let _viewedItems = new Set(); // items that have been expanded while selected
+let _viewedItems = new Set();
+
+function _clearUnread(todoId) {
+  _chatUnread.delete(todoId);
+  fetch('/api/chats/' + todoId + '/read', { method: 'POST' }).catch(() => {});
+  _updateSpinnersInPlace();
+}
 
 function applySelection() {
-  _flushPendingMarkRead();
-
-  // Clear unread on the previously selected item if it was ever expanded during this selection
-  if (_lastSelectedTodoId && _chatUnread.has(_lastSelectedTodoId) && _viewedItems.has(_lastSelectedTodoId)) {
-    _chatUnread.delete(_lastSelectedTodoId);
+  // Clear unread on deselect if item was ever expanded
+  if (_lastSelectedTodoId && _viewedItems.has(_lastSelectedTodoId)) {
     _viewedItems.delete(_lastSelectedTodoId);
-    fetch('/api/chats/' + _lastSelectedTodoId + '/read', { method: 'POST' }).catch(() => {});
-    _updateSpinnersInPlace();
+    _clearUnread(_lastSelectedTodoId);
   }
 
   // Track the current selection
@@ -9457,6 +9546,8 @@ async function saveSectionRename(oldName, newName) {
 loadTodos();
 startPolling();
 pollJobs();
+// Load initial unread state (once — not polled)
+fetch('/api/chats/unread').then(r => r.json()).then(ids => { _chatUnread = new Set(ids); _updateSpinnersInPlace(); }).catch(() => {});
 
 // Fade section headers and items behind them as they get covered by the next sticky header
 window.addEventListener('scroll', () => {

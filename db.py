@@ -149,6 +149,38 @@ def _run_migrations():
                 cur.execute("ALTER TABLE user_configs ADD COLUMN auto_approve_all BOOLEAN DEFAULT FALSE")
                 print("[db] Added auto_approve_all to user_configs")
 
+            # Migration: sections table
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables
+                    WHERE table_name = 'sections'
+                )
+            """)
+            if not cur.fetchone()[0]:
+                cur.execute("""
+                    CREATE TABLE sections (
+                        id          BIGSERIAL PRIMARY KEY,
+                        user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        name        TEXT NOT NULL,
+                        position    INT DEFAULT 0,
+                        directives  TEXT DEFAULT '',
+                        created_at  TIMESTAMPTZ DEFAULT now(),
+                        UNIQUE(user_id, name)
+                    );
+                    CREATE INDEX idx_sections_user ON sections(user_id, position);
+                """)
+                # Populate from existing todo sections
+                cur.execute("""
+                    INSERT INTO sections (user_id, name, position)
+                    SELECT DISTINCT ON (user_id, section) user_id, section,
+                           ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY MIN(position)) - 1
+                    FROM todos
+                    WHERE section != ''
+                    GROUP BY user_id, section
+                    ON CONFLICT DO NOTHING
+                """)
+                print("[db] Created sections table and populated from existing todos")
+
             # Migration: conversation_num on messages + current_conversation on chats
             cur.execute("""
                 SELECT EXISTS (
@@ -324,22 +356,25 @@ def delete_session(token: str):
 # ---------------------------------------------------------------------------
 
 def get_todos(user_id: str, status_filter: str = "all") -> list[dict]:
-    """Get todos for a user. status_filter: 'all', 'open', 'completed'."""
+    """Get todos for a user, ordered by section position then item position."""
     with _conn() as conn:
         with conn.cursor() as cur:
+            base = """SELECT t.id, t.title, t.description, t.status, t.priority, t.section, t.position
+                      FROM todos t
+                      LEFT JOIN sections s ON s.user_id = t.user_id AND s.name = t.section"""
             if status_filter == "open":
                 cur.execute(
-                    "SELECT id, title, description, status, priority, section, position FROM todos WHERE user_id = %s AND status = 'open' ORDER BY section, position",
+                    base + " WHERE t.user_id = %s AND t.status = 'open' ORDER BY COALESCE(s.position, 9999), t.position",
                     (user_id,),
                 )
             elif status_filter == "completed":
                 cur.execute(
-                    "SELECT id, title, description, status, priority, section, position FROM todos WHERE user_id = %s AND status = 'completed' ORDER BY updated_at DESC",
+                    base + " WHERE t.user_id = %s AND t.status = 'completed' ORDER BY t.updated_at DESC",
                     (user_id,),
                 )
             else:
                 cur.execute(
-                    "SELECT id, title, description, status, priority, section, position FROM todos WHERE user_id = %s ORDER BY section, position",
+                    base + " WHERE t.user_id = %s ORDER BY COALESCE(s.position, 9999), t.position",
                     (user_id,),
                 )
             return [
@@ -376,22 +411,37 @@ def get_todos_mtime(user_id: str) -> float:
             return float(r[0]) if r and r[0] else 0.0
 
 
+def _ensure_section(cur, user_id: str, section: str):
+    """Ensure a section exists in the sections table. New sections go to the top (position 0)."""
+    if section:
+        # Check if it already exists
+        cur.execute("SELECT 1 FROM sections WHERE user_id = %s AND name = %s", (user_id, section))
+        if not cur.fetchone():
+            # Shift all existing sections down by 1
+            cur.execute("UPDATE sections SET position = position + 1 WHERE user_id = %s", (user_id,))
+            cur.execute(
+                "INSERT INTO sections (user_id, name, position) VALUES (%s, %s, 0)",
+                (user_id, section),
+            )
+
+
 def create_todo(user_id: str, title: str, description: str = "",
                 priority: str = "none", section: str = "") -> dict:
     """Create a new todo. Returns the new todo dict."""
     todo_id = str(uuid.uuid4())[:8]
     with _conn() as conn:
         with conn.cursor() as cur:
+            section = section.strip()
+            _ensure_section(cur, user_id, section)
             cur.execute(
                 """INSERT INTO todos (id, user_id, title, description, priority, section)
                    VALUES (%s, %s, %s, %s, %s, %s)
                    RETURNING id, title, description, status, priority, section, position""",
-                (todo_id, user_id, title.strip(), description.strip(), priority, section.strip()),
+                (todo_id, user_id, title.strip(), description.strip(), priority, section),
             )
             r = cur.fetchone()
             todo = {"id": r[0], "title": r[1], "description": r[2], "status": r[3],
                     "priority": r[4], "section": r[5], "position": r[6]}
-            # Record history
             _record_history(cur, todo_id, user_id, "create", todo)
             return todo
 
@@ -419,6 +469,10 @@ def update_todo(user_id: str, todo_id: str, **fields) -> dict | None:
             old_dict = {"id": old[0], "title": old[1], "description": old[2], "status": old[3],
                         "priority": old[4], "section": old[5], "position": old[6]}
             _record_history(cur, todo_id, user_id, "update", old_dict)
+
+            # Ensure section exists if changing
+            if "section" in updates and updates["section"]:
+                _ensure_section(cur, user_id, updates["section"])
 
             set_clause = ", ".join(f"{k} = %s" for k in updates)
             values = list(updates.values()) + [todo_id, user_id]
@@ -469,6 +523,59 @@ def search_todos(user_id: str, query: str) -> list[dict]:
                  "priority": r[4], "section": r[5], "position": r[6]}
                 for r in cur.fetchall()
             ]
+
+
+def get_sections(user_id: str) -> list[dict]:
+    """Get all sections for a user, ordered by position."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT name, position, directives FROM sections WHERE user_id = %s ORDER BY position",
+                (user_id,),
+            )
+            return [{"name": r[0], "position": r[1], "directives": r[2] or ""} for r in cur.fetchall()]
+
+
+def upsert_section(user_id: str, name: str, position: int | None = None, directives: str | None = None):
+    """Create or update a section."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            if position is None:
+                # Auto-assign next position
+                cur.execute("SELECT COALESCE(MAX(position), -1) + 1 FROM sections WHERE user_id = %s", (user_id,))
+                position = cur.fetchone()[0]
+            cur.execute(
+                """INSERT INTO sections (user_id, name, position, directives)
+                   VALUES (%s, %s, %s, %s)
+                   ON CONFLICT (user_id, name) DO UPDATE SET
+                       position = EXCLUDED.position,
+                       directives = COALESCE(EXCLUDED.directives, sections.directives)""",
+                (user_id, name, position, directives or ""),
+            )
+
+
+def reorder_sections(user_id: str, section_names: list[str]):
+    """Set section order from an ordered list of names."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            for i, name in enumerate(section_names):
+                cur.execute(
+                    """INSERT INTO sections (user_id, name, position)
+                       VALUES (%s, %s, %s)
+                       ON CONFLICT (user_id, name) DO UPDATE SET position = EXCLUDED.position""",
+                    (user_id, name, i),
+                )
+
+
+def delete_section(user_id: str, name: str):
+    """Delete a section (does not delete todos in it — they become unsectioned)."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM sections WHERE user_id = %s AND name = %s", (user_id, name))
+            cur.execute(
+                "UPDATE todos SET section = '' WHERE user_id = %s AND section = %s",
+                (user_id, name),
+            )
 
 
 def bulk_update_todos(user_id: str, todos: list[dict]):
