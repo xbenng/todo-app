@@ -216,7 +216,7 @@ CREATE TABLE messages (
     id          BIGSERIAL PRIMARY KEY,
     todo_id     TEXT REFERENCES todos(id) ON DELETE CASCADE,
     user_id     UUID REFERENCES users(id),
-    role        TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+    role        TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'tool')),
     content     TEXT NOT NULL,
     created_at  TIMESTAMPTZ DEFAULT now()
 );
@@ -520,6 +520,24 @@ def get_history(user_id: str, limit: int = 30) -> list[dict]:
             ]
 
 
+def get_todo_history(user_id: str, todo_id: str, limit: int = 30) -> list[dict]:
+    """Get history entries for a specific todo item."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, action, snapshot, changed_at
+                   FROM todo_history
+                   WHERE user_id = %s AND todo_id = %s
+                   ORDER BY changed_at DESC LIMIT %s""",
+                (user_id, todo_id, limit),
+            )
+            return [
+                {"id": r[0], "action": r[1], "snapshot": r[2],
+                 "changed_at": r[3].isoformat()}
+                for r in cur.fetchall()
+            ]
+
+
 def restore_todo(user_id: str, history_id: int) -> dict | None:
     """Restore a todo from a history snapshot. Returns the restored todo."""
     with _conn() as conn:
@@ -568,19 +586,27 @@ def restore_todo(user_id: str, history_id: int) -> dict | None:
 # Chat Messages
 # ---------------------------------------------------------------------------
 
-def get_messages(todo_id: str, limit: int = 100) -> list[dict]:
+def get_messages(todo_id: str, limit: int = 100, include_tool: bool = True) -> list[dict]:
     """Get chat messages for the current conversation of a todo."""
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT current_conversation FROM chats WHERE todo_id = %s", (todo_id,))
             row = cur.fetchone()
             conv_num = row[0] if row and row[0] is not None else 0
-            cur.execute(
-                """SELECT role, content, created_at FROM messages
-                   WHERE todo_id = %s AND conversation_num = %s
-                   ORDER BY created_at LIMIT %s""",
-                (todo_id, conv_num, limit),
-            )
+            if include_tool:
+                cur.execute(
+                    """SELECT role, content, created_at FROM messages
+                       WHERE todo_id = %s AND conversation_num = %s
+                       ORDER BY created_at LIMIT %s""",
+                    (todo_id, conv_num, limit),
+                )
+            else:
+                cur.execute(
+                    """SELECT role, content, created_at FROM messages
+                       WHERE todo_id = %s AND conversation_num = %s AND role != 'tool'
+                       ORDER BY created_at LIMIT %s""",
+                    (todo_id, conv_num, limit),
+                )
             return [{"role": r[0], "content": r[1], "created_at": r[2].isoformat()} for r in cur.fetchall()]
 
 
@@ -614,10 +640,25 @@ def restart_conversation(todo_id: str):
             )
 
 
-def get_conversations(todo_id: str) -> list[dict]:
-    """List all conversations for a todo (newest first)."""
+def resume_conversation(todo_id: str, conv_num: int):
+    """Set the current conversation to a specific number (resume a past conversation)."""
     with _conn() as conn:
         with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE chats SET current_conversation = %s,
+                   unread = FALSE, conversation_id = NULL
+                   WHERE todo_id = %s""",
+                (conv_num, todo_id),
+            )
+
+
+def get_conversations(todo_id: str) -> tuple[int, list[dict]]:
+    """List all conversations for a todo (newest first). Returns (current_num, conversations)."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT current_conversation FROM chats WHERE todo_id = %s", (todo_id,))
+            row = cur.fetchone()
+            current_num = row[0] if row and row[0] is not None else 0
             cur.execute(
                 """SELECT conversation_num, MIN(created_at) as started, MAX(created_at) as last_msg,
                           COUNT(*) as message_count
@@ -625,8 +666,9 @@ def get_conversations(todo_id: str) -> list[dict]:
                    GROUP BY conversation_num ORDER BY conversation_num DESC""",
                 (todo_id,),
             )
-            return [{"num": r[0], "started": r[1].isoformat(), "last_msg": r[2].isoformat(),
-                     "message_count": r[3]} for r in cur.fetchall()]
+            convs = [{"num": r[0], "started": r[1].isoformat(), "last_msg": r[2].isoformat(),
+                      "message_count": r[3]} for r in cur.fetchall()]
+            return current_num, convs
 
 
 def get_conversation_messages(todo_id: str, conversation_num: int, limit: int = 100) -> list[dict]:

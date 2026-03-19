@@ -792,6 +792,87 @@ def _build_mcp_configs_from_registry(registry: dict, tokens: dict,
     return server_configs
 
 
+def _build_cli_mcp_config(user_id: str | None) -> dict | None:
+    """Build an mcpServers dict for Claude CLI --mcp-config from the registry + user credentials."""
+    registry = _load_mcp_registry()
+    if not registry:
+        return None
+    if _USE_DB and user_id and user_id != "local":
+        config = _db.get_config(user_id)
+        prefs = _db.get_mcp_preferences(user_id)
+        enabled = {name for name, p in prefs.items() if p["enabled"]}
+    else:
+        config = _load_config()
+        enabled = None
+    tokens = config.get("tokens", {})
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    servers = {}
+    for name, entry in registry.items():
+        if enabled is not None and name not in enabled:
+            continue
+        server_type = entry.get("type", "stdio")
+        if server_type == "stdio":
+            env = dict(entry.get("static_env", {}))
+            for field in entry.get("credential_fields", []):
+                key = field["key"]
+                if key in tokens:
+                    env[key] = tokens[key]
+            # Write per-user account configs if needed
+            extra_env = _write_server_accounts(user_id, name, entry)
+            env.update(extra_env)
+            # Resolve relative paths
+            args = []
+            for arg in entry.get("args", []):
+                if not arg.startswith("-") and not os.path.isabs(arg):
+                    resolved = os.path.join(app_dir, arg)
+                    if os.path.exists(resolved):
+                        args.append(resolved)
+                    else:
+                        args.append(arg)
+                else:
+                    args.append(arg)
+            command = entry["command"]
+            if not os.path.isabs(command):
+                resolved = shutil.which(command)
+                if resolved:
+                    command = resolved
+            servers[name] = {"type": "stdio", "command": command, "args": args, "env": env}
+        elif server_type in ("sse", "http"):
+            cfg = {"type": "http", "url": entry["url"]}
+            # Bearer token
+            bearer_key = entry.get("bearer_token")
+            if bearer_key and bearer_key in tokens:
+                oauth_token = tokens[bearer_key]
+                if isinstance(oauth_token, dict):
+                    cfg["headers"] = {"Authorization": f"Bearer {oauth_token.get('token', '')}"}
+                elif isinstance(oauth_token, str):
+                    cfg["headers"] = {"Authorization": f"Bearer {oauth_token}"}
+            # Basic auth fallback
+            if "headers" not in cfg:
+                basic_key = entry.get("basic_auth_token")
+                if basic_key and basic_key in tokens and tokens[basic_key]:
+                    cfg["headers"] = {"Authorization": f"Basic {tokens[basic_key]}"}
+            servers[name] = cfg
+    # Add the todo-tools MCP server (proxies back to our HTTP API)
+    todo_tools_script = os.path.join(app_dir, "mcp-servers", "todo-tools.py")
+    if os.path.exists(todo_tools_script):
+        todo_env = {"TODO_API_BASE": "http://localhost:5222"}
+        # Create a short-lived session token so the MCP proxy can call our API as this user
+        if _USE_DB and user_id and user_id != "local":
+            proxy_token = _db.create_session(user_id, expires_hours=1)
+            todo_env["TODO_AUTH_TOKEN"] = proxy_token
+        python_bin = shutil.which("python3") or "python3"
+        servers["todo-tools"] = {
+            "type": "stdio",
+            "command": python_bin,
+            "args": [todo_tools_script],
+            "env": todo_env,
+        }
+    if not servers:
+        return None
+    return {"mcpServers": servers}
+
+
 def _save_config(data: dict) -> None:
     """Save server config to disk."""
     _ensure_config_dir()
@@ -1145,6 +1226,24 @@ def update_todo_route(todo_id):
             _snapshot_and_write(TODO_FILE, todos)
             return jsonify(t)
     return jsonify({"error": "Not found"}), 404
+
+
+@app.route("/api/todos/search", methods=["GET"])
+def search_todos_route():
+    user = get_current_user()
+    if _USE_DB and not user:
+        return jsonify({"error": "Not authenticated"}), 401
+    query = (request.args.get("q") or "").lower()
+    if not query:
+        return jsonify([])
+    if _USE_DB:
+        todos = _db.get_todos(user["id"])
+    else:
+        todos = _parse_todo_file(TODO_FILE) + _parse_todo_file(_completed_file_path(TODO_FILE))
+    results = [t for t in todos
+               if query in t.get("title", "").lower()
+               or query in t.get("description", "").lower()]
+    return jsonify(results)
 
 
 @app.route("/api/todos/<todo_id>/mark-read", methods=["POST"])
@@ -1565,9 +1664,21 @@ def _run_claude_job(job_id: str, prompt: str, cwd: str):
         _jobs[job_id]["status"] = "error"
         return
 
+    # Append DB context files to the CLI's system prompt
+    user_id = _jobs.get(job_id, {}).get("user_id")
+    todo_id = _jobs.get(job_id, {}).get("todo_id")
+    append_prompt = ""
+    if _USE_DB and user_id and user_id != "local":
+        ctx = _db.get_context_files(user_id)
+        if ctx:
+            append_prompt = "\n\n".join(f"# {name}\n{content.strip()}"
+                                        for name, content in sorted(ctx.items())
+                                        if content and content.strip())
     cmd = [claude_bin, "-p", prompt, "--dangerously-skip-permissions",
            "--output-format", "stream-json", "--verbose",
            "--effort", "low", "--include-partial-messages"]
+    if append_prompt:
+        cmd.extend(["--system-prompt", append_prompt])
     _jobs[job_id]["status"] = "running"
 
     def emit(line: str) -> None:
@@ -1664,17 +1775,32 @@ def _get_tool_definitions(depth: int = 0, user_id: str | None = None) -> list[di
     tools = [
         {
             "name": "read_todos",
-            "description": "Read all todo items (active and completed). Returns a JSON array of todo objects with id, title, description, status, priority, and section fields.",
+            "description": "Read todo items. Returns summaries (id, title, status, priority, section) by default. Use detail=true for full descriptions. Use get_todo for a single item.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "status_filter": {
                         "type": "string",
                         "enum": ["all", "open", "completed"],
-                        "description": "Filter by status. Default: all"
+                        "description": "Filter by status. Default: open"
+                    },
+                    "detail": {
+                        "type": "boolean",
+                        "description": "Include full descriptions. Default: false (summaries only)"
                     }
                 },
                 "required": []
+            }
+        },
+        {
+            "name": "get_todo",
+            "description": "Get a single todo item by ID with full details including description.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "todo_id": {"type": "string", "description": "The todo item ID"}
+                },
+                "required": ["todo_id"]
             }
         },
         {
@@ -1792,12 +1918,27 @@ def _execute_tool(name: str, input_data: dict, todo_id: str | None,
                 active = _parse_todo_file(TODO_FILE)
                 completed = _parse_todo_file(_completed_file_path(TODO_FILE))
                 todos = active + completed
-            status_filter = input_data.get("status_filter", "all")
+            status_filter = input_data.get("status_filter", "open")
             if status_filter == "open":
                 todos = [t for t in todos if t["status"] != "completed"]
             elif status_filter == "completed":
                 todos = [t for t in todos if t["status"] == "completed"]
+            # Strip descriptions unless detail=true
+            if not input_data.get("detail"):
+                todos = [{k: v for k, v in t.items() if k != "description"} for t in todos]
             return json.dumps(todos, ensure_ascii=False)
+
+        elif name == "get_todo":
+            tid = input_data.get("todo_id", "")
+            if _USE_DB and user_id:
+                todo = _db.get_todo(user_id, tid)
+            else:
+                active = _parse_todo_file(TODO_FILE)
+                completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+                todo = next((t for t in active + completed if t["id"] == tid), None)
+            if not todo:
+                return json.dumps({"error": f"Todo {tid} not found"})
+            return json.dumps(todo, ensure_ascii=False)
 
         elif name == "update_todo":
             tid = input_data["todo_id"]
@@ -1877,6 +2018,8 @@ def _execute_tool(name: str, input_data: dict, todo_id: str | None,
                 results = [t for t in active + completed
                            if query in t.get("title", "").lower()
                            or query in t.get("description", "").lower()]
+            # Return summaries — use get_todo for full detail
+            results = [{k: v for k, v in t.items() if k != "description"} for t in results]
             return json.dumps(results, ensure_ascii=False)
 
         elif name == "read_chat_history":
@@ -2148,7 +2291,20 @@ def _build_system_prompt(todo_id: str | None, user_id: str | None = None) -> str
                     except OSError:
                         pass
 
-    # 3. Current date
+    # 3. Global context files (shared across all users)
+    global_ctx_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "context")
+    if os.path.isdir(global_ctx_dir):
+        for name in sorted(os.listdir(global_ctx_dir)):
+            if name.endswith(".md"):
+                try:
+                    with open(os.path.join(global_ctx_dir, name), "r", encoding="utf-8") as f:
+                        content = f.read().strip()
+                    if content:
+                        parts.append(f"# {name}\n{content}")
+                except OSError:
+                    pass
+
+    # 4. Current date
     parts.append(f"Today's date is {datetime.now().strftime('%Y-%m-%d')}.")
 
     # 4. Todo context
@@ -2251,7 +2407,11 @@ class ChatAgent:
         return self.job["status"] == "killed"
 
     def _build_history(self, message: str) -> list[dict]:
-        """Build messages array from persisted history + new message."""
+        """Build messages array from persisted history + new message.
+
+        If auto_compact is enabled in user config, automatically
+        summarizes older messages to stay within context limits.
+        """
         if _USE_DB and self.todo_id:
             raw_messages = _db.get_messages(self.todo_id)
         elif self.todo_id:
@@ -2264,10 +2424,94 @@ class ChatAgent:
         for m in raw_messages:
             role = m.get("role", "user")
             content = m.get("content", "")
-            if role in ("user", "assistant") and isinstance(content, str) and content.strip():
-                messages.append({"role": role, "content": content})
+            if role not in ("user", "assistant") or not isinstance(content, str) or not content.strip():
+                continue
+            messages.append({"role": role, "content": content})
         messages.append({"role": "user", "content": message})
+        # Auto-compact if enabled
+        if _USE_DB and self.user_id:
+            config = _db.get_config(self.user_id)
+        else:
+            config = _load_config()
+        if config.get("auto_compact", False) and len(messages) > 8:
+            threshold = config.get("compact_threshold", 100000)
+            keep_recent = config.get("compact_keep_recent", 8)
+            messages = self._maybe_compact(messages, threshold, keep_recent)
         return messages
+
+    @staticmethod
+    def _msg_size(m: dict) -> int:
+        c = m.get("content", "")
+        return len(json.dumps(c) if isinstance(c, (list, dict)) else c)
+
+    def _maybe_compact(self, messages: list[dict], threshold: int = 80000,
+                       keep_recent: int = 4) -> list[dict]:
+        """If conversation history is too large, summarize older messages."""
+        total_chars = sum(self._msg_size(m) for m in messages)
+        if total_chars < threshold:
+            return messages
+        if len(messages) <= keep_recent + 1:
+            return messages  # Not enough to compact
+        old_messages = messages[:-keep_recent]
+        recent_messages = messages[-keep_recent:]
+        self.emit("⟳ Compacting conversation history...")
+        summary = self._summarize_messages(old_messages)
+        if not summary:
+            return messages  # Summarization failed, use original
+        # Replace old messages with a single summary message pair
+        compacted = [
+            {"role": "user", "content": "[Earlier conversation summary]"},
+            {"role": "assistant", "content": summary},
+        ] + recent_messages
+        old_chars = sum(len(m["content"]) for m in old_messages)
+        new_chars = len(summary)
+        print(f"[compact] Compacted {len(old_messages)} messages ({old_chars} chars) → summary ({new_chars} chars)", flush=True)
+        return compacted
+
+    def _summarize_messages(self, messages: list[dict]) -> str | None:
+        """Use the LLM to summarize a list of messages into a concise summary."""
+        def _fmt(m):
+            c = m.get("content", "")
+            if isinstance(c, (list, dict)):
+                c = json.dumps(c, ensure_ascii=False)[:2000]
+            return f"**{m['role'].upper()}:** {c}"
+        conversation_text = "\n\n".join(_fmt(m) for m in messages)
+        summary_prompt = (
+            "Summarize the following conversation concisely. Preserve:\n"
+            "- Key decisions made\n"
+            "- Action items and their status\n"
+            "- Important facts and context\n"
+            "- Tool calls and their results (briefly)\n"
+            "Drop: greetings, filler, repeated information.\n"
+            "Output a concise summary in bullet points.\n\n"
+            f"CONVERSATION:\n{conversation_text}"
+        )
+        try:
+            if self.ptype == "anthropic" and anthropic:
+                client = anthropic.Anthropic(api_key=self.provider.get("api_key"))
+                resp = client.messages.create(
+                    model=self.model,
+                    max_tokens=2048,
+                    messages=[{"role": "user", "content": summary_prompt}],
+                )
+                return resp.content[0].text if resp.content else None
+            elif self.ptype == "openai_compat" and openai_mod:
+                client = openai_mod.OpenAI(
+                    base_url=self.provider.get("base_url"),
+                    api_key=self.provider.get("api_key", "none"),
+                )
+                resp = client.chat.completions.create(
+                    model=self.model,
+                    max_tokens=2048,
+                    messages=[
+                        {"role": "system", "content": "You are a concise summarizer."},
+                        {"role": "user", "content": summary_prompt},
+                    ],
+                )
+                return resp.choices[0].message.content if resp.choices else None
+        except Exception as exc:
+            print(f"[compact] Summarization failed: {exc}", flush=True)
+        return None
 
     def _get_tools_anthropic(self) -> list[dict]:
         tools = _get_tool_definitions(self.depth, self.user_id)
@@ -2278,22 +2522,23 @@ class ChatAgent:
         return _openai_tool_defs(self.depth, self.user_id)
 
     def _persist_response(self) -> None:
-        """Persist assistant response to chats/DB and mark unread."""
-        if self.todo_id and self.assistant_text_lines:
-            try:
-                content = "\n".join(self.assistant_text_lines)
-                if _USE_DB:
-                    user_id = self.job.get("user_id")
-                    _db.add_message(self.todo_id, user_id, "assistant", content)
-                else:
-                    chats = _load_chats()
-                    chat = chats.get(self.todo_id, {"conversationId": None, "messages": []})
-                    chat["messages"].append({"role": "assistant", "content": content})
-                    chat["unread"] = True
-                    chats[self.todo_id] = chat
-                    _save_chats(chats)
-            except Exception as exc:
-                print(f"[persist] ERROR saving chat for {self.todo_id}: {exc}")
+        """Persist assistant text response to chats/DB. Tool calls are not persisted."""
+        if not self.todo_id or not self.assistant_text_lines:
+            return
+        try:
+            content = "\n".join(self.assistant_text_lines)
+            if _USE_DB:
+                user_id = self.job.get("user_id")
+                _db.add_message(self.todo_id, user_id, "assistant", content)
+            else:
+                chats = _load_chats()
+                chat = chats.get(self.todo_id, {"conversationId": None, "messages": []})
+                chat["messages"].append({"role": "assistant", "content": content})
+                chat["unread"] = True
+                chats[self.todo_id] = chat
+                _save_chats(chats)
+        except Exception as exc:
+            print(f"[persist] ERROR saving chat for {self.todo_id}: {exc}")
 
     # ------------------------------------------------------------------
     # Anthropic provider
@@ -2480,9 +2725,8 @@ class ChatAgent:
                 # Provide actionable detail for common errors
                 if "max_tokens" in exc_str or "context_length" in exc_str or "too long" in exc_str.lower() or "maximum" in exc_str.lower():
                     hist_count = len(self.assistant_text_lines)
-                    self.emit(f"error: Context length exceeded. The conversation history + system prompt is too large for the model. "
-                              f"({self.total_input_tokens} input tokens so far, {hist_count} assistant lines accumulated). "
-                              f"Try /compact or Restart to reduce context. Raw: {exc_str[:200]}")
+                    self.emit(f"error: Context length exceeded ({self.total_input_tokens} input tokens, {hist_count} lines). "
+                              f"Try Restart to reduce context.")
                 elif "401" in exc_str or "auth" in exc_str.lower() or "api_key" in exc_str.lower():
                     self.emit(f"error: Authentication failed. Check your API key in Settings. Raw: {exc_str[:200]}")
                 elif "429" in exc_str or "rate" in exc_str.lower():
@@ -2504,8 +2748,17 @@ def _run_chat_local(job_id: str, message: str, cwd: str,
         _jobs[job_id]["status"] = "error"
         return
 
+    # Build system prompt and MCP config from DB
+    user_id = _jobs.get(job_id, {}).get("user_id")
+    system_prompt = _build_system_prompt(todo_id, user_id)
     cmd = [claude_bin, "-p", message, "--dangerously-skip-permissions",
            "--output-format", "stream-json", "--verbose"]
+    if system_prompt:
+        cmd.extend(["--system-prompt", system_prompt])
+    # Build per-user MCP config from registry + credentials
+    mcp_config = _build_cli_mcp_config(user_id)
+    if mcp_config:
+        cmd.extend(["--mcp-config", json.dumps(mcp_config)])
     if conversation_id:
         cmd.extend(["--resume", conversation_id])
     _jobs[job_id]["status"] = "running"
@@ -2864,6 +3117,9 @@ def chat_with_todo(todo_id):
         return jsonify({"error": "message is required"}), 400
 
     if _USE_DB:
+        resume_conv = data.get("resume_conv")
+        if resume_conv is not None:
+            _db.resume_conversation(todo_id, int(resume_conv))
         _db.add_message(todo_id, user["id"], "user", message)
         meta = _db.get_chat_meta(todo_id)
         conversation_id = meta["conversation_id"] if meta else None
@@ -2894,7 +3150,32 @@ def get_chat(todo_id):
     """Return the persisted chat session for a todo item, plus any running job."""
     user = get_current_user()
     if _USE_DB:
-        messages = _db.get_messages(todo_id) if user else []
+        include_tool = request.args.get("include_tool", "false").lower() == "true"
+        messages = _db.get_messages(todo_id, include_tool=include_tool) if user else []
+        # Filter out structured JSON content (tool use blocks) from assistant messages for display
+        if not include_tool:
+            clean = []
+            for m in messages:
+                content = m.get("content", "")
+                if isinstance(content, str) and content.startswith(("[", "{")):
+                    try:
+                        parsed = json.loads(content)
+                        if isinstance(parsed, list) and any(
+                            isinstance(b, dict) and b.get("type") in ("tool_use", "tool_result")
+                            for b in parsed
+                        ):
+                            # Extract only text blocks
+                            text_parts = [b["text"] for b in parsed
+                                         if isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip()]
+                            if text_parts:
+                                m = dict(m)
+                                m["content"] = "\n".join(text_parts)
+                            else:
+                                continue  # skip pure tool-use messages
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                clean.append(m)
+            messages = clean
         meta = _db.get_chat_meta(todo_id)
         chat = {
             "conversationId": meta["conversation_id"] if meta else None,
@@ -2932,8 +3213,8 @@ def get_conversations(todo_id):
     """List all conversations for a todo."""
     if not _USE_DB:
         return jsonify({"conversations": []})
-    convs = _db.get_conversations(todo_id)
-    return jsonify({"conversations": convs})
+    current_num, convs = _db.get_conversations(todo_id)
+    return jsonify({"conversations": convs, "current": current_num})
 
 
 @app.route("/api/chats/<todo_id>/conversations/<int:conv_num>")
@@ -3535,6 +3816,16 @@ def get_history():
     return jsonify({"entries": entries})
 
 
+@app.route("/api/todos/<todo_id>/history")
+def get_todo_history(todo_id):
+    """Return version history for a specific todo item."""
+    user = get_current_user()
+    if not _USE_DB or not user:
+        return jsonify({"entries": []})
+    entries = _db.get_todo_history(user["id"], todo_id)
+    return jsonify({"entries": entries})
+
+
 @app.route("/api/history/<int:history_id>/restore", methods=["POST"])
 def restore_history(history_id):
     """Restore a todo from a history snapshot."""
@@ -3905,7 +4196,9 @@ def ea_update_item():
         return jsonify({"status": "already_running", "job_id": existing["id"]})
 
     todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
-    job_id = _start_claude_chat_job(f"Check: {item_id}", job_key, f"/ea checkon {item_id}", todo_dir,
+    message = data.get("message") or f"/ea checkon {item_id}"
+    label = "Consolidate" if "consolidate" in message else f"Check: {item_id}"
+    job_id = _start_claude_chat_job(label, job_key, message, todo_dir,
                                      user_id=user["id"] if user else None)
     return jsonify({"status": "started", "job_id": job_id})
 
@@ -4193,12 +4486,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .todo-item:has(.job-spinner:not(.term-spinner):hover) .checkon-bubble:not(.done) { display: block; }
   .checkon-summary {
-    display: none; font-family: monospace; font-size: 0.82rem; line-height: 1.5; color: var(--muted);
+    display: none; font-family: monospace; font-size: 0.72rem; line-height: 1.45; color: var(--muted);
     background: rgba(0,0,0,0.025); border: 1px solid var(--border); border-radius: 6px;
     padding: 6px 10px; margin-top: 8px; white-space: pre-wrap; word-break: break-word;
+    max-height: calc(1.45em * 8 + 12px + 30px); overflow-y: auto;
   }
   .checkon-summary .checkon-inline-spinner { display: inline-flex; vertical-align: baseline; margin-left: 6px; position: relative; top: 2px; }
-  .checkon-header { font-size: 0.72rem; font-weight: 600; color: var(--subtle); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; padding-bottom: 3px; border-bottom: 1px solid var(--border); }
+  .checkon-header { font-size: 0.68rem; font-weight: 600; color: var(--subtle); text-transform: uppercase; letter-spacing: 0.05em; padding: 4px 0; border-bottom: 2px solid var(--border); position: sticky; top: 0; background: rgba(0,0,0,0.025); z-index: 1; display: flex; align-items: center; cursor: pointer; }
+  .checkon-header .checkon-arrow { margin-left: auto; font-size: 0.6rem; transition: transform 0.15s; }
+  .checkon-header.collapsed .checkon-arrow { transform: rotate(-90deg); }
+  .checkon-summary.collapsed .checkon-body { display: none; }
   .checkon-footer { font-size: 0.72rem; font-weight: 600; color: var(--subtle); text-transform: uppercase; letter-spacing: 0.05em; margin-top: 4px; padding-top: 3px; border-top: 1px solid var(--border); }
   .checkon-summary { display: none; }
   .todo-item.item-expanded .checkon-summary.has-content { display: block; }
@@ -5173,8 +5470,8 @@ function renderTodo(t) {
       <div class="todo-title" style="flex:1;min-width:0;display:flex;align-items:center;gap:2px" onclick="event.stopPropagation();selectTodo('${t.id}');toggleItemDesc('${t.id}')">${spinner}${esc(_parseTitle(t.title || '').displayTitle)}</div>
       <div class="todo-actions">
         ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();eaUpdateItem('${t.id}')" style="border:none;background:transparent;font-size:1rem;padding:4px 6px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Refresh via /ea checkon" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#8635;</button>` : ''}
+        <button onclick="event.stopPropagation();consolidateItem('${t.id}')" style="border:none;background:transparent;font-size:0.85rem;padding:4px 6px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Consolidate description" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#x29C9;</button>
         ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();openChat('${t.id}')" style="border:none;background:transparent;font-size:1rem;padding:4px 6px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Chat (s)" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#9654;</button>` : ''}
-
       </div>
       ${priorityBadge}
     </div>
@@ -5256,6 +5553,7 @@ function showCtxMenu(e, id) {
     `<div class="ctx-menu-item" onclick="ctxEdit()">&#9998; Edit</div>` +
     `<div class="ctx-menu-item has-submenu">&#128193; Move to section<div class="ctx-submenu">${sectionItems}</div></div>` +
     `<div class="ctx-menu-item has-submenu">&#9873; Set priority<div class="ctx-submenu">${priorityItems}</div></div>` +
+    `<div class="ctx-menu-item" onclick="hideCtxMenu();toggleTodoHistory(ctxTargetId)">&#128336; History</div>` +
     `<div class="ctx-menu-sep"></div>` +
     `<div class="ctx-menu-item" style="color:var(--danger)" onclick="ctxDelete()">&#128465; Delete</div>`;
 
@@ -6817,14 +7115,15 @@ async function _showChatHistory() {
     const res = await fetch('/api/chats/' + todoId + '/conversations');
     const data = await res.json();
     const convs = data.conversations || [];
+    const currentNum = data.current != null ? data.current : (convs.length ? convs[0].num : 0);
     if (convs.length <= 1) { showToast('No previous conversations'); return; }
-    let html = '<div style="padding:8px"><div style="font-size:0.82rem;font-weight:600;margin-bottom:8px;color:#e2e8f0">Previous Conversations</div>';
+    let html = '<div style="padding:8px"><div style="font-size:0.82rem;font-weight:600;margin-bottom:8px;color:#e2e8f0">Conversations</div>';
     convs.forEach(c => {
       const date = new Date(c.started).toLocaleDateString(undefined, {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
-      const isCurrent = c.num === convs[0].num;
+      const isCurrent = c.num === currentNum;
       html += '<div style="display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:6px;cursor:pointer;margin-bottom:4px;'
         + (isCurrent ? 'background:rgba(79,110,247,0.15);border:1px solid var(--accent)' : 'background:rgba(255,255,255,0.05);border:1px solid transparent')
-        + '" onclick="' + (isCurrent ? '_loadChatSession(\'' + todoId + '\').then(()=>{_renderChatLog(\'' + todoId + '\')})' : '_loadConversation(\'' + todoId + '\',' + c.num + ')') + '">'
+        + '" onclick="' + (isCurrent ? '_returnToCurrent(\'' + todoId + '\')' : '_loadConversation(\'' + todoId + '\',' + c.num + ')') + '">'
         + '<div style="flex:1"><div style="font-size:0.78rem;color:#e2e8f0">' + date + '</div>'
         + '<div style="font-size:0.68rem;color:var(--subtle)">' + c.message_count + ' messages</div></div>'
         + (isCurrent ? '<span style="font-size:0.65rem;color:var(--accent)">current</span>' : '')
@@ -6841,7 +7140,12 @@ async function _loadConversation(todoId, convNum) {
     const data = await res.json();
     const log = document.getElementById('chat-log');
     if (!log) return;
-    let html = '<div style="padding:4px 8px;font-size:0.7rem;color:var(--subtle);cursor:pointer" onclick="_loadChatSession(\'' + todoId + '\').then(()=>{_renderChatLog(\'' + todoId + '\')})">&larr; Back to current</div>';
+    // Track that we're viewing a historical conversation
+    const session = _chatSessions[todoId];
+    if (session) session._viewingConvNum = convNum;
+    // Show floating banner over chat log
+    _showHistoryBanner(todoId);
+    let html = '';
     (data.messages || []).forEach((msg, i) => {
       if (i > 0 && msg.role === 'user') html += '<hr class="chat-turn-sep">';
       if (msg.role === 'user') {
@@ -6909,6 +7213,31 @@ function chatSendOrStop(todoId) {
   }
 }
 
+function _showHistoryBanner(todoId) {
+  _hideHistoryBanner();
+  const log = document.getElementById('chat-log');
+  if (!log) return;
+  const banner = document.createElement('div');
+  banner.id = 'chat-history-banner';
+  banner.style.cssText = 'display:flex;align-items:center;gap:8px;padding:5px 14px;background:rgba(79,110,247,0.12);border-bottom:1px solid rgba(79,110,247,0.3);font-size:0.72rem;flex-shrink:0';
+  banner.innerHTML = '<span style="cursor:pointer;color:var(--accent)" onclick="_returnToCurrent(\'' + todoId + '\')">&larr; Back to current</span>'
+    + '<span style="color:var(--subtle)">Viewing past conversation — type to resume</span>';
+  log.parentElement.insertBefore(banner, log);
+}
+
+function _hideHistoryBanner() {
+  const banner = document.getElementById('chat-history-banner');
+  if (banner) banner.remove();
+}
+
+async function _returnToCurrent(todoId) {
+  const session = _chatSessions[todoId];
+  if (session) delete session._viewingConvNum;
+  _hideHistoryBanner();
+  await _loadChatSession(todoId);
+  _renderChatLog(todoId);
+}
+
 async function sendChatMessage(todoId) {
   const session = _chatSessions[todoId];
   if (session && session.streamingJobId) return;
@@ -6916,10 +7245,15 @@ async function sendChatMessage(todoId) {
   const message = input.value.trim();
   if (!message) return;
   input.value = '';
-  await _sendChatDirect(todoId, message);
+  let resumeConv = null;
+  if (session && session._viewingConvNum != null) {
+    resumeConv = session._viewingConvNum;
+    delete session._viewingConvNum;
+  }
+  await _sendChatDirect(todoId, message, resumeConv);
 }
 
-async function _sendChatDirect(todoId, message) {
+async function _sendChatDirect(todoId, message, resumeConv) {
   const session = _chatSessions[todoId];
   if (!session) return;
 
@@ -6935,16 +7269,24 @@ async function _sendChatDirect(todoId, message) {
 
   // POST to start job
   try {
+    const body = { message, conversation_id: session.conversationId };
+    if (resumeConv != null) body.resume_conv = resumeConv;
     const res = await fetch(API + '/' + todoId + '/chat', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ message, conversation_id: session.conversationId }),
+      body: JSON.stringify(body),
     });
     if (!res.ok) {
       _chatStreamDone(todoId, 'Failed to send message');
       return;
     }
     const data = await res.json();
+    // If we resumed a past conversation, reload session to get its full history
+    if (resumeConv != null) {
+      _hideHistoryBanner();
+      await _loadChatSession(todoId);
+      if (_activeChatTodoId === todoId) _renderChatLog(todoId);
+    }
     _streamChatResponse(todoId, data.job_id);
   } catch (e) {
     _chatStreamDone(todoId, 'Network error');
@@ -7179,6 +7521,103 @@ async function eaUpdate(force) {
   }
 }
 
+async function toggleTodoHistory(todoId) {
+  if (!todoId) todoId = selectedTodoId;
+  if (!todoId) { showToast('Select a todo first'); return; }
+  const overlay = document.getElementById('history-overlay');
+  if (overlay.style.display === 'flex' && overlay.dataset.todoId === todoId) {
+    closeHistoryPanel();
+    return;
+  }
+  overlay.dataset.todoId = todoId;
+  const todo = allTodos.find(t => t.id === todoId);
+  document.getElementById('history-title').textContent = todo ? (todo.title || todoId).slice(0, 60) : todoId;
+  const log = document.getElementById('history-log');
+  log.innerHTML = '<div style="padding:20px;color:var(--subtle)">Loading...</div>';
+  overlay.style.display = 'flex';
+  requestAnimationFrame(() => overlay.classList.add('visible'));
+  await _loadTodoHistory(todoId);
+}
+
+function closeHistoryPanel() {
+  const overlay = document.getElementById('history-overlay');
+  overlay.classList.remove('visible');
+  setTimeout(() => { overlay.style.display = 'none'; }, 100);
+}
+
+async function _loadTodoHistory(todoId) {
+  const log = document.getElementById('history-log');
+  if (!log) return;
+  try {
+    const res = await fetch('/api/todos/' + todoId + '/history');
+    const data = await res.json();
+    const entries = data.entries || [];
+    if (entries.length === 0) {
+      log.innerHTML = '<div style="padding:20px;color:var(--subtle)">No history for this item.</div>';
+      return;
+    }
+    let html = '';
+    entries.forEach((e, i) => {
+      const date = new Date(e.changed_at).toLocaleString(undefined, {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
+      const snap = e.snapshot || {};
+      const title = snap.title || '(untitled)';
+      const desc = (snap.description || '').replace(/\n/g, '\n');
+      const isCurrent = i === 0;
+      html += '<div style="padding:10px 14px;border-bottom:1px solid rgba(255,255,255,0.06)' + (isCurrent ? ';background:rgba(79,110,247,0.08)' : '') + '">'
+        + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">'
+        + '<div style="flex:1"><span style="font-size:0.8rem;color:#e2e8f0;font-weight:500">' + esc(title) + '</span>'
+        + ' <span style="font-size:0.65rem;color:var(--subtle)">' + esc(e.action) + ' — ' + date + '</span></div>'
+        + '<button onclick="restoreTodoVersion(' + e.id + ',\'' + esc(todoId) + '\')" style="border:none;background:var(--accent);color:#fff;padding:3px 10px;border-radius:5px;cursor:pointer;font-size:0.7rem">Restore</button>'
+        + '</div>';
+      if (desc) {
+        html += '<pre style="font-size:0.72rem;color:var(--muted);white-space:pre-wrap;word-break:break-word;margin:0;max-height:150px;overflow-y:auto">' + esc(desc) + '</pre>';
+      }
+      html += '</div>';
+    });
+    log.innerHTML = html;
+  } catch {
+    log.innerHTML = '<div style="padding:20px;color:var(--danger)">Failed to load history.</div>';
+  }
+}
+
+function _toggleCheckonBody(headerEl) {
+  const sumEl = headerEl.parentElement;
+  if (!sumEl) return;
+  const collapsed = sumEl.classList.toggle('collapsed');
+  headerEl.classList.toggle('collapsed', collapsed);
+}
+
+async function consolidateItem(todoId) {
+  try {
+    const res = await fetch('/api/ea-update-item', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({id: todoId, message: '/ea consolidate description ' + todoId})
+    });
+    const data = await res.json();
+    if (res.ok && data.job_id) {
+      showToast('Consolidating...');
+      _jobsState[data.job_id] = { id: data.job_id, job_key: 'ea-' + todoId, status: 'running', created_at: Date.now()/1000, _optimistic: true };
+      _updateSpinnersInPlace();
+      _openItemStream(todoId, data.job_id);
+    }
+  } catch { showToast('Failed', true); }
+}
+
+async function restoreTodoVersion(historyId, todoId) {
+  if (!confirm('Restore this version?')) return;
+  try {
+    const res = await fetch('/api/history/' + historyId + '/restore', { method: 'POST' });
+    if (res.ok) {
+      showToast('Restored');
+      loadTodos();
+    } else {
+      const data = await res.json();
+      showToast(data.error || 'Failed to restore', true);
+    }
+  } catch { showToast('Failed to restore', true); }
+}
+
 async function eaUpdateItem(id, force) {
   try {
     const res = await fetch('/api/ea-update-item', {
@@ -7275,7 +7714,7 @@ function _openItemStream(todoId, jobId) {
     const sumEl = document.getElementById('checkon-summary-' + todoId);
     if (sumEl) {
       const timeStr = _clientJobStartTime[todoId].toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
-      sumEl.innerHTML = '<div class="checkon-header">Status check — ' + timeStr + '</div><div class="checkon-body"></div><l-bouncy class="checkon-inline-spinner" size="20" speed="1.75" color="var(--muted)"></l-bouncy>';
+      sumEl.innerHTML = '<div class="checkon-header" onclick="event.stopPropagation();_toggleCheckonBody(this)"><span>Status check — ' + timeStr + '</span><span class="checkon-arrow">&#9660;</span></div><div class="checkon-body"></div><l-bouncy class="checkon-inline-spinner" size="20" speed="1.75" color="var(--muted)"></l-bouncy>';
       sumEl.classList.add('has-content');
     }
   }
@@ -7446,7 +7885,8 @@ function _restoreJobOutputs() {
         const timeStr = startTime.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
         const header = document.createElement('div');
         header.className = 'checkon-header';
-        header.textContent = 'Status check \u2014 ' + timeStr;
+        header.onclick = (e) => { e.stopPropagation(); _toggleCheckonBody(header); };
+        header.innerHTML = '<span>Status check \u2014 ' + timeStr + '</span><span class="checkon-arrow">&#9660;</span>';
         sumEl.appendChild(header);
       }
       const body = document.createElement('div');
@@ -7587,6 +8027,7 @@ function _openEaUpdateStream(jobId) {
     }
     const line = parseStreamLine(raw);
     if (!line) return;
+    console.log('[ea-update]', line);
     _appendEaUpdateBubbleLine(line);
   };
   src.onerror = () => { src.close(); _eaUpdateBubbleStream = null; };
@@ -8404,6 +8845,12 @@ document.addEventListener('keydown', e => {
     if (e.key === 'Escape') { e.preventDefault(); hideSettings(); }
     return;
   }
+  // History overlay: Escape closes it
+  const historyOpen = document.getElementById('history-overlay').style.display === 'flex';
+  if (historyOpen) {
+    if (e.key === 'Escape') { e.preventDefault(); closeHistoryPanel(); }
+    return;
+  }
   // Shortcuts dialog: Escape closes it, block all other keys while open
   const shortcutsOpen = document.getElementById('shortcuts-overlay').classList.contains('visible');
   if (shortcutsOpen) {
@@ -8611,6 +9058,11 @@ document.addEventListener('keydown', e => {
     if (selectedIdx >= 1 && selectedIdx <= visibleIds.length && !selectedIsSection()) {
       e.preventDefault();
       eaUpdateItem(visibleIds[selectedIdx - 1]);
+    }
+  } else if (e.key === 'h' && !e.metaKey && !e.ctrlKey) {
+    if (selectedIdx >= 1 && selectedIdx <= visibleIds.length && !selectedIsSection()) {
+      e.preventDefault();
+      toggleTodoHistory(visibleIds[selectedIdx - 1]);
     }
   } else if (e.key === '0' || e.key === '1' || e.key === '2' || e.key === '3') {
     if (selectedIdx >= 1 && selectedIdx <= visibleIds.length && !selectedIsSection()) {
@@ -9047,6 +9499,17 @@ window.addEventListener('scroll', () => {
 </div>
 
 <!-- Chat overlay -->
+<div id="history-overlay" onclick="if(event.target===this)closeHistoryPanel()" style="display:none;position:fixed;inset:0;z-index:4000;background:rgba(0,0,0,0.5);flex-direction:column;justify-content:flex-end;align-items:center">
+  <div style="background:#1a1b1e;border-radius:14px 14px 0 0;height:60vh;max-height:80vh;display:flex;flex-direction:column;box-shadow:0 -8px 32px rgba(0,0,0,0.4);width:100%;max-width:994px">
+    <div style="display:flex;align-items:center;padding:10px 14px;gap:10px;border-bottom:1px solid rgba(255,255,255,0.1);flex-shrink:0">
+      <span id="history-title" style="color:#e2e8f0;font-size:0.85rem;font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+      <span style="font-size:0.7rem;color:var(--subtle)">Version History</span>
+      <button onclick="closeHistoryPanel()" style="background:rgba(255,255,255,0.1);border:none;color:#e2e8f0;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem">Close</button>
+    </div>
+    <div id="history-log" style="flex:1;overflow-y:auto"></div>
+  </div>
+</div>
+
 <div id="chat-overlay" onclick="if(event.target===this)minimizeChat()" style="display:none;position:fixed;inset:0;z-index:4000;background:rgba(0,0,0,0.5);flex-direction:column;justify-content:flex-end;align-items:center">
   <div id="chat-panel" style="background:#1a1b1e;border-radius:14px 14px 0 0;height:77vh;min-height:150px;max-height:90vh;display:flex;flex-direction:column;box-shadow:0 -8px 32px rgba(0,0,0,0.4);width:100%;max-width:994px">
     <div style="height:12px;cursor:ns-resize;flex-shrink:0;display:flex;justify-content:center;align-items:center;touch-action:none" onmousedown="_startChatResize(event)" ontouchstart="_startChatResize(event)"><span style="width:40px;height:4px;border-radius:2px;background:rgba(255,255,255,0.25)"></span></div>
