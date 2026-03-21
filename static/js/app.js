@@ -3600,31 +3600,28 @@ document.addEventListener('drop', async e => {
 
       var capturedId = todoId;
       var capturedCompleted = isCompleted;
-      var capturedItem = item;
       var capturedDir = swipeDir;
+      var fired = false;
 
       var done = function() {
-        capturedItem.removeEventListener('transitionend', done);
+        if (fired) return;
+        fired = true;
         if (capturedDir === 'left') {
           deleteTodo(capturedId);
         } else {
           toggleComplete(capturedId, !capturedCompleted);
         }
       };
-      // Listen on the content div for the transform transition
       content.addEventListener('transitionend', done, { once: true });
-      // Safety fallback in case transitionend doesn't fire
-      setTimeout(function() {
-        done();
-      }, 350);
+      setTimeout(done, 350);
     } else {
-      // Snap back
+      // Snap back — clean up all swipe classes
       item.classList.remove('swiping', 'swipe-threshold', 'swipe-left');
       item.classList.add('snap-back');
       content.style.transform = '';
       var snapItem = item;
       setTimeout(function() {
-        snapItem.classList.remove('snap-back', 'swipe-active');
+        snapItem.classList.remove('snap-back', 'swipe-active', 'swipe-left');
       }, 300);
     }
 
@@ -3633,12 +3630,12 @@ document.addEventListener('drop', async e => {
 
   document.addEventListener('touchcancel', function() {
     if (item) {
-      item.classList.remove('swiping', 'swipe-threshold');
+      item.classList.remove('swiping', 'swipe-threshold', 'swipe-left');
       item.classList.add('snap-back');
       if (content) content.style.transform = '';
       var snapItem = item;
       setTimeout(function() {
-        snapItem.classList.remove('snap-back', 'swipe-active');
+        snapItem.classList.remove('snap-back', 'swipe-active', 'swipe-left');
       }, 300);
     }
     item = null; content = null; locked = null; swipeDir = null;
