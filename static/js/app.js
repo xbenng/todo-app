@@ -316,11 +316,11 @@ function renderTodo(t) {
   const isCompleted = t.status === 'completed';
   const swipeRevealClass = isCompleted ? 'swipe-reveal swipe-reveal-undo' : 'swipe-reveal';
   const swipeIcon = isCompleted ? '&#8634;' : '&#10003;';
-  return `<div class="todo-item ${statusClass}${itemToggled}" data-todo-id="${t.id}" ${draggable} onclick="selectTodo('${t.id}')" ondblclick="startEdit('${t.id}')" oncontextmenu="showCtxMenu(event,'${t.id}')" style="cursor:pointer;">
+  return `<div class="todo-item ${statusClass}${itemToggled}" data-todo-id="${t.id}" onclick="selectTodo('${t.id}')" ondblclick="startEdit('${t.id}')" oncontextmenu="showCtxMenu(event,'${t.id}')" style="cursor:pointer;">
     <div class="${swipeRevealClass}"><span class="swipe-reveal-icon">${swipeIcon}</span></div>
     <div class="swipe-content">
     <div class="todo-header">
-      <div class="todo-title" style="flex:1;min-width:0;display:flex;align-items:center;gap:2px" onclick="event.stopPropagation();selectTodo('${t.id}');toggleItemDesc('${t.id}')">${spinner}${esc(_parseTitle(t.title || '').displayTitle)}</div>
+      <div class="todo-title" ${draggable} style="flex:1;min-width:0;display:flex;align-items:center;gap:2px;${t.status !== 'completed' ? 'cursor:grab;' : ''}" onclick="event.stopPropagation();selectTodo('${t.id}');toggleItemDesc('${t.id}')">${spinner}${esc(_parseTitle(t.title || '').displayTitle)}</div>
       <div class="todo-actions">
         ${t.status !== 'completed' ? `<button onclick="event.stopPropagation();eaUpdateItem('${t.id}')" style="border:none;background:transparent;font-size:1rem;padding:4px 6px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Refresh via /ea checkon" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#8635;</button>` : ''}
         <button onclick="event.stopPropagation();consolidateItem('${t.id}')" style="border:none;background:transparent;font-size:0.85rem;padding:4px 6px;cursor:pointer;color:var(--subtle);line-height:1;transition:color .15s" title="Consolidate description" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--subtle)'">&#x29C9;</button>
@@ -3318,8 +3318,10 @@ document.addEventListener('dragstart', e => {
     e.dataTransfer.setData('text/plain', 'section:' + dragSectionName);
     return;
   }
-  // Todo item drag
-  const item = e.target.closest('.todo-item[draggable]');
+  // Todo item drag — only from the title handle
+  const titleEl = e.target.closest('.todo-title[draggable]');
+  if (!titleEl) return;
+  const item = titleEl.closest('.todo-item');
   if (!item) return;
   dragId = item.dataset.todoId;
   dragSectionName = null;
@@ -3955,7 +3957,7 @@ document.addEventListener('keydown', e => {
     } else if (selectedIdx >= 1 && selectedIdx <= visibleIds.length && !selectedIsSection()) {
       startEdit(visibleIds[selectedIdx - 1]);
     }
-  } else if (e.key === 'c') {
+  } else if (e.key === 'c' && !e.metaKey && !e.ctrlKey) {
     if (selectedIdx >= 1 && selectedIdx <= visibleIds.length && !selectedIsSection()) {
       e.preventDefault();
       copyTodoId(visibleIds[selectedIdx - 1]);
