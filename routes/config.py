@@ -370,7 +370,7 @@ def mcp_oauth_start():
         state_payload["code_verifier"] = code_verifier
     state_data = json.dumps(state_payload)
     sig = hmac.new(_OAUTH_SECRET.encode(), state_data.encode(), hashlib.sha256).hexdigest()[:16]
-    state = base64.urlsafe_b64encode(f"{sig}:{state_data}".encode()).decode()
+    oauth_state = base64.urlsafe_b64encode(f"{sig}:{state_data}".encode()).decode()
     # Build redirect URI from request host
     domain = os.environ.get("DOMAIN_NAME")
     if domain:
@@ -381,7 +381,7 @@ def mcp_oauth_start():
         "client_id": client_id,
         "redirect_uri": redirect_uri,
         "response_type": "code",
-        "state": state,
+        "state": oauth_state,
     }
     if code_verifier:
         params["code_challenge"] = code_challenge
@@ -427,13 +427,13 @@ def _handle_oauth_callback():
         expected_sig = hmac.new(_OAUTH_SECRET.encode(), state_data.encode(), hashlib.sha256).hexdigest()[:16]
         if not hmac.compare_digest(sig, expected_sig):
             return "Invalid state signature", 400
-        state = json.loads(state_data)
+        oauth_state = json.loads(state_data)
     except Exception:
         return "Invalid state", 400
-    user_id = state["user_id"]
-    server = state["server"]
-    provider_id = state["provider"]
-    account_id = state.get("account_id", "")
+    user_id = oauth_state["user_id"]
+    server = oauth_state["server"]
+    provider_id = oauth_state["provider"]
+    account_id = oauth_state.get("account_id", "")
     # Look up OAuth provider config
     registry = _load_mcp_registry()
     providers = registry.get(server, {}).get("oauth_providers", [])
@@ -456,7 +456,7 @@ def _handle_oauth_callback():
         "grant_type": "authorization_code",
     }
     # Include PKCE code_verifier if present in state
-    code_verifier = state.get("code_verifier")
+    code_verifier = oauth_state.get("code_verifier")
     if code_verifier:
         token_payload["code_verifier"] = code_verifier
     resp = _requests.post(provider["token_uri"], data=token_payload)
