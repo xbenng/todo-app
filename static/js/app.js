@@ -3615,13 +3615,14 @@ document.addEventListener('drop', async e => {
       content.addEventListener('transitionend', done, { once: true });
       setTimeout(done, 350);
     } else {
-      // Snap back — clean up all swipe classes
+      // Snap back — animate then fully reset
       item.classList.remove('swiping', 'swipe-threshold', 'swipe-left');
       item.classList.add('snap-back');
       content.style.transform = '';
       var snapItem = item;
       setTimeout(function() {
-        snapItem.classList.remove('snap-back', 'swipe-active', 'swipe-left');
+        snapItem.classList.remove('snap-back', 'swipe-active', 'swipe-left', 'snap-complete');
+        snapItem.querySelector('.swipe-content').style.transform = '';
       }, 300);
     }
 
@@ -3629,16 +3630,7 @@ document.addEventListener('drop', async e => {
   }, { passive: true });
 
   document.addEventListener('touchcancel', function() {
-    if (item) {
-      item.classList.remove('swiping', 'swipe-threshold', 'swipe-left');
-      item.classList.add('snap-back');
-      if (content) content.style.transform = '';
-      var snapItem = item;
-      setTimeout(function() {
-        snapItem.classList.remove('snap-back', 'swipe-active', 'swipe-left');
-      }, 300);
-    }
-    item = null; content = null; locked = null; swipeDir = null;
+    reset();
   }, { passive: true });
 })();
 
