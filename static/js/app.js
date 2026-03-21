@@ -193,7 +193,7 @@ function render() {
     return `<button class="header-toggle" style="${style}" onclick="cycleFilter('${p}')" title="Filter ${p}">${label}</button>`;
   }).join('');
   const previewBtn = `<button class="header-toggle preview-toggle-btn${previewMode ? ' active' : ''}" onclick="togglePreviewMode()" title="Preview mode: auto-expand selected (v)">Preview</button>`;
-  const sessionsBtn = `<button class="header-toggle${filterActiveSessions ? ' active' : ''}" onclick="toggleFilterSessions()" title="Filter by active sessions (Ctrl+S)" style="${filterActiveSessions ? '' : 'color:var(--subtle)'}">Sessions</button>`;
+  const sessionsBtn = `<button class="header-toggle${filterActiveSessions ? ' active' : ''}" onclick="toggleFilterSessions()" title="Filter by active sessions (Alt+S)" style="${filterActiveSessions ? '' : 'color:var(--subtle)'}">Sessions</button>`;
   const unreadBtn = `<button class="header-toggle${filterUnread ? ' active' : ''}" onclick="toggleFilterUnread()" title="Filter by unread updates" style="${filterUnread ? 'background:#f59e0b;color:#fff;border-color:#f59e0b' : 'color:#f59e0b;border-color:#f59e0b'}">Unread</button>`;
   const activeSections = sectionsOrder.filter(s => s);
   const collapsedCount = activeSections.filter(s => collapsedSections.has(s)).length;
@@ -3865,14 +3865,15 @@ document.addEventListener('keydown', e => {
   if (!inSearchInput && (tag === 'input' || tag === 'textarea' || tag === 'select')) return;
   if (editingId) return;
 
-  // Filter sessions: Ctrl+S
-  if (e.ctrlKey && e.key === 's' && !e.metaKey && !e.shiftKey) {
+  // Filter sessions: Alt+S
+  if (e.altKey && e.key === 's' && !e.metaKey && !e.ctrlKey && !e.shiftKey) {
     e.preventDefault();
     toggleFilterSessions();
     return;
   }
 
-  if ((e.metaKey || e.ctrlKey) && e.key === 'u' && !e.shiftKey) {
+  // Filter unread: Alt+U
+  if (e.altKey && e.key === 'u' && !e.metaKey && !e.ctrlKey && !e.shiftKey) {
     e.preventDefault();
     toggleFilterUnread();
     return;
