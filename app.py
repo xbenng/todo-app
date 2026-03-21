@@ -58,6 +58,22 @@ register_blueprints(app)
 # Register WebSocket routes (terminal)
 register_websocket(sock)
 
+# CSRF protection — require Content-Type: application/json on state-changing requests.
+# Browsers enforce that HTML forms cannot set this header, so cross-origin form
+# submissions are blocked. The JS frontend already sends this header on all fetches.
+@app.before_request
+def csrf_protect():
+    if request.method in ("POST", "PUT", "DELETE"):
+        # Skip for OAuth callback (browser redirect, not JS fetch)
+        if request.path == "/api/mcp/oauth/callback":
+            return
+        # Skip for WebSocket upgrade requests
+        if request.headers.get("Upgrade", "").lower() == "websocket":
+            return
+        content_type = request.content_type or ""
+        if "application/json" not in content_type:
+            return jsonify({"error": "Content-Type must be application/json"}), 415
+
 # Global error handler — never expose tracebacks to clients
 @app.errorhandler(Exception)
 def handle_unhandled_exception(e):

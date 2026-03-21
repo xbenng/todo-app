@@ -35,7 +35,7 @@ def auth_register(data: RegisterRequest):
         return jsonify({"error": str(exc)}), 500
     token = _db.create_session(user["id"])
     resp = jsonify({"user": user})
-    resp.set_cookie("session_token", token, httponly=True, samesite="Lax",
+    resp.set_cookie("session_token", token, httponly=True, samesite="Strict",
                      max_age=60 * 60 * 24 * 30)  # 30 days
     return resp
 
@@ -48,7 +48,7 @@ def auth_login(data: LoginRequest):
         return jsonify({"error": "Invalid email or password"}), 401
     token = _db.create_session(user["id"])
     resp = jsonify({"user": user})
-    resp.set_cookie("session_token", token, httponly=True, samesite="Lax",
+    resp.set_cookie("session_token", token, httponly=True, samesite="Strict",
                      max_age=60 * 60 * 24 * 30)
     return resp
 
