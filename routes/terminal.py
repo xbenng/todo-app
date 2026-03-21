@@ -11,14 +11,15 @@ import db as _db
 bp = Blueprint('terminal', __name__)
 
 
-from services.file_io import _parse_todo_file
-
-
 @bp.route("/api/todos/<todo_id>/terminal", methods=["POST"])
 def open_terminal(todo_id):
     """Create a tmux-backed terminal session for a todo. Returns existing if alive."""
     data = request.json or {}
     resume_id = data.get("resume_id")
+
+    user = get_current_user()
+    if not user:
+        return jsonify({"error": "Not authenticated"}), 401
 
     # Return existing alive session for this todo (unless resuming a specific conv)
     if not resume_id:
@@ -26,8 +27,7 @@ def open_terminal(todo_id):
             if s["todo_id"] == todo_id and s["alive"]:
                 return jsonify({"session_id": s["id"], "title": s["title"], "existing": True})
 
-    todos = _parse_todo_file(state.TODO_FILE)
-    todo = next((t for t in todos if t["id"] == todo_id), None)
+    todo = _db.get_todo(user["id"], todo_id)
     if not todo:
         return jsonify({"error": "Todo not found"}), 404
 
@@ -37,7 +37,7 @@ def open_terminal(todo_id):
 
     session_id = str(uuid.uuid4())[:8]
     tmux_name = f"t-{session_id}"
-    todo_dir = os.path.dirname(os.path.abspath(state.TODO_FILE)) or os.getcwd()
+    todo_dir = os.getcwd()
 
     # Create a dedicated tmux session (one window, no switching possible)
     tmux = _tmux_bin()

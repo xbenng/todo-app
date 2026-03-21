@@ -2,11 +2,10 @@
 """
 Dossie — AI-powered executive assistant and todo manager.
 
-Usage:
-    python app.py [path/to/todos.md]
+Requires PostgreSQL. Set DATABASE_URL in .env or environment.
 
-If no file is specified, defaults to 'todos.md' in the current directory.
-The file will be created if it doesn't exist.
+Usage:
+    python app.py [--host HOST] [--port PORT]
 """
 
 import sys
@@ -56,26 +55,19 @@ if __name__ == "__main__":
     import atexit
 
     parser = argparse.ArgumentParser(description="Dossie — AI-powered Todo App")
-    parser.add_argument("todo_file", nargs="?", default="todos.md", help="Path to the todo markdown file")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
     parser.add_argument("--port", type=int, default=5111, help="Port to listen on")
     args = parser.parse_args()
 
-    state.TODO_FILE = args.todo_file
-
-    # Initialize database if DATABASE_URL is set
+    # Initialize database (required)
     database_url = os.environ.get("DATABASE_URL")
-    if database_url:
-        _db.init(database_url)
-        state._USE_DB = True
-        print(f"Database connected: {database_url.split('@')[-1] if '@' in database_url else database_url}")
-    else:
-        # File mode — create file if it doesn't exist
-        from services.file_io import _write_todo_file, _ensure_config_dir
-        if not os.path.exists(state.TODO_FILE):
-            _write_todo_file(state.TODO_FILE, [])
-            print(f"Created new todo file: {state.TODO_FILE}")
-        _ensure_config_dir()
+    if not database_url:
+        print("ERROR: DATABASE_URL environment variable is required.")
+        print("Set it in .env or export it: export DATABASE_URL=postgresql://localhost/todos")
+        sys.exit(1)
+
+    _db.init(database_url)
+    print(f"Database connected: {database_url.split('@')[-1] if '@' in database_url else database_url}")
 
     # Register cleanup handler for MCP managers
     def _shutdown_all_mcp():
@@ -89,6 +81,5 @@ if __name__ == "__main__":
     from services.terminal import _tmux_recover_sessions
     _tmux_recover_sessions()
 
-    print(f"Serving todo UI for: {os.path.abspath(state.TODO_FILE)}")
     print(f"Open http://{args.host}:{args.port} in your browser")
     app.run(host=args.host, port=args.port, debug=False, use_reloader=True)

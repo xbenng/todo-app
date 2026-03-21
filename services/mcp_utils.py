@@ -62,7 +62,7 @@ def _refresh_oauth_token(oauth_token: dict) -> str | None:
 
 def _write_server_accounts(user_id: str, server_name: str, entry: dict) -> dict:
     """Write per-user account configs to temp files. Returns extra env vars to set."""
-    if not state._USE_DB or not user_id or user_id == "local":
+    if not user_id or user_id == "local":
         return {}
     if "account_fields" not in entry:
         return {}
@@ -215,7 +215,7 @@ def _build_mcp_configs_from_registry(registry: dict, tokens: dict,
                             oauth_token["token"] = fresh
                             oauth_token["expiry"] = (datetime.now(timezone.utc) +
                                                      timedelta(seconds=3600)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-                            if state._USE_DB and user_id and user_id != "local":
+                            if user_id and user_id != "local":
                                 config = _db.get_config(user_id)
                                 db_tokens = config.get("tokens", {})
                                 db_tokens[bearer_key] = oauth_token
@@ -235,16 +235,15 @@ def _build_mcp_configs_from_registry(registry: dict, tokens: dict,
 
 def _build_cli_mcp_config(user_id: str | None) -> dict | None:
     """Build an mcpServers dict for Claude CLI --mcp-config from the registry + user credentials."""
-    from services.file_io import _load_config
     registry = _load_mcp_registry()
     if not registry:
         return None
-    if state._USE_DB and user_id and user_id != "local":
+    if user_id and user_id != "local":
         config = _db.get_config(user_id)
         prefs = _db.get_mcp_preferences(user_id)
         enabled = {name for name, p in prefs.items() if p["enabled"]}
     else:
-        config = _load_config()
+        config = {}
         enabled = None
     tokens = config.get("tokens", {})
     app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -300,7 +299,7 @@ def _build_cli_mcp_config(user_id: str | None) -> dict | None:
     if os.path.exists(todo_tools_script):
         todo_env = {"TODO_API_BASE": "http://localhost:5222"}
         # Create a short-lived session token so the MCP proxy can call our API as this user
-        if state._USE_DB and user_id and user_id != "local":
+        if user_id and user_id != "local":
             proxy_token = _db.create_session(user_id, expires_hours=1)
             todo_env["TODO_AUTH_TOKEN"] = proxy_token
         python_bin = shutil.which("python3") or "python3"
@@ -335,15 +334,14 @@ def _get_mcp_manager(user_id: str | None = None) -> MCPManager | None:
     registry = _load_mcp_registry()
     if not registry:
         return None
-    if state._USE_DB and user_id and user_id != "local":
+    if user_id and user_id != "local":
         config = _db.get_config(user_id)
     else:
-        from services.file_io import _load_config
-        config = _load_config()
+        config = {}
     tokens = config.get("tokens", {})
     # Only connect servers the user has enabled
     enabled_servers = None
-    if state._USE_DB and user_id and user_id != "local":
+    if user_id and user_id != "local":
         prefs = _db.get_mcp_preferences(user_id)
         enabled_servers = {name for name, p in prefs.items() if p["enabled"]}
         if not enabled_servers:
@@ -376,7 +374,7 @@ def _get_mcp_tools(user_id: str | None = None) -> list[dict]:
             for tool_name in entry.get("exclude_tools", []):
                 excluded.add(f"mcp__{server_name}__{tool_name}")
     # Add per-user disabled tools
-    if state._USE_DB and user_id and user_id != "local":
+    if user_id and user_id != "local":
         prefs = _db.get_mcp_preferences(user_id)
         for server_name, pref in prefs.items():
             for tool_name in pref.get("disabled_tools", []):

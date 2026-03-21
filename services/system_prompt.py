@@ -36,7 +36,7 @@ def _build_system_prompt(todo_id: str | None, user_id: str | None = None) -> str
     """Build a system prompt from per-user DB config or file-based fallback."""
     parts = []
 
-    if state._USE_DB and user_id:
+    if user_id:
         config = _db.get_config(user_id)
         # 1. Base system prompt from DB
         sp = config.get("system_prompt")
@@ -51,34 +51,7 @@ def _build_system_prompt(todo_id: str | None, user_id: str | None = None) -> str
             if content and content.strip():
                 parts.append(f"# {name}\n{content.strip()}")
     else:
-        # File-based fallback
-        from services.file_io import _config_dir_path
-        config_dir = _config_dir_path()
-        # 1. Base system prompt
-        prompt_path = os.path.join(config_dir, "system-prompt.md")
-        if os.path.exists(prompt_path):
-            try:
-                with open(prompt_path, "r", encoding="utf-8") as f:
-                    content = f.read().strip()
-                if content:
-                    parts.append(content)
-            except OSError:
-                pass
-        if not parts:
-            parts.append(_DEFAULT_SYSTEM_PROMPT.strip())
-        # 2. Context files from disk
-        context_dir = os.path.join(config_dir, "context")
-        if os.path.isdir(context_dir):
-            for name in sorted(os.listdir(context_dir)):
-                if name.endswith(".md"):
-                    fp = os.path.join(context_dir, name)
-                    try:
-                        with open(fp, "r", encoding="utf-8") as f:
-                            content = f.read().strip()
-                        if content:
-                            parts.append(f"# {name}\n{content}")
-                    except OSError:
-                        pass
+        parts.append(_DEFAULT_SYSTEM_PROMPT.strip())
 
     # 3. Global context files (shared across all users)
     global_ctx_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "context")

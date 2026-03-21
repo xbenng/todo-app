@@ -1,10 +1,9 @@
-import json, time, copy, re
+import json, re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import state
 from services.tools import _execute_tool, _get_tool_definitions
 from services.mcp_utils import _get_mcp_tools
 from services.system_prompt import _build_system_prompt
-from services.file_io import _load_chats, _save_chats, _load_config
 import db as _db
 
 try:
@@ -76,12 +75,8 @@ class ChatAgent:
         If auto_compact is enabled in user config, automatically
         summarizes older messages to stay within context limits.
         """
-        if state._USE_DB and self.todo_id:
+        if self.todo_id:
             raw_messages = _db.get_messages(self.todo_id)
-        elif self.todo_id:
-            chats = _load_chats()
-            chat = chats.get(self.todo_id, {"messages": []})
-            raw_messages = chat.get("messages", [])
         else:
             raw_messages = []
         messages = []
@@ -93,10 +88,10 @@ class ChatAgent:
             messages.append({"role": role, "content": content})
         messages.append({"role": "user", "content": message})
         # Auto-compact if enabled
-        if state._USE_DB and self.user_id:
+        if self.user_id:
             config = _db.get_config(self.user_id)
         else:
-            config = _load_config()
+            config = {}
         if config.get("auto_compact", False) and len(messages) > 8:
             threshold = config.get("compact_threshold", 100000)
             keep_recent = config.get("compact_keep_recent", 8)
@@ -191,16 +186,8 @@ class ChatAgent:
             return
         try:
             content = "\n".join(self.assistant_text_lines)
-            if state._USE_DB:
-                user_id = self.job.get("user_id")
-                _db.add_message(self.todo_id, user_id, "assistant", content)
-            else:
-                chats = _load_chats()
-                chat = chats.get(self.todo_id, {"conversationId": None, "messages": []})
-                chat["messages"].append({"role": "assistant", "content": content})
-                chat["unread"] = True
-                chats[self.todo_id] = chat
-                _save_chats(chats)
+            user_id = self.job.get("user_id")
+            _db.add_message(self.todo_id, user_id, "assistant", content)
         except Exception as exc:
             print(f"[persist] ERROR saving chat for {self.todo_id}: {exc}")
 

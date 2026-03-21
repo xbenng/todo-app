@@ -8,7 +8,6 @@ from services.mcp_utils import (
     _load_mcp_registry, _get_mcp_manager, _get_mcp_tools, _redact_key,
     _build_mcp_configs_from_registry, _write_server_accounts,
 )
-from services.file_io import _load_config, _save_config
 from services.chat_runner import _get_active_provider
 import db as _db
 
@@ -33,10 +32,7 @@ def _resolve_oauth_creds(provider: dict) -> tuple[str, str]:
 def get_config():
     """Return server config with API keys redacted."""
     user = get_current_user()
-    if state._USE_DB and user:
-        config = _db.get_config(user["id"])
-    else:
-        config = _load_config()
+    config = _db.get_config(user["id"]) if user else {}
     safe = dict(config)
     # Redact legacy flat keys
     if "anthropic_api_key" in safe and safe["anthropic_api_key"]:
@@ -66,11 +62,10 @@ def get_config():
 def put_config():
     """Update server config."""
     user = get_current_user()
+    if not user:
+        return jsonify({"error": "Not authenticated"}), 401
     data = request.json or {}
-    if state._USE_DB and user:
-        config = _db.get_config(user["id"])
-    else:
-        config = _load_config()
+    config = _db.get_config(user["id"])
     # Merge provided fields (legacy + new)
     for key in ("anthropic_api_key", "model", "mcp_servers", "openai_compat", "active_provider", "subagents_enabled", "max_subagents", "auto_approve_all"):
         if key in data:
@@ -91,13 +86,10 @@ def put_config():
         config["providers"] = existing
     if "tokens" in data and isinstance(data["tokens"], dict):
         config.setdefault("tokens", {}).update(data["tokens"])
-    if state._USE_DB and user:
-        _db.save_config(user["id"], **{k: v for k, v in config.items()
-                        if k in ("providers", "active_provider", "tokens",
-                                 "subagents_enabled", "max_subagents",
-                                 "auto_approve_all")})
-    else:
-        _save_config(config)
+    _db.save_config(user["id"], **{k: v for k, v in config.items()
+                    if k in ("providers", "active_provider", "tokens",
+                             "subagents_enabled", "max_subagents",
+                             "auto_approve_all")})
     return jsonify({"ok": True})
 
 
@@ -112,13 +104,13 @@ def mcp_status():
     # Load user preferences
     prefs = {}
     auto_approve_all = False
-    if state._USE_DB and user_id and user_id != "local":
+    if user_id and user_id != "local":
         prefs = _db.get_mcp_preferences(user_id)
         config = _db.get_config(user_id)
         auto_approve_all = config.get("auto_approve_all", False)
     # Get user tokens to show which credentials are set
     user_tokens = {}
-    if state._USE_DB and user_id and user_id != "local":
+    if user_id and user_id != "local":
         user_tokens = config.get("tokens", {})
     servers = []
     for name, reg_entry in registry.items():
@@ -126,7 +118,7 @@ def mcp_status():
         cred_fields = reg_entry.get("credential_fields", [])
         acct_fields = reg_entry.get("account_fields", [])
         acct_count = 0
-        if acct_fields and state._USE_DB and user_id and user_id != "local":
+        if acct_fields and user_id and user_id != "local":
             acct_count = len(_db.get_server_accounts(user_id, name))
         entry = {
             "name": name,
@@ -210,7 +202,7 @@ def mcp_approve():
     # Persist auto-approval if requested
     if approved and always_allow:
         user = get_current_user()
-        if user and state._USE_DB:
+        if user:
             _db.set_tool_auto_approved(
                 user["id"], pending["server_name"], pending["tool_name"], True
             )
@@ -224,7 +216,7 @@ def mcp_approve():
 def mcp_set_server():
     """Enable or disable an MCP server for the current user."""
     user = get_current_user()
-    if not user or not state._USE_DB:
+    if not user:
         return jsonify({"error": "Not authenticated"}), 401
     data = request.json or {}
     server = data.get("server", "")
@@ -246,7 +238,7 @@ def mcp_set_server():
 def mcp_set_tool():
     """Set tool disabled or auto_approved state."""
     user = get_current_user()
-    if not user or not state._USE_DB:
+    if not user:
         return jsonify({"error": "Not authenticated"}), 401
     data = request.json or {}
     server = data.get("server", "")
@@ -264,7 +256,7 @@ def mcp_set_tool():
 def mcp_get_accounts(server_name):
     """Get all accounts for a server."""
     user = get_current_user()
-    if not user or not state._USE_DB:
+    if not user:
         return jsonify({"error": "Not authenticated"}), 401
     accounts = _db.get_server_accounts(user["id"], server_name)
     # Redact secrets, add oauth_connected flag
@@ -283,7 +275,7 @@ def mcp_get_accounts(server_name):
 def mcp_add_account(server_name):
     """Add an account for a server."""
     user = get_current_user()
-    if not user or not state._USE_DB:
+    if not user:
         return jsonify({"error": "Not authenticated"}), 401
     registry = _load_mcp_registry()
     if server_name not in registry:
@@ -303,7 +295,7 @@ def mcp_add_account(server_name):
 def mcp_update_account(server_name, account_id):
     """Update an account."""
     user = get_current_user()
-    if not user or not state._USE_DB:
+    if not user:
         return jsonify({"error": "Not authenticated"}), 401
     data = request.json or {}
     # Merge: don't overwrite password with redacted value
@@ -331,7 +323,7 @@ def mcp_update_account(server_name, account_id):
 def mcp_delete_account(server_name, account_id):
     """Delete an account."""
     user = get_current_user()
-    if not user or not state._USE_DB:
+    if not user:
         return jsonify({"error": "Not authenticated"}), 401
     if not _db.delete_server_account(user["id"], account_id):
         return jsonify({"error": "Not found"}), 404
@@ -348,7 +340,7 @@ def mcp_delete_account(server_name, account_id):
 def mcp_oauth_start():
     """Start an OAuth flow. Returns {auth_url} for the UI to open in a popup."""
     user = get_current_user()
-    if not user or not state._USE_DB:
+    if not user:
         return jsonify({"error": "Not authenticated"}), 401
     server = request.args.get("server", "")
     provider_id = request.args.get("provider", "")

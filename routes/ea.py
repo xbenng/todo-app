@@ -22,7 +22,7 @@ def ea_update():
     if existing and not force:
         return jsonify({"status": "already_running", "job_id": existing["id"]})
 
-    todo_dir = os.path.dirname(os.path.abspath(state.TODO_FILE)) or os.getcwd()
+    todo_dir = os.getcwd()
     job_id = _start_claude_chat_job("EA Update", "ea-update", "/ea update", todo_dir,
                                      user_id=user["id"] if user else None)
     return jsonify({"status": "started", "job_id": job_id})
@@ -44,7 +44,7 @@ def ea_update_item():
     if existing and not force:
         return jsonify({"status": "already_running", "job_id": existing["id"]})
 
-    todo_dir = os.path.dirname(os.path.abspath(state.TODO_FILE)) or os.getcwd()
+    todo_dir = os.getcwd()
     message = data.get("message") or f"/ea checkon {item_id}"
     label = "Consolidate" if "consolidate" in message else f"Check: {item_id}"
     job_id = _start_claude_chat_job(label, job_key, message, todo_dir,
@@ -80,7 +80,7 @@ def resume_conv():
             check=True,
             capture_output=True,
         )
-        todo_dir = os.path.dirname(os.path.abspath(state.TODO_FILE)) or os.getcwd()
+        todo_dir = os.getcwd()
         subprocess.run(
             [
                 tmux_bin, "send-keys",

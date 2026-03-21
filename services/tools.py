@@ -5,8 +5,6 @@ Contains built-in tool schemas, the main tool dispatcher, and subagent spawning.
 
 import json
 import re
-import uuid
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import state
@@ -14,10 +12,7 @@ from services.mcp_utils import (
     _get_mcp_tools, _parse_mcp_tool_name, _check_tool_permission, _get_mcp_manager,
 )
 from services.system_prompt import _build_system_prompt
-from services.file_io import (
-    _parse_todo_file, _write_todo_file, _snapshot_and_write,
-    _load_chats, _save_chats, VALID_PRIORITIES,
-)
+from services.file_io import VALID_PRIORITIES
 import db as _db
 
 
@@ -126,11 +121,10 @@ def _get_tool_definitions(depth: int = 0, user_id: str | None = None) -> list[di
             }
         },
     ]
-    if state._USE_DB and user_id and user_id != "local":
+    if user_id and user_id != "local":
         config = _db.get_config(user_id)
     else:
-        from services.file_io import _load_config
-        config = _load_config()
+        config = {}
     if depth < 2 and config.get("subagents_enabled", True):
         tools.append({
             "name": "spawn_agents",
@@ -177,19 +171,13 @@ def _execute_tool(name: str, input_data: dict, todo_id: str | None,
     if agent_context and agent_context.get("job_id"):
         user_id = state._jobs.get(agent_context["job_id"], {}).get("user_id")
 
-    # In DB mode, require user_id — never fall through to file-based operations
-    if state._USE_DB and not user_id and name not in ("spawn_agents",):
+    # Require user_id — never fall through without authentication
+    if not user_id and name not in ("spawn_agents",):
         return json.dumps({"error": "Not authenticated"})
 
     try:
         if name == "read_todos":
-            if state._USE_DB and user_id:
-                todos = _db.get_todos(user_id)
-            else:
-                from services.file_io import _completed_file_path
-                active = _parse_todo_file(state.TODO_FILE)
-                completed = _parse_todo_file(_completed_file_path(state.TODO_FILE))
-                todos = active + completed
+            todos = _db.get_todos(user_id)
             status_filter = input_data.get("status_filter", "open")
             if status_filter == "open":
                 todos = [t for t in todos if t["status"] != "completed"]
@@ -202,109 +190,54 @@ def _execute_tool(name: str, input_data: dict, todo_id: str | None,
 
         elif name == "get_todo":
             tid = input_data.get("todo_id", "")
-            if state._USE_DB and user_id:
-                todo = _db.get_todo(user_id, tid)
-            else:
-                from services.file_io import _completed_file_path
-                active = _parse_todo_file(state.TODO_FILE)
-                completed = _parse_todo_file(_completed_file_path(state.TODO_FILE))
-                todo = next((t for t in active + completed if t["id"] == tid), None)
+            todo = _db.get_todo(user_id, tid)
             if not todo:
                 return json.dumps({"error": f"Todo {tid} not found"})
             return json.dumps(todo, ensure_ascii=False)
 
         elif name == "update_todo":
             tid = input_data["todo_id"]
-            if state._USE_DB and user_id:
-                fields = {}
-                for k in ("title", "description", "status", "priority", "section"):
-                    if k in input_data:
-                        val = input_data[k]
-                        if k == "status" and val not in ("open", "completed"):
-                            continue
-                        if k == "priority" and val not in VALID_PRIORITIES:
-                            continue
-                        fields[k] = val.strip() if isinstance(val, str) else val
-                result = _db.update_todo(user_id, tid, **fields)
-                if not result:
-                    return json.dumps({"error": f"Todo {tid} not found"})
-                if agent_context:
-                    _db.mark_chat_unread(tid, user_id)
-                return json.dumps(result, ensure_ascii=False)
-            else:
-                from services.file_io import _completed_file_path
-                active = _parse_todo_file(state.TODO_FILE)
-                completed = _parse_todo_file(_completed_file_path(state.TODO_FILE))
-                todos = active + completed
-                for t in todos:
-                    if t["id"] == tid:
-                        for field in ("title", "description", "status", "priority", "section"):
-                            if field in input_data:
-                                val = input_data[field]
-                                if field == "status" and val not in ("open", "completed"):
-                                    continue
-                                if field == "priority" and val not in VALID_PRIORITIES:
-                                    continue
-                                t[field] = val.strip() if isinstance(val, str) else val
-                        _snapshot_and_write(state.TODO_FILE, todos)
-                        return json.dumps(t, ensure_ascii=False)
+            fields = {}
+            for k in ("title", "description", "status", "priority", "section"):
+                if k in input_data:
+                    val = input_data[k]
+                    if k == "status" and val not in ("open", "completed"):
+                        continue
+                    if k == "priority" and val not in VALID_PRIORITIES:
+                        continue
+                    fields[k] = val.strip() if isinstance(val, str) else val
+            result = _db.update_todo(user_id, tid, **fields)
+            if not result:
                 return json.dumps({"error": f"Todo {tid} not found"})
+            if agent_context:
+                _db.mark_chat_unread(tid, user_id)
+            return json.dumps(result, ensure_ascii=False)
 
         elif name == "create_todo":
             title = (input_data.get("title") or "").strip()
             if not title:
                 return json.dumps({"error": "Title is required"})
-            if state._USE_DB and user_id:
-                new_todo = _db.create_todo(
-                    user_id, title,
-                    description=(input_data.get("description") or "").strip(),
-                    priority=input_data.get("priority", DEFAULT_PRIORITY),
-                    section=(input_data.get("section") or "").strip(),
-                )
-                if agent_context:
-                    _db.mark_chat_unread(new_todo["id"], user_id)
-                return json.dumps(new_todo, ensure_ascii=False)
-            else:
-                from services.file_io import _completed_file_path
-                active = _parse_todo_file(state.TODO_FILE)
-                completed = _parse_todo_file(_completed_file_path(state.TODO_FILE))
-                todos = active + completed
-                new_todo = {
-                    "id": str(uuid.uuid4())[:8],
-                    "title": title,
-                    "description": (input_data.get("description") or "").strip(),
-                    "status": "open",
-                    "priority": input_data.get("priority", DEFAULT_PRIORITY),
-                    "section": (input_data.get("section") or "").strip(),
-                }
-                todos.append(new_todo)
-                _snapshot_and_write(state.TODO_FILE, todos)
-                return json.dumps(new_todo, ensure_ascii=False)
+            new_todo = _db.create_todo(
+                user_id, title,
+                description=(input_data.get("description") or "").strip(),
+                priority=input_data.get("priority", DEFAULT_PRIORITY),
+                section=(input_data.get("section") or "").strip(),
+            )
+            if agent_context:
+                _db.mark_chat_unread(new_todo["id"], user_id)
+            return json.dumps(new_todo, ensure_ascii=False)
 
         elif name == "search_todos":
             query = input_data.get("query", "").lower()
-            if state._USE_DB and user_id:
-                results = _db.search_todos(user_id, query)
-            else:
-                from services.file_io import _completed_file_path
-                active = _parse_todo_file(state.TODO_FILE)
-                completed = _parse_todo_file(_completed_file_path(state.TODO_FILE))
-                results = [t for t in active + completed
-                           if query in t.get("title", "").lower()
-                           or query in t.get("description", "").lower()]
+            results = _db.search_todos(user_id, query)
             # Return summaries — use get_todo for full detail
             results = [{k: v for k, v in t.items() if k != "description"} for t in results]
             return json.dumps(results, ensure_ascii=False)
 
         elif name == "read_chat_history":
             tid = input_data.get("todo_id", todo_id)
-            if state._USE_DB:
-                messages = _db.get_messages(tid)
-                return json.dumps(messages[-20:], ensure_ascii=False)
-            else:
-                chats = _load_chats()
-                chat = chats.get(tid, {"messages": []})
-                return json.dumps(chat.get("messages", [])[-20:], ensure_ascii=False)
+            messages = _db.get_messages(tid)
+            return json.dumps(messages[-20:], ensure_ascii=False)
 
         elif name == "spawn_agents":
             if not agent_context:
@@ -313,11 +246,10 @@ def _execute_tool(name: str, input_data: dict, todo_id: str | None,
             print(f"[spawn_agents] Received {len(agents)} agent(s): {[a.get('label', '?') for a in agents]}")
             if not agents:
                 return json.dumps({"error": "No agents specified"})
-            if state._USE_DB and user_id:
+            if user_id:
                 config = _db.get_config(user_id)
             else:
-                from services.file_io import _load_config
-                config = _load_config()
+                config = {}
             max_subagents = config.get("max_subagents", 10)
             if len(agents) > max_subagents:
                 return json.dumps({"error": f"Maximum {max_subagents} parallel agents"})
@@ -333,7 +265,7 @@ def _execute_tool(name: str, input_data: dict, todo_id: str | None,
             mgr = _get_mcp_manager(user_id)
             if mgr and mgr.is_mcp_tool(name):
                 # Check runtime permission before executing
-                if state._USE_DB and user_id and user_id != "local":
+                if user_id and user_id != "local":
                     permission = _check_tool_permission(user_id, name, input_data, agent_context)
                     if permission == "denied":
                         return json.dumps({"error": f"Tool '{name}' was denied by the user"})
@@ -354,8 +286,11 @@ def _execute_spawn_agents(agents: list[dict], agent_context: dict, todo_id: str 
     state._jobs[job_id]["output_lines"].append(f"\u26a1 Launching {len(agents)} subagent(s)...")
 
     results = []
-    from services.file_io import _load_config
-    config = _load_config()
+    user_id = state._jobs[job_id].get("user_id")
+    if user_id:
+        config = _db.get_config(user_id)
+    else:
+        config = {}
     max_workers = config.get("max_subagents", 10)
     with ThreadPoolExecutor(max_workers=min(len(agents), max_workers)) as executor:
         futures = {}

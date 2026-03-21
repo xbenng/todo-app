@@ -3,8 +3,7 @@ import os, json
 from flask import Blueprint, request, jsonify
 from routes.auth import get_current_user
 import state
-from services.chat_runner import _start_claude_chat_job, _start_claude_job
-from services.file_io import _parse_todo_file, _load_chats, _save_chats
+from services.chat_runner import _start_claude_chat_job
 import db as _db
 
 bp = Blueprint('chat', __name__)
@@ -13,12 +12,15 @@ bp = Blueprint('chat', __name__)
 @bp.route("/api/todos/<todo_id>/start", methods=["POST"])
 def start_in_tmux(todo_id):
     """Launch a headless Claude Code session working on the given todo."""
-    todos = _parse_todo_file(state.TODO_FILE)
-    todo = next((t for t in todos if t["id"] == todo_id), None)
+    user = get_current_user()
+    if not user:
+        return jsonify({"error": "Not authenticated"}), 401
+    todo = _db.get_todo(user["id"], todo_id)
     if not todo:
         return jsonify({"error": "Todo not found"}), 404
 
-    todo_dir = os.path.dirname(os.path.abspath(state.TODO_FILE)) or os.getcwd()
+    todo_dir = os.getcwd()
+    from services.chat_runner import _start_claude_job
     job_id = _start_claude_job(todo.get("title", todo_id), f"workon-{todo_id}",
                                f"/ea workon {todo_id}", todo_dir)
     return jsonify({"status": "started", "job_id": job_id})
@@ -28,14 +30,10 @@ def start_in_tmux(todo_id):
 def chat_with_todo(todo_id):
     """Send a chat message for a todo item, optionally resuming a conversation."""
     user = get_current_user()
-    if state._USE_DB and not user:
+    if not user:
         return jsonify({"error": "Not authenticated"}), 401
 
-    if state._USE_DB:
-        todo = _db.get_todo(user["id"], todo_id)
-    else:
-        todos = _parse_todo_file(state.TODO_FILE)
-        todo = next((t for t in todos if t["id"] == todo_id), None)
+    todo = _db.get_todo(user["id"], todo_id)
     if not todo:
         return jsonify({"error": "Todo not found"}), 404
 
@@ -44,22 +42,14 @@ def chat_with_todo(todo_id):
     if not message:
         return jsonify({"error": "message is required"}), 400
 
-    if state._USE_DB:
-        resume_conv = data.get("resume_conv")
-        if resume_conv is not None:
-            _db.resume_conversation(todo_id, int(resume_conv))
-        _db.add_message(todo_id, user["id"], "user", message)
-        meta = _db.get_chat_meta(todo_id)
-        conversation_id = meta["conversation_id"] if meta else None
-    else:
-        chats = _load_chats()
-        chat = chats.get(todo_id, {"conversationId": None, "messages": []})
-        conversation_id = chat.get("conversationId")
-        chat["messages"].append({"role": "user", "content": message})
-        chats[todo_id] = chat
-        _save_chats(chats)
+    resume_conv = data.get("resume_conv")
+    if resume_conv is not None:
+        _db.resume_conversation(todo_id, int(resume_conv))
+    _db.add_message(todo_id, user["id"], "user", message)
+    meta = _db.get_chat_meta(todo_id)
+    conversation_id = meta["conversation_id"] if meta else None
 
-    todo_dir = os.path.dirname(os.path.abspath(state.TODO_FILE)) or os.getcwd()
+    todo_dir = os.getcwd()
 
     job_id = _start_claude_chat_job(
         label=f"chat: {todo.get('title', todo_id)[:40]}",
@@ -68,7 +58,7 @@ def chat_with_todo(todo_id):
         cwd=todo_dir,
         conversation_id=conversation_id,
         todo_id=todo_id,
-        user_id=user["id"] if user else None,
+        user_id=user["id"],
     )
     return jsonify({"job_id": job_id, "conversation_id": conversation_id})
 
@@ -77,41 +67,37 @@ def chat_with_todo(todo_id):
 def get_chat(todo_id):
     """Return the persisted chat session for a todo item, plus any running job."""
     user = get_current_user()
-    if state._USE_DB:
-        include_tool = request.args.get("include_tool", "false").lower() == "true"
-        messages = _db.get_messages(todo_id, include_tool=include_tool) if user else []
-        # Filter out structured JSON content (tool use blocks) from assistant messages for display
-        if not include_tool:
-            clean = []
-            for m in messages:
-                content = m.get("content", "")
-                if isinstance(content, str) and content.startswith(("[", "{")):
-                    try:
-                        parsed = json.loads(content)
-                        if isinstance(parsed, list) and any(
-                            isinstance(b, dict) and b.get("type") in ("tool_use", "tool_result")
-                            for b in parsed
-                        ):
-                            # Extract only text blocks
-                            text_parts = [b["text"] for b in parsed
-                                         if isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip()]
-                            if text_parts:
-                                m = dict(m)
-                                m["content"] = "\n".join(text_parts)
-                            else:
-                                continue  # skip pure tool-use messages
-                    except (json.JSONDecodeError, ValueError):
-                        pass
-                clean.append(m)
-            messages = clean
-        meta = _db.get_chat_meta(todo_id)
-        chat = {
-            "conversationId": meta["conversation_id"] if meta else None,
-            "messages": messages,
-        }
-    else:
-        chats = _load_chats()
-        chat = chats.get(todo_id, {"conversationId": None, "messages": []})
+    include_tool = request.args.get("include_tool", "false").lower() == "true"
+    messages = _db.get_messages(todo_id, include_tool=include_tool) if user else []
+    # Filter out structured JSON content (tool use blocks) from assistant messages for display
+    if not include_tool:
+        clean = []
+        for m in messages:
+            content = m.get("content", "")
+            if isinstance(content, str) and content.startswith(("[", "{")):
+                try:
+                    parsed = json.loads(content)
+                    if isinstance(parsed, list) and any(
+                        isinstance(b, dict) and b.get("type") in ("tool_use", "tool_result")
+                        for b in parsed
+                    ):
+                        # Extract only text blocks
+                        text_parts = [b["text"] for b in parsed
+                                     if isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip()]
+                        if text_parts:
+                            m = dict(m)
+                            m["content"] = "\n".join(text_parts)
+                        else:
+                            continue  # skip pure tool-use messages
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            clean.append(m)
+        messages = clean
+    meta = _db.get_chat_meta(todo_id)
+    chat = {
+        "conversationId": meta["conversation_id"] if meta else None,
+        "messages": messages,
+    }
     # Check for the most recent running chat job for this todo
     job_key = f"chat-{todo_id}"
     latest_job = None
@@ -127,20 +113,13 @@ def get_chat(todo_id):
 @bp.route("/api/chats/<todo_id>", methods=["DELETE"])
 def delete_chat(todo_id):
     """Restart chat — starts a new conversation, preserving old messages."""
-    if state._USE_DB:
-        _db.restart_conversation(todo_id)
-    else:
-        chats = _load_chats()
-        chats.pop(todo_id, None)
-        _save_chats(chats)
+    _db.restart_conversation(todo_id)
     return jsonify({"ok": True})
 
 
 @bp.route("/api/chats/<todo_id>/conversations")
 def get_conversations(todo_id):
     """List all conversations for a todo."""
-    if not state._USE_DB:
-        return jsonify({"conversations": []})
     current_num, convs = _db.get_conversations(todo_id)
     return jsonify({"conversations": convs, "current": current_num})
 
@@ -148,8 +127,6 @@ def get_conversations(todo_id):
 @bp.route("/api/chats/<todo_id>/conversations/<int:conv_num>")
 def get_conversation(todo_id, conv_num):
     """Get messages from a specific past conversation."""
-    if not state._USE_DB:
-        return jsonify({"messages": []})
     messages = _db.get_conversation_messages(todo_id, conv_num)
     return jsonify({"messages": messages})
 
@@ -158,21 +135,13 @@ def get_conversation(todo_id, conv_num):
 def get_unread_chats():
     """Return list of todo_ids with unread chat responses."""
     user = get_current_user()
-    if state._USE_DB and user:
+    if user:
         return jsonify(list(_db.get_unread_todo_ids(user["id"])))
-    chats = _load_chats()
-    return jsonify([tid for tid, c in chats.items() if c.get("unread")])
+    return jsonify([])
 
 
 @bp.route("/api/chats/<todo_id>/read", methods=["POST"])
 def mark_chat_read(todo_id):
     """Mark a chat as read."""
-    if state._USE_DB:
-        _db.mark_chat_read(todo_id)
-    else:
-        chats = _load_chats()
-        chat = chats.get(todo_id)
-        if chat and chat.get("unread"):
-            chat["unread"] = False
-            _save_chats(chats)
+    _db.mark_chat_read(todo_id)
     return jsonify({"ok": True})

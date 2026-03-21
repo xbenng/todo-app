@@ -1,10 +1,9 @@
-import os, json, subprocess, threading, time, uuid
+import json, subprocess, threading, time, uuid
 import state
 from services.chat_agent import ChatAgent
 from services.shell_utils import _resolve_claude_bin, _get_user_shell_env, _kill_process_tree
 from services.system_prompt import _build_system_prompt
 from services.mcp_utils import _build_cli_mcp_config
-from services.file_io import _load_chats, _save_chats, _load_config
 import db as _db
 
 
@@ -118,18 +117,6 @@ def _run_chat_local(job_id: str, message: str, cwd: str,
         if state._jobs[job_id]["status"] != "killed":
             state._jobs[job_id]["status"] = "done" if proc.returncode == 0 else "error"
 
-        # Persist assistant response to chats file and mark unread
-        if todo_id and assistant_text_lines:
-            try:
-                chats = _load_chats()
-                chat = chats.get(todo_id, {"conversationId": None, "messages": []})
-                chat["conversationId"] = state._jobs[job_id].get("conversation_id")
-                chat["messages"].append({"role": "assistant", "content": "\n".join(assistant_text_lines)})
-                chat["unread"] = True
-                chats[todo_id] = chat
-                _save_chats(chats)
-            except Exception:
-                pass
 
     except Exception as exc:
         state._jobs[job_id]["output_lines"].append(f"error: {exc}")
@@ -138,10 +125,10 @@ def _run_chat_local(job_id: str, message: str, cwd: str,
 
 def _get_active_provider(user_id: str | None = None) -> tuple[str, dict]:
     """Return (provider_name, provider_config) for the active provider."""
-    if state._USE_DB and user_id:
+    if user_id:
         config = _db.get_config(user_id)
     else:
-        config = _load_config()
+        config = {}
     active = config.get("active_provider", "")
 
     # Explicit local CLI selection
@@ -224,7 +211,7 @@ def _run_claude_job(job_id: str, prompt: str, cwd: str):
     user_id = state._jobs.get(job_id, {}).get("user_id")
     todo_id = state._jobs.get(job_id, {}).get("todo_id")
     append_prompt = ""
-    if state._USE_DB and user_id and user_id != "local":
+    if user_id and user_id != "local":
         ctx = _db.get_context_files(user_id)
         if ctx:
             append_prompt = "\n\n".join(f"# {name}\n{content.strip()}"
