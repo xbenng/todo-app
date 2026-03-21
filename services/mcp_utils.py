@@ -183,9 +183,22 @@ def _build_mcp_configs_from_registry(registry: dict, tokens: dict,
                         args.append(arg)
                 else:
                     args.append(arg)
+            # Resolve command to absolute path so it works regardless of subprocess PATH
+            command = entry["command"]
+            if not os.path.isabs(command):
+                mcp_dir = os.path.join(app_dir, "mcp-servers")
+                for candidate in [
+                    shutil.which(command),
+                    os.path.join(app_dir, command),
+                    os.path.join(mcp_dir, command),
+                    os.path.join(mcp_dir, name, "node_modules", ".bin", command),
+                ]:
+                    if candidate and os.path.isfile(candidate):
+                        command = candidate
+                        break
             server_configs[name] = {
                 "type": "stdio",
-                "command": entry["command"],
+                "command": command,
                 "args": args,
                 "env": env,
             }
@@ -276,9 +289,15 @@ def _build_cli_mcp_config(user_id: str | None) -> dict | None:
                     args.append(arg)
             command = entry["command"]
             if not os.path.isabs(command):
-                resolved = shutil.which(command)
-                if resolved:
-                    command = resolved
+                for candidate in [
+                    shutil.which(command),
+                    os.path.join(app_dir, command),
+                    os.path.join(app_dir, "mcp-servers", command),
+                    os.path.join(app_dir, "mcp-servers", name, "node_modules", ".bin", command),
+                ]:
+                    if candidate and os.path.isfile(candidate):
+                        command = candidate
+                        break
             servers[name] = {"type": "stdio", "command": command, "args": args, "env": env}
         elif server_type in ("sse", "http"):
             cfg = {"type": "http", "url": entry["url"]}
