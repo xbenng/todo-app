@@ -3551,9 +3551,12 @@ document.addEventListener('drop', async e => {
     // Lock direction on first significant move
     if (!swipeDir) swipeDir = dx > 0 ? 'right' : 'left';
 
-    // Only allow movement in the locked direction
+    // If user drags back past origin, cancel the swipe
+    if ((swipeDir === 'right' && dx < 0) || (swipeDir === 'left' && dx > 0)) {
+      reset();
+      return;
+    }
     var absDx = Math.abs(dx);
-    if ((swipeDir === 'right' && dx < 0) || (swipeDir === 'left' && dx > 0)) absDx = 0;
 
     // Toggle swipe-left class for CSS styling (shows delete reveal)
     if (swipeDir === 'left') {
