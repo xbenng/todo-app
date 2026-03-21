@@ -117,6 +117,13 @@ def _run_chat_local(job_id: str, message: str, cwd: str,
         if state._jobs[job_id]["status"] != "killed":
             state._jobs[job_id]["status"] = "done" if proc.returncode == 0 else "error"
 
+        # Persist assistant response to DB
+        if todo_id and assistant_text_lines:
+            try:
+                _db.add_message(todo_id, user_id, "assistant", "\n".join(assistant_text_lines))
+                _db.mark_chat_unread(todo_id, user_id)
+            except Exception:
+                pass
 
     except Exception as exc:
         state._jobs[job_id]["output_lines"].append(f"error: {exc}")
