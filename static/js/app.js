@@ -736,8 +736,8 @@ async function changePriority(id, priority) {
   loadTodos();
 }
 
-async function deleteTodo(id, skipConfirm) {
-  if (!skipConfirm && !confirm('Delete this todo?')) return;
+async function deleteTodo(id) {
+  if (!confirm('Delete this todo?')) return;
   await fetch(API + '/' + id, {method: 'DELETE', headers: {'Content-Type': 'application/json'}});
   loadTodos();
 }
@@ -3595,28 +3595,52 @@ document.addEventListener('drop', async e => {
     var pastThreshold = absDx >= threshold || (velocity > VELOCITY_THRESHOLD && absDx > 30);
 
     if (pastThreshold && swipeDir) {
-      // Animate off-screen
-      item.classList.remove('swiping');
-      item.classList.add('snap-complete');
-      var sign = swipeDir === 'left' ? -1 : 1;
-      content.style.transform = 'translateX(' + (itemW * sign) + 'px)';
-
-      var capturedId = todoId;
-      var capturedCompleted = isCompleted;
-      var capturedDir = swipeDir;
-      var fired = false;
-
-      var done = function() {
-        if (fired) return;
-        fired = true;
-        if (capturedDir === 'left') {
-          deleteTodo(capturedId, true);
-        } else {
-          toggleComplete(capturedId, !capturedCompleted);
+      // For delete: confirm before animating
+      if (swipeDir === 'left') {
+        var capturedId = todoId;
+        if (!confirm('Delete this todo?')) {
+          // Cancelled — snap back
+          item.classList.remove('swiping', 'swipe-threshold', 'swipe-left');
+          item.classList.add('snap-back');
+          content.style.transform = '';
+          var snapItem = item;
+          setTimeout(function() {
+            snapItem.classList.remove('snap-back', 'swipe-active', 'swipe-left', 'snap-complete');
+            snapItem.querySelector('.swipe-content').style.transform = '';
+          }, 300);
+          item = null; content = null; locked = null; swipeDir = null;
+          return;
         }
-      };
-      content.addEventListener('transitionend', done, { once: true });
-      setTimeout(done, 350);
+        // Confirmed — animate off and delete
+        item.classList.remove('swiping');
+        item.classList.add('snap-complete');
+        content.style.transform = 'translateX(' + (-itemW) + 'px)';
+        var fired = false;
+        var done = function() {
+          if (fired) return;
+          fired = true;
+          fetch(API + '/' + capturedId, {method: 'DELETE', headers: {'Content-Type': 'application/json'}}).then(function() { loadTodos(); });
+        };
+        content.addEventListener('transitionend', done, { once: true });
+        setTimeout(done, 350);
+      } else {
+        // Right swipe: animate off-screen, then toggle complete
+        item.classList.remove('swiping');
+        item.classList.add('snap-complete');
+        content.style.transform = 'translateX(' + itemW + 'px)';
+
+        var capturedId = todoId;
+        var capturedCompleted = isCompleted;
+        var fired = false;
+
+        var done = function() {
+          if (fired) return;
+          fired = true;
+          toggleComplete(capturedId, !capturedCompleted);
+        };
+        content.addEventListener('transitionend', done, { once: true });
+        setTimeout(done, 350);
+      }
     } else {
       // Snap back — animate then fully reset
       item.classList.remove('swiping', 'swipe-threshold', 'swipe-left');
