@@ -271,7 +271,9 @@ def _execute_spawn_agents(agents: list[dict], agent_context: dict, todo_id: str 
     provider = agent_context["provider"]
     depth = agent_context.get("depth", 0)
 
-    state._jobs[job_id]["output_lines"].append(f"\u26a1 Launching {len(agents)} subagent(s)...")
+    state._jobs[job_id]["output_lines"].append({
+        "__status__": "spawning", "count": len(agents),
+    })
 
     results = []
     user_id = state._jobs[job_id].get("user_id")
@@ -305,9 +307,12 @@ def _execute_spawn_agents(agents: list[dict], agent_context: dict, todo_id: str 
 
     total_in = sum(r.get("input_tokens", 0) for r in results)
     total_out = sum(r.get("output_tokens", 0) for r in results)
-    state._jobs[job_id]["output_lines"].append(
-        f"\u2713 All {len(results)} subagent(s) complete (tokens: {total_in}+{total_out})"
-    )
+    state._jobs[job_id]["output_lines"].append({
+        "__status__": "spawn_complete",
+        "count": len(results),
+        "input_tokens": total_in,
+        "output_tokens": total_out,
+    })
     return json.dumps({"agents": results}, ensure_ascii=False)
 
 

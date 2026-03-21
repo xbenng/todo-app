@@ -2186,6 +2186,7 @@ function _streamChatResponse(todoId, jobId) {
       return;
     }
 
+    // --- Structured event handling (no string matching) ---
     if (typeof raw === 'object' && raw.__tool_call__) {
       const streamEl = document.getElementById('chat-assistant-streaming');
       if (streamEl) {
@@ -2202,31 +2203,57 @@ function _streamChatResponse(todoId, jobId) {
       return;
     }
 
+    if (typeof raw === 'object' && raw.__error__) {
+      const streamEl = document.getElementById('chat-assistant-streaming');
+      if (streamEl) {
+        const div = document.createElement('div');
+        div.style.cssText = 'color:#ef4444;font-size:0.8rem;padding:6px 10px;background:rgba(239,68,68,0.08);border-radius:6px;border-left:3px solid #ef4444;margin:4px 0;white-space:pre-wrap;word-break:break-word';
+        div.textContent = raw.message;
+        streamEl.appendChild(div);
+        textDiv = null;
+        currentBlockText = '';
+      }
+      return;
+    }
+
+    if (typeof raw === 'object' && raw.__status__) {
+      const streamEl = document.getElementById('chat-assistant-streaming');
+      if (streamEl) {
+        const div = document.createElement('div');
+        if (raw.__status__ === 'done') {
+          div.className = 'chat-cost-line';
+          div.textContent = raw.cost != null
+            ? `\u2713 Done \u2014 $${raw.cost.toFixed(4)}`
+            : `\u2713 Done (tokens: ${raw.input_tokens || 0}+${raw.output_tokens || 0})`;
+        } else if (raw.__status__ === 'spawning') {
+          div.textContent = `\u26a1 Launching ${raw.count} subagent(s)...`;
+        } else if (raw.__status__ === 'spawn_complete') {
+          div.className = 'chat-cost-line';
+          div.textContent = `\u2713 All ${raw.count} subagent(s) complete (tokens: ${raw.input_tokens || 0}+${raw.output_tokens || 0})`;
+        } else if (raw.__status__ === 'compacting') {
+          div.textContent = '\u27f3 Compacting conversation history...';
+        } else {
+          div.textContent = raw.__status__;
+        }
+        streamEl.appendChild(div);
+        textDiv = null;
+        currentBlockText = '';
+      }
+      return;
+    }
+
+    // --- Plain text lines (from CLI provider or streamed text) ---
     if (typeof raw !== 'string') return;
     const line = raw;
     const cur = _chatSessions[todoId];
 
-    // Look up the streaming element fresh each time (survives minimize/reopen)
     const streamEl = document.getElementById('chat-assistant-streaming');
 
     if (streamEl) {
-      if (line.startsWith('error:') || line.startsWith('error ')) {
-        const div = document.createElement('div');
-        div.style.cssText = 'color:#ef4444;font-size:0.8rem;padding:6px 10px;background:rgba(239,68,68,0.08);border-radius:6px;border-left:3px solid #ef4444;margin:4px 0;white-space:pre-wrap;word-break:break-word';
-        div.textContent = line;
-        streamEl.appendChild(div);
-        textDiv = null;
-        currentBlockText = '';
-      } else if (line.startsWith('\u25b6 ')) {
+      // Legacy string-based tool/status lines (from CLI provider)
+      if (line.startsWith('\u25b6 ')) {
         const div = document.createElement('div');
         div.className = 'chat-tool-line';
-        div.textContent = line;
-        streamEl.appendChild(div);
-        textDiv = null;
-        currentBlockText = ''; // reset for next text block
-      } else if (line.startsWith('\u2713 Done')) {
-        const div = document.createElement('div');
-        div.className = 'chat-cost-line';
         div.textContent = line;
         streamEl.appendChild(div);
         textDiv = null;
@@ -2242,8 +2269,8 @@ function _streamChatResponse(todoId, jobId) {
         textDiv.innerHTML = renderMd(currentBlockText);
       }
     } else {
-      // Panel is minimized — just accumulate text
-      if (!line.startsWith('\u25b6 ') && !line.startsWith('\u2713 Done')) {
+      // Panel is minimized — just accumulate text (strings only)
+      if (typeof raw === 'string') {
         cur.streamingText += (cur.streamingText ? '\n' : '') + line;
       }
     }
@@ -2613,47 +2640,65 @@ function _openItemStream(todoId, jobId) {
       pollJobs();
       return;
     }
-    // Handle structured tool call objects
-    if (typeof raw === 'object' && raw.__tool_call__) {
-      const toolLine = raw.subagent
-        ? `[${raw.subagent}] \u25b6 ${raw.name}...`
-        : `\u25b6 ${raw.name}...`;
-      parsedCount++;
-      const outEl = document.getElementById('checkon-bubble-' + todoId);
-      if (outEl) {
-        outEl.classList.add('has-content');
-        const div = document.createElement('div');
-        div.textContent = toolLine;
-        outEl.appendChild(div);
-        outEl.scrollTop = outEl.scrollHeight;
+    // --- Structured event handling ---
+    if (typeof raw === 'object') {
+      if (raw.__tool_call__ || raw.__status__ || raw.__error__) {
+        parsedCount++;
+        let text = '';
+        let isStatus = false;
+        if (raw.__tool_call__) {
+          text = raw.subagent ? `[${raw.subagent}] \u25b6 ${raw.name}...` : `\u25b6 ${raw.name}...`;
+        } else if (raw.__error__) {
+          text = raw.message;
+        } else if (raw.__status__ === 'done') {
+          text = raw.cost != null ? `\u2713 Done \u2014 $${raw.cost.toFixed(4)}` : `\u2713 Done (tokens: ${raw.input_tokens || 0}+${raw.output_tokens || 0})`;
+          isStatus = true;
+        } else if (raw.__status__ === 'spawning') {
+          text = `\u26a1 Launching ${raw.count} subagent(s)...`;
+          isStatus = true;
+        } else if (raw.__status__ === 'spawn_complete') {
+          text = `\u2713 All ${raw.count} subagent(s) complete (tokens: ${raw.input_tokens || 0}+${raw.output_tokens || 0})`;
+          isStatus = true;
+        } else if (raw.__status__ === 'compacting') {
+          text = '\u27f3 Compacting conversation history...';
+          isStatus = true;
+        }
+        const outEl = document.getElementById('checkon-bubble-' + todoId);
+        if (outEl && text) {
+          outEl.classList.add('has-content');
+          const div = document.createElement('div');
+          if (isStatus) div.style.color = 'var(--accent)';
+          div.textContent = text;
+          outEl.appendChild(div);
+          outEl.scrollTop = outEl.scrollHeight;
+        }
+        return;
       }
-      return;
+      return; // unknown structured object
     }
+    // --- Plain text lines ---
     const line = parseStreamLine(raw);
     if (!line) return;
     if (parsedCount < existingCount) { parsedCount++; return; }
     console.log(`[job:${jobId}]`, line);
     _clientJobLines[todoId].push(line);
     parsedCount++;
-    // Bubble: all lines (live feedback while running)
+    // Bubble: all lines
     const outEl = document.getElementById('checkon-bubble-' + todoId);
     if (outEl) {
       outEl.classList.add('has-content');
       const div = document.createElement('div');
-      if (line.startsWith('✓')) div.style.color = 'var(--accent)';
       div.textContent = line;
       outEl.appendChild(div);
       outEl.scrollTop = outEl.scrollHeight;
     }
-    // Summary: only message lines (no tool calls or status)
-    if (!line.startsWith('▶') && !line.startsWith('✓') && !line.startsWith('⚡')) {
-      _clientJobSummary[todoId].push('⏺ ' + line);
-      const sumEl = document.getElementById('checkon-summary-' + todoId);
-      if (sumEl) {
-        sumEl.classList.add('has-content');
-        const bodyEl = sumEl.querySelector('.checkon-body');
-        if (bodyEl) bodyEl.textContent = _clientJobSummary[todoId].join('\n');
-      }
+    // Summary: only text lines (structured events already filtered above)
+    _clientJobSummary[todoId].push('\u23fa ' + line);
+    const sumEl = document.getElementById('checkon-summary-' + todoId);
+    if (sumEl) {
+      sumEl.classList.add('has-content');
+      const bodyEl = sumEl.querySelector('.checkon-body');
+      if (bodyEl) bodyEl.textContent = _clientJobSummary[todoId].join('\n');
     }
   };
   src.onerror = () => { src.close(); delete _itemStreamSources[todoId]; };

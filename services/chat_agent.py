@@ -373,7 +373,7 @@ class ChatAgent:
             return messages
         old_messages = messages[:-keep_recent]
         recent_messages = messages[-keep_recent:]
-        self.emit("\u27f3 Compacting conversation history...")
+        self.job["output_lines"].append({"__status__": "compacting"})
         summary = self._summarize_messages(old_messages)
         if not summary:
             return messages
@@ -509,12 +509,15 @@ class ChatAgent:
             self._run_loop(message)
             if self.is_killed():
                 return
-            ptype = self.provider.get("type", "local")
-            if ptype == "anthropic":
+            cost = None
+            if self.provider.get("type") == "anthropic":
                 cost = (self.total_input_tokens * 3.0 + self.total_output_tokens * 15.0) / 1_000_000
-                self.emit(f"\u2713 Done \u2014 ${cost:.4f}" if cost > 0 else "\u2713 Done")
-            else:
-                self.emit(f"\u2713 Done (tokens: {self.total_input_tokens}+{self.total_output_tokens})")
+            self.job["output_lines"].append({
+                "__status__": "done",
+                "input_tokens": self.total_input_tokens,
+                "output_tokens": self.total_output_tokens,
+                "cost": cost,
+            })
             self.job["status"] = "done"
             if self.persist:
                 self._persist_response()
@@ -523,13 +526,18 @@ class ChatAgent:
             if not self.is_killed():
                 exc_str = str(exc)
                 if "max_tokens" in exc_str or "context_length" in exc_str or "too long" in exc_str.lower():
-                    self.emit(f"error: Context length exceeded ({self.total_input_tokens} input tokens). Try Restart.")
+                    code, msg = "context_length", f"Context length exceeded ({self.total_input_tokens} input tokens). Try Restart."
                 elif "401" in exc_str or "auth" in exc_str.lower() or "api_key" in exc_str.lower():
-                    self.emit(f"error: Authentication failed. Check API key. Raw: {exc_str[:200]}")
+                    code, msg = "auth", f"Authentication failed. Check API key. Raw: {exc_str[:200]}"
                 elif "429" in exc_str or "rate" in exc_str.lower():
-                    self.emit(f"error: Rate limited. Wait and retry. Raw: {exc_str[:200]}")
+                    code, msg = "rate_limit", f"Rate limited. Wait and retry. Raw: {exc_str[:200]}"
                 elif "connection" in exc_str.lower() or "timeout" in exc_str.lower():
-                    self.emit(f"error: Connection failed. Raw: {exc_str[:200]}")
+                    code, msg = "connection", f"Connection failed. Raw: {exc_str[:200]}"
                 else:
-                    self.emit(f"error: {exc_str[:300]}")
+                    code, msg = "unknown", exc_str[:300]
+                self.job["output_lines"].append({
+                    "__error__": True,
+                    "code": code,
+                    "message": msg,
+                })
                 self.job["status"] = "error"
