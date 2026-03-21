@@ -1,7 +1,7 @@
 """Authentication routes: register, login, logout, me."""
 
 from flask import Blueprint, request, jsonify
-from state import _USE_DB
+import state
 import db as _db
 
 bp = Blueprint('auth', __name__)
@@ -9,7 +9,7 @@ bp = Blueprint('auth', __name__)
 
 def get_current_user():
     """Extract user from session cookie or Authorization header."""
-    if not _USE_DB:
+    if not state._USE_DB:
         return {"id": "local", "email": "local", "name": "Local User"}
     token = request.cookies.get("session_token")
     if not token:
@@ -28,7 +28,7 @@ def require_user():
 
 @bp.route("/api/auth/register", methods=["POST"])
 def auth_register():
-    if not _USE_DB:
+    if not state._USE_DB:
         return jsonify({"error": "Auth not available in file mode"}), 400
     data = request.json or {}
     email = (data.get("email") or "").strip()
@@ -53,7 +53,7 @@ def auth_register():
 
 @bp.route("/api/auth/login", methods=["POST"])
 def auth_login():
-    if not _USE_DB:
+    if not state._USE_DB:
         return jsonify({"error": "Auth not available in file mode"}), 400
     data = request.json or {}
     email = (data.get("email") or "").strip()
@@ -71,7 +71,7 @@ def auth_login():
 @bp.route("/api/auth/logout", methods=["POST"])
 def auth_logout():
     token = request.cookies.get("session_token")
-    if token and _USE_DB:
+    if token and state._USE_DB:
         _db.delete_session(token)
     resp = jsonify({"ok": True})
     resp.delete_cookie("session_token")

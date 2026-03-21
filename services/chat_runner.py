@@ -1,5 +1,5 @@
 import os, json, subprocess, threading, time, uuid
-from state import _jobs, _USE_DB, TODO_FILE
+import state
 from services.chat_agent import ChatAgent
 from services.shell_utils import _resolve_claude_bin, _get_user_shell_env, _kill_process_tree
 from services.system_prompt import _build_system_prompt
@@ -14,12 +14,12 @@ def _run_chat_local(job_id: str, message: str, cwd: str,
     """Thread target: run claude -p for chat with optional --resume (local CLI fallback)."""
     claude_bin, env = _resolve_claude_bin()
     if not claude_bin:
-        _jobs[job_id]["output_lines"].append("error: claude binary not found")
-        _jobs[job_id]["status"] = "error"
+        state._jobs[job_id]["output_lines"].append("error: claude binary not found")
+        state._jobs[job_id]["status"] = "error"
         return
 
     # Build system prompt and MCP config from DB
-    user_id = _jobs.get(job_id, {}).get("user_id")
+    user_id = state._jobs.get(job_id, {}).get("user_id")
     system_prompt = _build_system_prompt(todo_id, user_id)
     cmd = [claude_bin, "-p", message, "--dangerously-skip-permissions",
            "--output-format", "stream-json", "--verbose"]
@@ -31,13 +31,13 @@ def _run_chat_local(job_id: str, message: str, cwd: str,
         cmd.extend(["--mcp-config", json.dumps(mcp_config)])
     if conversation_id:
         cmd.extend(["--resume", conversation_id])
-    _jobs[job_id]["status"] = "running"
+    state._jobs[job_id]["status"] = "running"
 
     assistant_text_lines = []  # collect plain text lines for persistence
 
     def emit(line: str, is_text: bool = False) -> None:
         if line.strip():
-            _jobs[job_id]["output_lines"].append(line)
+            state._jobs[job_id]["output_lines"].append(line)
             if is_text:
                 assistant_text_lines.append(line)
 
@@ -45,7 +45,7 @@ def _run_chat_local(job_id: str, message: str, cwd: str,
         proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, env=env,
                                 start_new_session=True)
-        _jobs[job_id]["proc"] = proc
+        state._jobs[job_id]["proc"] = proc
 
         text_buf = ""
         got_streaming = False
@@ -105,7 +105,7 @@ def _run_chat_local(job_id: str, message: str, cwd: str,
             elif t == "result":
                 session_id = data.get("session_id")
                 if session_id:
-                    _jobs[job_id]["conversation_id"] = session_id
+                    state._jobs[job_id]["conversation_id"] = session_id
                 result = data.get("result", "").strip()
                 cost = data.get("cost_usd")
                 cost_str = f" — ${cost:.4f}" if cost else ""
@@ -115,15 +115,15 @@ def _run_chat_local(job_id: str, message: str, cwd: str,
             emit(text_buf.strip(), is_text=True)
 
         proc.wait()
-        if _jobs[job_id]["status"] != "killed":
-            _jobs[job_id]["status"] = "done" if proc.returncode == 0 else "error"
+        if state._jobs[job_id]["status"] != "killed":
+            state._jobs[job_id]["status"] = "done" if proc.returncode == 0 else "error"
 
         # Persist assistant response to chats file and mark unread
         if todo_id and assistant_text_lines:
             try:
                 chats = _load_chats()
                 chat = chats.get(todo_id, {"conversationId": None, "messages": []})
-                chat["conversationId"] = _jobs[job_id].get("conversation_id")
+                chat["conversationId"] = state._jobs[job_id].get("conversation_id")
                 chat["messages"].append({"role": "assistant", "content": "\n".join(assistant_text_lines)})
                 chat["unread"] = True
                 chats[todo_id] = chat
@@ -132,13 +132,13 @@ def _run_chat_local(job_id: str, message: str, cwd: str,
                 pass
 
     except Exception as exc:
-        _jobs[job_id]["output_lines"].append(f"error: {exc}")
-        _jobs[job_id]["status"] = "error"
+        state._jobs[job_id]["output_lines"].append(f"error: {exc}")
+        state._jobs[job_id]["status"] = "error"
 
 
 def _get_active_provider(user_id: str | None = None) -> tuple[str, dict]:
     """Return (provider_name, provider_config) for the active provider."""
-    if _USE_DB and user_id:
+    if state._USE_DB and user_id:
         config = _db.get_config(user_id)
     else:
         config = _load_config()
@@ -175,7 +175,7 @@ def _run_claude_chat_job(job_id: str, message: str, cwd: str,
                          conversation_id: str | None = None,
                          todo_id: str | None = None):
     """Dispatcher: route to the active provider. Only uses local CLI if explicitly selected."""
-    user_id = _jobs.get(job_id, {}).get("user_id")
+    user_id = state._jobs.get(job_id, {}).get("user_id")
     name, provider = _get_active_provider(user_id)
     ptype = provider.get("type", "")
     if ptype in ("anthropic", "openai_compat"):
@@ -184,8 +184,8 @@ def _run_claude_chat_job(job_id: str, message: str, cwd: str,
     elif ptype == "local":
         _run_chat_local(job_id, message, cwd, conversation_id, todo_id)
     else:
-        _jobs[job_id]["output_lines"].append("error: No provider configured. Go to Settings to set up a provider.")
-        _jobs[job_id]["status"] = "error"
+        state._jobs[job_id]["output_lines"].append("error: No provider configured. Go to Settings to set up a provider.")
+        state._jobs[job_id]["status"] = "error"
 
 
 def _start_claude_chat_job(label: str, job_key: str, message: str, cwd: str,
@@ -194,7 +194,7 @@ def _start_claude_chat_job(label: str, job_key: str, message: str, cwd: str,
                            user_id: str | None = None) -> str:
     """Start a headless Claude chat job; return job_id. No dedup — each message is a new job."""
     job_id = str(uuid.uuid4())[:8]
-    _jobs[job_id] = {
+    state._jobs[job_id] = {
         "id": job_id,
         "label": label,
         "job_key": job_key,
@@ -216,15 +216,15 @@ def _run_claude_job(job_id: str, prompt: str, cwd: str):
     """Thread target: run claude -p as a subprocess and parse stream-json output."""
     claude_bin, env = _resolve_claude_bin()
     if not claude_bin:
-        _jobs[job_id]["output_lines"].append("error: claude binary not found")
-        _jobs[job_id]["status"] = "error"
+        state._jobs[job_id]["output_lines"].append("error: claude binary not found")
+        state._jobs[job_id]["status"] = "error"
         return
 
     # Append DB context files to the CLI's system prompt
-    user_id = _jobs.get(job_id, {}).get("user_id")
-    todo_id = _jobs.get(job_id, {}).get("todo_id")
+    user_id = state._jobs.get(job_id, {}).get("user_id")
+    todo_id = state._jobs.get(job_id, {}).get("todo_id")
     append_prompt = ""
-    if _USE_DB and user_id and user_id != "local":
+    if state._USE_DB and user_id and user_id != "local":
         ctx = _db.get_context_files(user_id)
         if ctx:
             append_prompt = "\n\n".join(f"# {name}\n{content.strip()}"
@@ -235,17 +235,17 @@ def _run_claude_job(job_id: str, prompt: str, cwd: str):
            "--effort", "low", "--include-partial-messages"]
     if append_prompt:
         cmd.extend(["--system-prompt", append_prompt])
-    _jobs[job_id]["status"] = "running"
+    state._jobs[job_id]["status"] = "running"
 
     def emit(line: str) -> None:
         if line.strip():
-            _jobs[job_id]["output_lines"].append(line)
+            state._jobs[job_id]["output_lines"].append(line)
 
     try:
         proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, env=env,
                                 start_new_session=True)
-        _jobs[job_id]["proc"] = proc
+        state._jobs[job_id]["proc"] = proc
 
         text_buf = ""       # accumulates text_delta fragments until a newline or block end
         got_streaming = False  # True if we receive content_block_delta events
@@ -315,20 +315,20 @@ def _run_claude_job(job_id: str, prompt: str, cwd: str):
             emit(text_buf.strip())
 
         proc.wait()
-        if _jobs[job_id]["status"] != "killed":
-            _jobs[job_id]["status"] = "done" if proc.returncode == 0 else "error"
+        if state._jobs[job_id]["status"] != "killed":
+            state._jobs[job_id]["status"] = "done" if proc.returncode == 0 else "error"
     except Exception as exc:
-        _jobs[job_id]["output_lines"].append(f"error: {exc}")
-        _jobs[job_id]["status"] = "error"
+        state._jobs[job_id]["output_lines"].append(f"error: {exc}")
+        state._jobs[job_id]["status"] = "error"
 
 
 def _start_claude_job(label: str, job_key: str, prompt: str, cwd: str) -> str:
     """Start a headless Claude job; return job_id. Deduplicates by job_key."""
-    for j in _jobs.values():
+    for j in state._jobs.values():
         if j["job_key"] == job_key and j["status"] == "running":
             return j["id"]
     job_id = str(uuid.uuid4())[:8]
-    _jobs[job_id] = {
+    state._jobs[job_id] = {
         "id": job_id,
         "label": label,
         "job_key": job_key,

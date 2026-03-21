@@ -3,7 +3,7 @@ import os, json, subprocess, threading, time, uuid, pty, fcntl, termios, struct
 import select as _select
 from flask import Blueprint, request, jsonify
 from routes.auth import get_current_user
-from state import _pty_sessions, _jobs, _USE_DB, TODO_FILE
+import state
 from services.terminal import _terminal_io_loop, _pty_set_winsize, _tmux_bin, _tmux_session_exists, _tmux_list_sessions
 from services.shell_utils import _kill_process_tree, _resolve_claude_bin
 import db as _db
@@ -22,11 +22,11 @@ def open_terminal(todo_id):
 
     # Return existing alive session for this todo (unless resuming a specific conv)
     if not resume_id:
-        for s in _pty_sessions.values():
+        for s in state._pty_sessions.values():
             if s["todo_id"] == todo_id and s["alive"]:
                 return jsonify({"session_id": s["id"], "title": s["title"], "existing": True})
 
-    todos = _parse_todo_file(TODO_FILE)
+    todos = _parse_todo_file(state.TODO_FILE)
     todo = next((t for t in todos if t["id"] == todo_id), None)
     if not todo:
         return jsonify({"error": "Todo not found"}), 404
@@ -37,7 +37,7 @@ def open_terminal(todo_id):
 
     session_id = str(uuid.uuid4())[:8]
     tmux_name = f"t-{session_id}"
-    todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
+    todo_dir = os.path.dirname(os.path.abspath(state.TODO_FILE)) or os.getcwd()
 
     # Create a dedicated tmux session (one window, no switching possible)
     tmux = _tmux_bin()
@@ -57,7 +57,7 @@ def open_terminal(todo_id):
     subprocess.run([tmux, "set-option", "-g", "window-size", "latest"],
                    capture_output=True)
 
-    _pty_sessions[session_id] = {
+    state._pty_sessions[session_id] = {
         "id": session_id,
         "todo_id": todo_id,
         "title": todo.get("title", todo_id),
@@ -72,7 +72,7 @@ def open_terminal(todo_id):
     if not resume_id:
         def _auto_send():
             time.sleep(1.5)
-            if _pty_sessions.get(session_id, {}).get("alive"):
+            if state._pty_sessions.get(session_id, {}).get("alive"):
                 subprocess.run(
                     [tmux, "send-keys", "-t", tmux_name, f"/ea workon {todo_id}", "Enter"],
                     capture_output=True,
@@ -87,25 +87,25 @@ def list_terminal_sessions():
     """List terminal sessions, syncing alive state with tmux."""
     live_sessions = set(_tmux_list_sessions())
     # Sync alive state with tmux reality
-    for s in _pty_sessions.values():
+    for s in state._pty_sessions.values():
         s["alive"] = f"t-{s['id']}" in live_sessions
     # Purge dead sessions older than 5 min
     cutoff = time.time() - 300
-    stale = [sid for sid, s in _pty_sessions.items()
+    stale = [sid for sid, s in state._pty_sessions.items()
              if not s["alive"] and s["created_at"] < cutoff]
     for sid in stale:
-        del _pty_sessions[sid]
+        del state._pty_sessions[sid]
     return jsonify([{
         "session_id": s["id"], "todo_id": s["todo_id"],
         "title": s["title"], "alive": s["alive"],
         "created_at": s["created_at"],
-    } for s in _pty_sessions.values()])
+    } for s in state._pty_sessions.values()])
 
 
 @bp.route("/api/terminal/<session_id>/kill", methods=["POST"])
 def kill_terminal(session_id):
     """Kill a terminal session by destroying its tmux session."""
-    session = _pty_sessions.get(session_id)
+    session = state._pty_sessions.get(session_id)
     if not session:
         return jsonify({"error": "not found"}), 404
     session["alive"] = False
@@ -118,7 +118,7 @@ def register_websocket(sock):
     @sock.route("/api/terminal/<session_id>/ws")
     def terminal_ws(ws, session_id):
         """WebSocket handler: attach to tmux window via PTY, bridge to browser."""
-        session = _pty_sessions.get(session_id)
+        session = state._pty_sessions.get(session_id)
         if not session:
             ws.close()
             return

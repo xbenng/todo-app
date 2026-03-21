@@ -3,7 +3,7 @@ import os, subprocess
 from datetime import datetime
 from flask import Blueprint, request, jsonify
 from routes.auth import get_current_user
-from state import _USE_DB, TODO_FILE
+import state
 from services.file_io import _completed_file_path
 import db as _db
 
@@ -12,7 +12,7 @@ bp = Blueprint('history', __name__)
 
 def _todo_git_dir() -> str | None:
     """Return the git repo directory containing the todo file, or None."""
-    todo_path = os.path.realpath(TODO_FILE)
+    todo_path = os.path.realpath(state.TODO_FILE)
     try:
         result = subprocess.run(
             ["git", "-C", os.path.dirname(todo_path), "rev-parse", "--show-toplevel"],
@@ -29,7 +29,7 @@ def _todo_git_dir() -> str | None:
 def get_history():
     """Return recent version history for the current user."""
     user = get_current_user()
-    if not _USE_DB or not user:
+    if not state._USE_DB or not user:
         return jsonify({"entries": []})
     entries = _db.get_history(user["id"])
     return jsonify({"entries": entries})
@@ -39,7 +39,7 @@ def get_history():
 def get_todo_history(todo_id):
     """Return version history for a specific todo item."""
     user = get_current_user()
-    if not _USE_DB or not user:
+    if not state._USE_DB or not user:
         return jsonify({"entries": []})
     entries = _db.get_todo_history(user["id"], todo_id)
     return jsonify({"entries": entries})
@@ -49,7 +49,7 @@ def get_todo_history(todo_id):
 def restore_history(history_id):
     """Restore a todo from a history snapshot."""
     user = get_current_user()
-    if not _USE_DB or not user:
+    if not state._USE_DB or not user:
         return jsonify({"error": "Not available"}), 400
     result = _db.restore_todo(user["id"], history_id)
     if not result:
@@ -63,8 +63,8 @@ def git_log():
     git_dir = _todo_git_dir()
     if not git_dir:
         return jsonify({"error": "No git repo found for todo file"}), 404
-    todo_real = os.path.realpath(TODO_FILE)
-    completed_real = os.path.realpath(_completed_file_path(TODO_FILE))
+    todo_real = os.path.realpath(state.TODO_FILE)
+    completed_real = os.path.realpath(_completed_file_path(state.TODO_FILE))
     # Get paths relative to git root
     todo_rel = os.path.relpath(todo_real, git_dir)
     completed_rel = os.path.relpath(completed_real, git_dir)
@@ -92,8 +92,8 @@ def git_commit():
         return jsonify({"error": "No git repo found"}), 404
     data = request.json or {}
     message = data.get("message", "").strip() or f"Manual save {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-    todo_real = os.path.realpath(TODO_FILE)
-    completed_real = os.path.realpath(_completed_file_path(TODO_FILE))
+    todo_real = os.path.realpath(state.TODO_FILE)
+    completed_real = os.path.realpath(_completed_file_path(state.TODO_FILE))
     todo_rel = os.path.relpath(todo_real, git_dir)
     completed_rel = os.path.relpath(completed_real, git_dir)
     try:
@@ -123,8 +123,8 @@ def git_rollback():
     commit_hash = data.get("hash", "").strip()
     if not commit_hash:
         return jsonify({"error": "hash is required"}), 400
-    todo_real = os.path.realpath(TODO_FILE)
-    completed_real = os.path.realpath(_completed_file_path(TODO_FILE))
+    todo_real = os.path.realpath(state.TODO_FILE)
+    completed_real = os.path.realpath(_completed_file_path(state.TODO_FILE))
     todo_rel = os.path.relpath(todo_real, git_dir)
     completed_rel = os.path.relpath(completed_real, git_dir)
     try:

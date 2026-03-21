@@ -6,7 +6,7 @@ Assembles the system prompt from config, context files, and runtime state.
 import os
 from datetime import datetime
 
-from state import _USE_DB, TODO_FILE
+import state
 from services.mcp_utils import _get_mcp_tools
 import db as _db
 
@@ -36,7 +36,7 @@ def _build_system_prompt(todo_id: str | None, user_id: str | None = None) -> str
     """Build a system prompt from per-user DB config or file-based fallback."""
     parts = []
 
-    if _USE_DB and user_id:
+    if state._USE_DB and user_id:
         config = _db.get_config(user_id)
         # 1. Base system prompt from DB
         sp = config.get("system_prompt")

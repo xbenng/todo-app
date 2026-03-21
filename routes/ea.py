@@ -2,7 +2,7 @@
 import os, json, shutil, subprocess
 from flask import Blueprint, request, jsonify
 from routes.auth import get_current_user
-from state import _USE_DB, _jobs, TODO_FILE
+import state
 from services.chat_runner import _start_claude_chat_job
 import db as _db
 
@@ -17,12 +17,12 @@ def ea_update():
     force = data.get("force", False)
 
     # Check for existing running job
-    existing = next((j for j in _jobs.values()
+    existing = next((j for j in state._jobs.values()
                      if j["job_key"] == "ea-update" and j["status"] == "running"), None)
     if existing and not force:
         return jsonify({"status": "already_running", "job_id": existing["id"]})
 
-    todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
+    todo_dir = os.path.dirname(os.path.abspath(state.TODO_FILE)) or os.getcwd()
     job_id = _start_claude_chat_job("EA Update", "ea-update", "/ea update", todo_dir,
                                      user_id=user["id"] if user else None)
     return jsonify({"status": "started", "job_id": job_id})
@@ -39,12 +39,12 @@ def ea_update_item():
         return jsonify({"error": "id required"}), 400
 
     job_key = f"ea-{item_id}"
-    existing = next((j for j in _jobs.values()
+    existing = next((j for j in state._jobs.values()
                      if j["job_key"] == job_key and j["status"] == "running"), None)
     if existing and not force:
         return jsonify({"status": "already_running", "job_id": existing["id"]})
 
-    todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
+    todo_dir = os.path.dirname(os.path.abspath(state.TODO_FILE)) or os.getcwd()
     message = data.get("message") or f"/ea checkon {item_id}"
     label = "Consolidate" if "consolidate" in message else f"Check: {item_id}"
     job_id = _start_claude_chat_job(label, job_key, message, todo_dir,
@@ -80,7 +80,7 @@ def resume_conv():
             check=True,
             capture_output=True,
         )
-        todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
+        todo_dir = os.path.dirname(os.path.abspath(state.TODO_FILE)) or os.getcwd()
         subprocess.run(
             [
                 tmux_bin, "send-keys",

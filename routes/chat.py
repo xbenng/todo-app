@@ -2,7 +2,7 @@
 import os, json
 from flask import Blueprint, request, jsonify
 from routes.auth import get_current_user
-from state import _USE_DB, _jobs, TODO_FILE
+import state
 from services.chat_runner import _start_claude_chat_job, _start_claude_job
 from services.file_io import _parse_todo_file, _load_chats, _save_chats
 import db as _db
@@ -13,12 +13,12 @@ bp = Blueprint('chat', __name__)
 @bp.route("/api/todos/<todo_id>/start", methods=["POST"])
 def start_in_tmux(todo_id):
     """Launch a headless Claude Code session working on the given todo."""
-    todos = _parse_todo_file(TODO_FILE)
+    todos = _parse_todo_file(state.TODO_FILE)
     todo = next((t for t in todos if t["id"] == todo_id), None)
     if not todo:
         return jsonify({"error": "Todo not found"}), 404
 
-    todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
+    todo_dir = os.path.dirname(os.path.abspath(state.TODO_FILE)) or os.getcwd()
     job_id = _start_claude_job(todo.get("title", todo_id), f"workon-{todo_id}",
                                f"/ea workon {todo_id}", todo_dir)
     return jsonify({"status": "started", "job_id": job_id})
@@ -28,13 +28,13 @@ def start_in_tmux(todo_id):
 def chat_with_todo(todo_id):
     """Send a chat message for a todo item, optionally resuming a conversation."""
     user = get_current_user()
-    if _USE_DB and not user:
+    if state._USE_DB and not user:
         return jsonify({"error": "Not authenticated"}), 401
 
-    if _USE_DB:
+    if state._USE_DB:
         todo = _db.get_todo(user["id"], todo_id)
     else:
-        todos = _parse_todo_file(TODO_FILE)
+        todos = _parse_todo_file(state.TODO_FILE)
         todo = next((t for t in todos if t["id"] == todo_id), None)
     if not todo:
         return jsonify({"error": "Todo not found"}), 404
@@ -44,7 +44,7 @@ def chat_with_todo(todo_id):
     if not message:
         return jsonify({"error": "message is required"}), 400
 
-    if _USE_DB:
+    if state._USE_DB:
         resume_conv = data.get("resume_conv")
         if resume_conv is not None:
             _db.resume_conversation(todo_id, int(resume_conv))
@@ -59,7 +59,7 @@ def chat_with_todo(todo_id):
         chats[todo_id] = chat
         _save_chats(chats)
 
-    todo_dir = os.path.dirname(os.path.abspath(TODO_FILE)) or os.getcwd()
+    todo_dir = os.path.dirname(os.path.abspath(state.TODO_FILE)) or os.getcwd()
 
     job_id = _start_claude_chat_job(
         label=f"chat: {todo.get('title', todo_id)[:40]}",
@@ -77,7 +77,7 @@ def chat_with_todo(todo_id):
 def get_chat(todo_id):
     """Return the persisted chat session for a todo item, plus any running job."""
     user = get_current_user()
-    if _USE_DB:
+    if state._USE_DB:
         include_tool = request.args.get("include_tool", "false").lower() == "true"
         messages = _db.get_messages(todo_id, include_tool=include_tool) if user else []
         # Filter out structured JSON content (tool use blocks) from assistant messages for display
@@ -115,7 +115,7 @@ def get_chat(todo_id):
     # Check for the most recent running chat job for this todo
     job_key = f"chat-{todo_id}"
     latest_job = None
-    for j in _jobs.values():
+    for j in state._jobs.values():
         if j["job_key"] == job_key and j["status"] in ("pending", "running"):
             if not latest_job or j["created_at"] > latest_job["created_at"]:
                 latest_job = j
@@ -127,7 +127,7 @@ def get_chat(todo_id):
 @bp.route("/api/chats/<todo_id>", methods=["DELETE"])
 def delete_chat(todo_id):
     """Restart chat — starts a new conversation, preserving old messages."""
-    if _USE_DB:
+    if state._USE_DB:
         _db.restart_conversation(todo_id)
     else:
         chats = _load_chats()
@@ -139,7 +139,7 @@ def delete_chat(todo_id):
 @bp.route("/api/chats/<todo_id>/conversations")
 def get_conversations(todo_id):
     """List all conversations for a todo."""
-    if not _USE_DB:
+    if not state._USE_DB:
         return jsonify({"conversations": []})
     current_num, convs = _db.get_conversations(todo_id)
     return jsonify({"conversations": convs, "current": current_num})
@@ -148,7 +148,7 @@ def get_conversations(todo_id):
 @bp.route("/api/chats/<todo_id>/conversations/<int:conv_num>")
 def get_conversation(todo_id, conv_num):
     """Get messages from a specific past conversation."""
-    if not _USE_DB:
+    if not state._USE_DB:
         return jsonify({"messages": []})
     messages = _db.get_conversation_messages(todo_id, conv_num)
     return jsonify({"messages": messages})
@@ -158,7 +158,7 @@ def get_conversation(todo_id, conv_num):
 def get_unread_chats():
     """Return list of todo_ids with unread chat responses."""
     user = get_current_user()
-    if _USE_DB and user:
+    if state._USE_DB and user:
         return jsonify(list(_db.get_unread_todo_ids(user["id"])))
     chats = _load_chats()
     return jsonify([tid for tid, c in chats.items() if c.get("unread")])
@@ -167,7 +167,7 @@ def get_unread_chats():
 @bp.route("/api/chats/<todo_id>/read", methods=["POST"])
 def mark_chat_read(todo_id):
     """Mark a chat as read."""
-    if _USE_DB:
+    if state._USE_DB:
         _db.mark_chat_read(todo_id)
     else:
         chats = _load_chats()

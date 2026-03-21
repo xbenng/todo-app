@@ -1,6 +1,6 @@
 import json, time, copy, re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from state import _jobs, _USE_DB
+import state
 from services.tools import _execute_tool, _get_tool_definitions
 from services.mcp_utils import _get_mcp_tools
 from services.system_prompt import _build_system_prompt
@@ -52,14 +52,14 @@ class ChatAgent:
         self.ptype = provider.get("type", "local")
         self.model = provider.get("model", "claude-sonnet-4-20250514")
         self.depth = depth
-        self.user_id = _jobs.get(job_id, {}).get("user_id")
+        self.user_id = state._jobs.get(job_id, {}).get("user_id")
         self.assistant_text_lines: list[str] = []
         self.total_input_tokens = 0
         self.total_output_tokens = 0
 
     @property
     def job(self):
-        return _jobs[self.job_id]
+        return state._jobs[self.job_id]
 
     def emit(self, line: str, is_text: bool = False) -> None:
         if line.strip():
@@ -76,7 +76,7 @@ class ChatAgent:
         If auto_compact is enabled in user config, automatically
         summarizes older messages to stay within context limits.
         """
-        if _USE_DB and self.todo_id:
+        if state._USE_DB and self.todo_id:
             raw_messages = _db.get_messages(self.todo_id)
         elif self.todo_id:
             chats = _load_chats()
@@ -93,7 +93,7 @@ class ChatAgent:
             messages.append({"role": role, "content": content})
         messages.append({"role": "user", "content": message})
         # Auto-compact if enabled
-        if _USE_DB and self.user_id:
+        if state._USE_DB and self.user_id:
             config = _db.get_config(self.user_id)
         else:
             config = _load_config()
@@ -191,7 +191,7 @@ class ChatAgent:
             return
         try:
             content = "\n".join(self.assistant_text_lines)
-            if _USE_DB:
+            if state._USE_DB:
                 user_id = self.job.get("user_id")
                 _db.add_message(self.todo_id, user_id, "assistant", content)
             else:

@@ -4,7 +4,7 @@ import re as _re
 from datetime import datetime as _dt
 from flask import Blueprint, request, jsonify, render_template
 from routes.auth import get_current_user
-from state import _USE_DB, TODO_FILE, _undo_stack, _undo_stacks, _jobs
+import state
 from services.file_io import (
     _parse_todo_file, _write_todo_file, _snapshot_and_write,
     _completed_file_path,
@@ -19,7 +19,7 @@ bp = Blueprint('todos', __name__)
 @bp.route("/")
 def index():
     user = get_current_user()
-    if _USE_DB and not user:
+    if state._USE_DB and not user:
         return render_template("login.html")
     return render_template("app.html")
 
@@ -27,22 +27,22 @@ def index():
 @bp.route("/api/todos", methods=["GET"])
 def get_todos():
     user = get_current_user()
-    if _USE_DB and not user:
+    if state._USE_DB and not user:
         return jsonify({"error": "Not authenticated"}), 401
-    if _USE_DB:
+    if state._USE_DB:
         return jsonify(_db.get_todos(user["id"]))
-    active = _parse_todo_file(TODO_FILE)
-    completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+    active = _parse_todo_file(state.TODO_FILE)
+    completed = _parse_todo_file(_completed_file_path(state.TODO_FILE))
     return jsonify(active + completed)
 
 
 @bp.route("/api/todos", methods=["POST"])
 def add_todo():
     user = get_current_user()
-    if _USE_DB and not user:
+    if state._USE_DB and not user:
         return jsonify({"error": "Not authenticated"}), 401
     data = request.json
-    if _USE_DB:
+    if state._USE_DB:
         title = (data.get("title") or "").strip()
         if not title:
             return jsonify({"error": "Title is required"}), 400
@@ -54,8 +54,8 @@ def add_todo():
         )
         return jsonify(todo), 201
 
-    active = _parse_todo_file(TODO_FILE)
-    completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+    active = _parse_todo_file(state.TODO_FILE)
+    completed = _parse_todo_file(_completed_file_path(state.TODO_FILE))
     todos = active + completed
     new_todo = {
         "id": str(uuid.uuid4())[:8],
@@ -78,19 +78,19 @@ def add_todo():
         todos = active + completed
     else:
         todos.append(new_todo)
-    _snapshot_and_write(TODO_FILE, todos)
+    _snapshot_and_write(state.TODO_FILE, todos)
     return jsonify(new_todo), 201
 
 
 @bp.route("/api/todos/<todo_id>", methods=["GET"])
 def get_single_todo(todo_id):
     user = get_current_user()
-    if _USE_DB and not user:
+    if state._USE_DB and not user:
         return jsonify({"error": "Not authenticated"}), 401
-    if _USE_DB:
+    if state._USE_DB:
         todo = _db.get_todo(user["id"], todo_id)
     else:
-        todos = _parse_todo_file(TODO_FILE) + _parse_todo_file(_completed_file_path(TODO_FILE))
+        todos = _parse_todo_file(state.TODO_FILE) + _parse_todo_file(_completed_file_path(state.TODO_FILE))
         todo = next((t for t in todos if t["id"] == todo_id), None)
     if not todo:
         return jsonify({"error": "Not found"}), 404
@@ -100,10 +100,10 @@ def get_single_todo(todo_id):
 @bp.route("/api/todos/<todo_id>", methods=["PUT"])
 def update_todo_route(todo_id):
     user = get_current_user()
-    if _USE_DB and not user:
+    if state._USE_DB and not user:
         return jsonify({"error": "Not authenticated"}), 401
     data = request.json
-    if _USE_DB:
+    if state._USE_DB:
         fields = {}
         for k in ("title", "description", "status", "priority", "section"):
             if k in data:
@@ -120,8 +120,8 @@ def update_todo_route(todo_id):
             _db.mark_chat_unread(todo_id, user["id"])
         return jsonify(result)
 
-    active = _parse_todo_file(TODO_FILE)
-    completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+    active = _parse_todo_file(state.TODO_FILE)
+    completed = _parse_todo_file(_completed_file_path(state.TODO_FILE))
     todos = active + completed
     for t in todos:
         if t["id"] == todo_id:
@@ -135,7 +135,7 @@ def update_todo_route(todo_id):
                 t["priority"] = data["priority"]
             if "section" in data:
                 t["section"] = data["section"].strip()
-            _snapshot_and_write(TODO_FILE, todos)
+            _snapshot_and_write(state.TODO_FILE, todos)
             return jsonify(t)
     return jsonify({"error": "Not found"}), 404
 
@@ -143,15 +143,15 @@ def update_todo_route(todo_id):
 @bp.route("/api/todos/search", methods=["GET"])
 def search_todos_route():
     user = get_current_user()
-    if _USE_DB and not user:
+    if state._USE_DB and not user:
         return jsonify({"error": "Not authenticated"}), 401
     query = (request.args.get("q") or "").lower()
     if not query:
         return jsonify([])
-    if _USE_DB:
+    if state._USE_DB:
         todos = _db.get_todos(user["id"])
     else:
-        todos = _parse_todo_file(TODO_FILE) + _parse_todo_file(_completed_file_path(TODO_FILE))
+        todos = _parse_todo_file(state.TODO_FILE) + _parse_todo_file(_completed_file_path(state.TODO_FILE))
     results = [t for t in todos
                if query in t.get("title", "").lower()
                or query in t.get("description", "").lower()]
@@ -161,14 +161,14 @@ def search_todos_route():
 @bp.route("/api/todos/<todo_id>/mark-read", methods=["POST"])
 def mark_read(todo_id):
     """Replace `updated ...` tag with `read ...` and current timestamp."""
-    active = _parse_todo_file(TODO_FILE)
-    completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+    active = _parse_todo_file(state.TODO_FILE)
+    completed = _parse_todo_file(_completed_file_path(state.TODO_FILE))
     todos = active + completed
     for t in todos:
         if t["id"] == todo_id:
             now = _dt.now().strftime("%Y-%m-%d %H:%M")
             t["title"] = _re.sub(r'`updated[^`]*`', f'`read {now}`', t["title"])
-            _snapshot_and_write(TODO_FILE, todos)
+            _snapshot_and_write(state.TODO_FILE, todos)
             return jsonify(t)
     return jsonify({"error": "Not found"}), 404
 
@@ -176,26 +176,26 @@ def mark_read(todo_id):
 @bp.route("/api/todos/<todo_id>", methods=["DELETE"])
 def delete_todo_route(todo_id):
     user = get_current_user()
-    if _USE_DB and not user:
+    if state._USE_DB and not user:
         return jsonify({"error": "Not authenticated"}), 401
-    if _USE_DB:
+    if state._USE_DB:
         if not _db.delete_todo(user["id"], todo_id):
             return jsonify({"error": "Not found"}), 404
         return jsonify({"ok": True})
-    active = _parse_todo_file(TODO_FILE)
-    completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+    active = _parse_todo_file(state.TODO_FILE)
+    completed = _parse_todo_file(_completed_file_path(state.TODO_FILE))
     todos = active + completed
     new_todos = [t for t in todos if t["id"] != todo_id]
     if len(new_todos) == len(todos):
         return jsonify({"error": "Not found"}), 404
-    _snapshot_and_write(TODO_FILE, new_todos)
+    _snapshot_and_write(state.TODO_FILE, new_todos)
     return jsonify({"ok": True})
 
 
 @bp.route("/api/todos/reorder", methods=["POST"])
 def reorder_todo():
     user = get_current_user()
-    if _USE_DB and not user:
+    if state._USE_DB and not user:
         return jsonify({"error": "Not authenticated"}), 401
     data = request.json
     todo_id = data.get("id")
@@ -203,13 +203,13 @@ def reorder_todo():
     if not todo_id or direction not in ("up", "down"):
         return jsonify({"error": "id and direction (up/down) required"}), 400
 
-    if _USE_DB:
+    if state._USE_DB:
         all_todos = _db.get_todos(user["id"])
         active = [t for t in all_todos if t["status"] != "completed"]
         completed = [t for t in all_todos if t["status"] == "completed"]
     else:
-        active = _parse_todo_file(TODO_FILE)
-        completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+        active = _parse_todo_file(state.TODO_FILE)
+        completed = _parse_todo_file(_completed_file_path(state.TODO_FILE))
 
     # Find the item in active list
     idx = next((i for i, t in enumerate(active) if t["id"] == todo_id), None)
@@ -281,12 +281,12 @@ def reorder_todo():
                     last_in_new = i
             active.insert(last_in_new + 1, item)
 
-    if _USE_DB:
+    if state._USE_DB:
         for i, t in enumerate(active):
             t["position"] = i
         _db.bulk_update_todos(user["id"], active)
     else:
-        _snapshot_and_write(TODO_FILE, active + completed)
+        _snapshot_and_write(state.TODO_FILE, active + completed)
     return jsonify({"ok": True, "moved": True})
 
 
@@ -294,20 +294,20 @@ def reorder_todo():
 def move_to_top():
     """Move a todo to the top of its section."""
     user = get_current_user()
-    if _USE_DB and not user:
+    if state._USE_DB and not user:
         return jsonify({"error": "Not authenticated"}), 401
     data = request.json
     todo_id = data.get("id")
     if not todo_id:
         return jsonify({"error": "id required"}), 400
 
-    if _USE_DB:
+    if state._USE_DB:
         all_todos = _db.get_todos(user["id"])
         active = [t for t in all_todos if t["status"] != "completed"]
         completed = [t for t in all_todos if t["status"] == "completed"]
     else:
-        active = _parse_todo_file(TODO_FILE)
-        completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+        active = _parse_todo_file(state.TODO_FILE)
+        completed = _parse_todo_file(_completed_file_path(state.TODO_FILE))
 
     idx = next((i for i, t in enumerate(active) if t["id"] == todo_id), None)
     if idx is None:
@@ -325,12 +325,12 @@ def move_to_top():
     active.pop(idx)
     active.insert(first_idx, item)
 
-    if _USE_DB:
+    if state._USE_DB:
         for i, t in enumerate(active):
             t["position"] = i
         _db.bulk_update_todos(user["id"], active)
     else:
-        _snapshot_and_write(TODO_FILE, active + completed)
+        _snapshot_and_write(state.TODO_FILE, active + completed)
     return jsonify({"ok": True, "moved": True})
 
 
@@ -338,18 +338,18 @@ def move_to_top():
 def sort_by_priority():
     """Sort todos by priority within a given section."""
     user = get_current_user()
-    if _USE_DB and not user:
+    if state._USE_DB and not user:
         return jsonify({"error": "Not authenticated"}), 401
     data = request.json
     section = data.get("section", "")
 
-    if _USE_DB:
+    if state._USE_DB:
         all_todos = _db.get_todos(user["id"])
         active = [t for t in all_todos if t["status"] != "completed"]
         completed = [t for t in all_todos if t["status"] == "completed"]
     else:
-        active = _parse_todo_file(TODO_FILE)
-        completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+        active = _parse_todo_file(state.TODO_FILE)
+        completed = _parse_todo_file(_completed_file_path(state.TODO_FILE))
 
     # Separate items in the target section from others, preserving order
     section_items = []
@@ -376,12 +376,12 @@ def sort_by_priority():
     if not inserted:
         rebuilt.extend(section_items)
 
-    if _USE_DB:
+    if state._USE_DB:
         for i, t in enumerate(rebuilt):
             t["position"] = i
         _db.bulk_update_todos(user["id"], rebuilt)
     else:
-        _snapshot_and_write(TODO_FILE, rebuilt + completed)
+        _snapshot_and_write(state.TODO_FILE, rebuilt + completed)
     return jsonify({"ok": True})
 
 
@@ -389,7 +389,7 @@ def sort_by_priority():
 def drop_todo():
     """Move a todo to a specific position: before another item, or to the end of a section."""
     user = get_current_user()
-    if _USE_DB and not user:
+    if state._USE_DB and not user:
         return jsonify({"error": "Not authenticated"}), 401
     data = request.json
     todo_id = data.get("id")
@@ -399,13 +399,13 @@ def drop_todo():
     if not todo_id:
         return jsonify({"error": "id required"}), 400
 
-    if _USE_DB:
+    if state._USE_DB:
         all_todos = _db.get_todos(user["id"])
         active = [t for t in all_todos if t["status"] != "completed"]
         completed = [t for t in all_todos if t["status"] == "completed"]
     else:
-        active = _parse_todo_file(TODO_FILE)
-        completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+        active = _parse_todo_file(state.TODO_FILE)
+        completed = _parse_todo_file(_completed_file_path(state.TODO_FILE))
 
     idx = next((i for i, t in enumerate(active) if t["id"] == todo_id), None)
     if idx is None:
@@ -429,12 +429,12 @@ def drop_todo():
     else:
         active.append(item)
 
-    if _USE_DB:
+    if state._USE_DB:
         for i, t in enumerate(active):
             t["position"] = i
         _db.bulk_update_todos(user["id"], active)
     else:
-        _snapshot_and_write(TODO_FILE, active + completed)
+        _snapshot_and_write(state.TODO_FILE, active + completed)
     return jsonify({"ok": True})
 
 
@@ -442,7 +442,7 @@ def drop_todo():
 def rename_section():
     """Rename a section header across all todos."""
     user = get_current_user()
-    if _USE_DB and not user:
+    if state._USE_DB and not user:
         return jsonify({"error": "Not authenticated"}), 401
     data = request.json
     old_name = (data.get("old_name") or "").strip()
@@ -452,11 +452,11 @@ def rename_section():
     if old_name == new_name:
         return jsonify({"ok": True})
 
-    if _USE_DB:
+    if state._USE_DB:
         todos = _db.get_todos(user["id"])
     else:
-        active = _parse_todo_file(TODO_FILE)
-        completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+        active = _parse_todo_file(state.TODO_FILE)
+        completed = _parse_todo_file(_completed_file_path(state.TODO_FILE))
         todos = active + completed
     changed = False
     for t in todos:
@@ -465,10 +465,10 @@ def rename_section():
             changed = True
     if not changed:
         return jsonify({"error": "Section not found"}), 404
-    if _USE_DB:
+    if state._USE_DB:
         _db.bulk_update_todos(user["id"], [t for t in todos if t.get("section") == new_name])
     else:
-        _snapshot_and_write(TODO_FILE, todos)
+        _snapshot_and_write(state.TODO_FILE, todos)
     return jsonify({"ok": True})
 
 
@@ -476,7 +476,7 @@ def rename_section():
 def reorder_section():
     """Move a section (and all its todos) before another section."""
     user = get_current_user()
-    if _USE_DB and not user:
+    if state._USE_DB and not user:
         return jsonify({"error": "Not authenticated"}), 401
     data = request.json
     section = (data.get("section") or "").strip()
@@ -485,7 +485,7 @@ def reorder_section():
     if not section:
         return jsonify({"error": "section required"}), 400
 
-    if _USE_DB:
+    if state._USE_DB:
         # Get current section order from DB
         sections = _db.get_sections(user["id"])
         sections_order = [s["name"] for s in sections]
@@ -504,8 +504,8 @@ def reorder_section():
             sections_order.append(section)
         _db.reorder_sections(user["id"], sections_order)
     else:
-        active = _parse_todo_file(TODO_FILE)
-        completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+        active = _parse_todo_file(state.TODO_FILE)
+        completed = _parse_todo_file(_completed_file_path(state.TODO_FILE))
         sections_order = []
         seen = set()
         for t in active:
@@ -531,7 +531,7 @@ def reorder_section():
         rebuilt = []
         for s in sections_order:
             rebuilt.extend(section_groups.get(s, []))
-        _snapshot_and_write(TODO_FILE, rebuilt + completed)
+        _snapshot_and_write(state.TODO_FILE, rebuilt + completed)
     return jsonify({"ok": True})
 
 
@@ -539,7 +539,7 @@ def reorder_section():
 def get_sections():
     """Return sections for the current user, ordered by position."""
     user = get_current_user()
-    if not _USE_DB or not user:
+    if not state._USE_DB or not user:
         return jsonify([])
     return jsonify(_db.get_sections(user["id"]))
 
@@ -548,7 +548,7 @@ def get_sections():
 def update_section():
     """Update a section's directives."""
     user = get_current_user()
-    if not _USE_DB or not user:
+    if not state._USE_DB or not user:
         return jsonify({"error": "Not available"}), 400
     data = request.json or {}
     name = (data.get("name") or "").strip()
@@ -574,25 +574,25 @@ def execute_tool_endpoint():
     agent_ctx = {"job_id": "__api__", "provider": {}, "depth": 0} if as_agent else None
     # Ensure __api__ pseudo-job exists with user_id so _execute_tool can resolve it
     if as_agent:
-        _jobs["__api__"] = {"user_id": user["id"]}
+        state._jobs["__api__"] = {"user_id": user["id"]}
     try:
         result = _execute_tool(tool_name, tool_input, todo_id=None, agent_context=agent_ctx)
         return current_app.response_class(result, mimetype="application/json")
     finally:
-        _jobs.pop("__api__", None)
+        state._jobs.pop("__api__", None)
 
 
 @bp.route("/api/todos/mtime", methods=["GET"])
 def get_mtime():
     """Return the max modification time for change detection."""
-    if _USE_DB:
+    if state._USE_DB:
         user = get_current_user()
         if user:
             mtime = _db.get_todos_mtime(user["id"])
             return jsonify({"mtime": mtime})
         return jsonify({"mtime": 0})
     mtime = 0
-    for p in (TODO_FILE, _completed_file_path(TODO_FILE)):
+    for p in (state.TODO_FILE, _completed_file_path(state.TODO_FILE)):
         try:
             mtime = max(mtime, os.path.getmtime(p))
         except OSError:
@@ -603,8 +603,8 @@ def get_mtime():
 @bp.route("/api/undo", methods=["POST"])
 def undo():
     """Restore the previous file state from the undo stack."""
-    if not _undo_stack:
+    if not state._undo_stack:
         return jsonify({"error": "Nothing to undo"}), 400
-    old_active, old_completed = _undo_stack.pop()
-    _write_todo_file(TODO_FILE, old_active + old_completed)
+    old_active, old_completed = state._undo_stack.pop()
+    _write_todo_file(state.TODO_FILE, old_active + old_completed)
     return jsonify({"ok": True})

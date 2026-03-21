@@ -2,7 +2,7 @@
 import json, time
 from flask import Blueprint, request, jsonify, Response
 from routes.auth import get_current_user
-from state import _jobs
+import state
 from services.shell_utils import _kill_process_tree
 
 bp = Blueprint('jobs', __name__)
@@ -12,21 +12,21 @@ bp = Blueprint('jobs', __name__)
 def list_jobs():
     """List all jobs, purging completed/killed entries older than 30 minutes."""
     cutoff = time.time() - 1800
-    stale = [jid for jid, j in _jobs.items()
+    stale = [jid for jid, j in state._jobs.items()
              if j["status"] in ("done", "error", "killed") and j["created_at"] < cutoff]
     for jid in stale:
-        del _jobs[jid]
+        del state._jobs[jid]
     return jsonify([{
         "id": j["id"], "label": j["label"], "job_key": j["job_key"],
         "status": j["status"], "line_count": len(j["output_lines"]), "created_at": j["created_at"],
         "conversation_id": j.get("conversation_id"),
-    } for j in _jobs.values()])
+    } for j in state._jobs.values()])
 
 
 @bp.route("/api/jobs/<job_id>/stream")
 def stream_job(job_id):
     """SSE stream of raw output lines for a job."""
-    job = _jobs.get(job_id)
+    job = state._jobs.get(job_id)
     if not job:
         return jsonify({"error": "not found"}), 404
 
@@ -51,7 +51,7 @@ def stream_job(job_id):
 @bp.route("/api/jobs/<job_id>/kill", methods=["POST"])
 def kill_job(job_id):
     """Cancel a running job (supports both local subprocess and API stream)."""
-    job = _jobs.get(job_id)
+    job = state._jobs.get(job_id)
     if not job:
         return jsonify({"error": "not found"}), 404
     # Cancel API stream if present
