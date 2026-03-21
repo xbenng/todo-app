@@ -5,30 +5,16 @@ Contains built-in tool schemas, the main tool dispatcher, and subagent spawning.
 
 import json
 import re
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import state
 from services.mcp_utils import (
     _get_mcp_tools, _parse_mcp_tool_name, _check_tool_permission, _get_mcp_manager,
 )
-from services.system_prompt import _build_system_prompt
-from services.file_io import VALID_PRIORITIES
+from services.file_io import VALID_PRIORITIES, DEFAULT_PRIORITY
 import db as _db
 
-
-try:
-    import anthropic
-except ImportError:
-    anthropic = None
-
-try:
-    import openai as openai_mod
-except ImportError:
-    openai_mod = None
-
-# Re-export DEFAULT_PRIORITY for use by _execute_tool
-from services.file_io import DEFAULT_PRIORITY
-import logging
 log = logging.getLogger("services.tools")
 
 
@@ -327,132 +313,45 @@ def _execute_spawn_agents(agents: list[dict], agent_context: dict, todo_id: str 
 
 def _run_subagent(job_id: str, todo_id: str | None, provider: dict,
                   prompt: str, label: str, depth: int) -> dict:
-    """Run a single subagent to completion. Returns {label, result, error, tokens}."""
-    ptype = provider.get("type", "local")
-    model = provider.get("model", "claude-sonnet-4-20250514")
+    """Run a single subagent using ChatAgent. Returns {label, result, error, tokens}."""
+    import time
+    import uuid
+    from services.chat_agent import ChatAgent
+
     job = state._jobs[job_id]
 
     def emit(line: str):
         if line.strip():
             job["output_lines"].append(f"[{label}] {line}")
 
-    emit(f"Starting ({model})...")
-    result_lines = []
-    total_input = 0
-    total_output = 0
+    emit(f"Starting ({provider.get('model', '?')})...")
+
+    # Create ephemeral sub-job so ChatAgent has its own output context
+    sub_job_id = str(uuid.uuid4())[:8]
+    state._jobs[sub_job_id] = {
+        "id": sub_job_id, "label": label, "job_key": f"subagent-{sub_job_id}",
+        "status": "running", "output_lines": [],
+        "proc": None, "created_at": time.time(),
+        "user_id": job.get("user_id"), "todo_id": todo_id,
+    }
 
     try:
-        system_prompt = _build_system_prompt(todo_id, job.get("user_id"))
-        messages_api = [{"role": "user", "content": prompt}]
-        tools = _get_tool_definitions(depth, job.get("user_id"))
-        tools = tools + _get_mcp_tools(job.get("user_id"))
-        agent_ctx = {"job_id": job_id, "provider": provider, "depth": depth}
+        agent = ChatAgent(sub_job_id, todo_id, provider, depth=depth, persist=False)
+        agent.run(prompt)
 
-        if ptype == "anthropic":
-            api_key = provider.get("api_key")
-            if not api_key or not anthropic:
-                return {"label": label, "result": "", "error": "Anthropic API not configured",
-                        "input_tokens": 0, "output_tokens": 0}
-            client = anthropic.Anthropic(api_key=api_key)
+        # Forward output to parent job
+        for line in state._jobs.get(sub_job_id, {}).get("output_lines", []):
+            if isinstance(line, str) and line.strip():
+                job["output_lines"].append(f"[{label}] {line}")
 
-            for _ in range(20):
-                if job["status"] == "killed":
-                    return {"label": label, "result": "\n".join(result_lines),
-                            "error": "killed", "input_tokens": total_input, "output_tokens": total_output}
-                response = client.messages.create(
-                    model=model, system=system_prompt, messages=messages_api,
-                    max_tokens=8192, tools=tools,
-                )
-                if response.usage:
-                    total_input += response.usage.input_tokens
-                    total_output += response.usage.output_tokens
-
-                for block in response.content:
-                    if block.type == "text" and block.text.strip():
-                        for ln in block.text.strip().splitlines():
-                            emit(ln)
-                            result_lines.append(ln)
-
-                if response.stop_reason == "tool_use":
-                    tool_results = []
-                    assistant_content = []
-                    for block in response.content:
-                        if block.type == "text":
-                            assistant_content.append({"type": "text", "text": block.text})
-                        elif block.type == "tool_use":
-                            assistant_content.append({
-                                "type": "tool_use", "id": block.id,
-                                "name": block.name, "input": block.input
-                            })
-                            emit(f"\u25b6 {block.name}...")
-                            result = _execute_tool(block.name, block.input, todo_id, agent_ctx)
-                            tool_results.append({
-                                "type": "tool_result", "tool_use_id": block.id, "content": result
-                            })
-                    messages_api.append({"role": "assistant", "content": assistant_content})
-                    messages_api.append({"role": "user", "content": tool_results})
-                    continue
-                break
-
-        elif ptype == "openai_compat":
-            base_url = provider.get("base_url")
-            api_key = provider.get("api_key", "none")
-            if not base_url or not openai_mod:
-                return {"label": label, "result": "", "error": "OpenAI endpoint not configured",
-                        "input_tokens": 0, "output_tokens": 0}
-            client = openai_mod.OpenAI(base_url=base_url, api_key=api_key)
-            oai_messages = [{"role": "system", "content": system_prompt},
-                            {"role": "user", "content": prompt}]
-            oai_tools = [{
-                "type": "function",
-                "function": {"name": t["name"], "description": t.get("description", ""),
-                             "parameters": t.get("input_schema", {"type": "object", "properties": {}})}
-            } for t in tools]
-            max_tokens = min(provider.get("max_tokens", 4096), 4096)
-
-            for _ in range(20):
-                if job["status"] == "killed":
-                    return {"label": label, "result": "\n".join(result_lines),
-                            "error": "killed", "input_tokens": total_input, "output_tokens": total_output}
-                kwargs = {"model": model, "messages": oai_messages, "max_tokens": max_tokens}
-                if oai_tools and provider.get("tool_use", True):
-                    kwargs["tools"] = oai_tools
-                resp = client.chat.completions.create(**kwargs)
-                if resp.usage:
-                    total_input += resp.usage.prompt_tokens or 0
-                    total_output += resp.usage.completion_tokens or 0
-                choice = resp.choices[0]
-                msg = choice.message
-                if msg.content:
-                    cleaned = _strip_think_tags(msg.content)
-                    if cleaned:
-                        for ln in cleaned.splitlines():
-                            emit(ln)
-                            result_lines.append(ln)
-                if msg.tool_calls:
-                    assistant_msg = {"role": "assistant", "content": msg.content or ""}
-                    assistant_msg["tool_calls"] = [
-                        {"id": tc.id, "type": "function",
-                         "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-                        for tc in msg.tool_calls
-                    ]
-                    oai_messages.append(assistant_msg)
-                    for tc in msg.tool_calls:
-                        emit(f"\u25b6 {tc.function.name}...")
-                        try:
-                            args = json.loads(tc.function.arguments)
-                        except json.JSONDecodeError:
-                            args = {}
-                        result = _execute_tool(tc.function.name, args, todo_id, agent_ctx)
-                        oai_messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
-                    continue
-                break
-
-        emit("Done.")
-        return {"label": label, "result": "\n".join(result_lines), "error": None,
-                "input_tokens": total_input, "output_tokens": total_output}
-
+        return {
+            "label": label, "result": agent.assistant_text, "error": None,
+            "input_tokens": agent.total_input_tokens,
+            "output_tokens": agent.total_output_tokens,
+        }
     except Exception as exc:
         emit(f"Error: {str(exc)[:200]}")
-        return {"label": label, "result": "\n".join(result_lines), "error": str(exc),
-                "input_tokens": total_input, "output_tokens": total_output}
+        return {"label": label, "result": "", "error": str(exc),
+                "input_tokens": 0, "output_tokens": 0}
+    finally:
+        state._jobs.pop(sub_job_id, None)
