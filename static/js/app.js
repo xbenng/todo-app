@@ -94,9 +94,11 @@ function startPolling() {
 }
 
 function render() {
-  // Prune stale references from persisted sets
-  const todoIds = new Set(allTodos.map(t => t.id));
-  expandedItems.forEach(id => { if (!todoIds.has(id)) expandedItems.delete(id); });
+  // Prune stale references from persisted sets (skip if todos haven't loaded yet)
+  if (allTodos.length > 0) {
+    const todoIds = new Set(allTodos.map(t => t.id));
+    expandedItems.forEach(id => { if (!todoIds.has(id)) expandedItems.delete(id); });
+  }
   _saveViewState();
   const active = allTodos.filter(t => t.status !== 'completed');
   const completed = allTodos.filter(t => t.status === 'completed');
