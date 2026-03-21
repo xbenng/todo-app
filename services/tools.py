@@ -311,6 +311,21 @@ def _execute_spawn_agents(agents: list[dict], agent_context: dict, todo_id: str 
     return json.dumps({"agents": results}, ensure_ascii=False)
 
 
+class _ForwardingOutputLines(list):
+    """List subclass that forwards tool call lines to a parent job's output in real-time."""
+
+    def __init__(self, parent_lines, label):
+        super().__init__()
+        self._parent = parent_lines
+        self._label = label
+
+    def append(self, item):
+        super().append(item)
+        # Forward tool calls to parent stream so they render in the chat pane
+        if isinstance(item, str) and item.startswith("\u25b6"):
+            self._parent.append(f"[{self._label}] {item}")
+
+
 def _run_subagent(job_id: str, todo_id: str | None, provider: dict,
                   prompt: str, label: str, depth: int) -> dict:
     """Run a single subagent using ChatAgent. Returns {label, result, error, tokens}."""
@@ -326,11 +341,13 @@ def _run_subagent(job_id: str, todo_id: str | None, provider: dict,
 
     emit(f"Starting ({provider.get('model', '?')})...")
 
-    # Create ephemeral sub-job so ChatAgent has its own output context
+    # Create ephemeral sub-job so ChatAgent has its own output context.
+    # Use _ForwardingOutputLines so tool calls (▶) appear in the parent stream.
     sub_job_id = str(uuid.uuid4())[:8]
     state._jobs[sub_job_id] = {
         "id": sub_job_id, "label": label, "job_key": f"subagent-{sub_job_id}",
-        "status": "running", "output_lines": [],
+        "status": "running",
+        "output_lines": _ForwardingOutputLines(job["output_lines"], label),
         "proc": None, "created_at": time.time(),
         "user_id": job.get("user_id"), "todo_id": todo_id,
     }
