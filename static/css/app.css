@@ -117,9 +117,10 @@
     position: relative;
   }
   .search-clear-hint {
-    display: none; position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
-    font-size: 0.7rem; color: var(--subtle); background: var(--bg); padding: 2px 6px;
+    display: none; position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+    font-size: 0.7rem; color: var(--subtle); background: var(--bg); padding: 6px 10px;
     border-radius: 4px; border: 1px solid var(--border); cursor: pointer;
+    z-index: 2; -webkit-tap-highlight-color: transparent;
   }
   .search-bar input.has-query ~ .search-clear-hint { display: block; }
   .search-bar input {
