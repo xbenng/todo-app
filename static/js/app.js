@@ -803,7 +803,7 @@ async function moveToAdjacentSection(direction) {
 }
 
 async function performUndo() {
-  const res = await fetch('/api/undo', { method: 'POST' });
+  const res = await fetch('/api/undo', { method: 'POST', headers: {'Content-Type': 'application/json'} });
   if (res.ok) {
     await loadTodos();
     const toast = document.createElement('div');
@@ -1057,7 +1057,7 @@ async function killTerminal(todoId, skipMinimize) {
 
   // Kill on server
   try {
-    await fetch('/api/terminal/' + session.sessionId + '/kill', { method: 'POST' });
+    await fetch('/api/terminal/' + session.sessionId + '/kill', { method: 'POST', headers: {'Content-Type': 'application/json'} });
   } catch {}
 
   // Clean up client
@@ -1451,7 +1451,7 @@ window.addEventListener('message', async (e) => {
 async function _deleteMcpAccount(serverName, accountId) {
   if (!confirm('Delete this account?')) return;
   _mcpAction(async () => {
-    const res = await fetch('/api/mcp/accounts/' + serverName + '/' + accountId, { method: 'DELETE' });
+    const res = await fetch('/api/mcp/accounts/' + serverName + '/' + accountId, { method: 'DELETE', headers: {'Content-Type': 'application/json'} });
     if (res.ok) {
       showToast('Account deleted');
       await _loadMcpStatus();
@@ -1581,7 +1581,7 @@ async function _toggleAutoApproveAll(checked) {
 
 async function _logout() {
   if (!confirm('Log out?')) return;
-  await fetch('/api/auth/logout', { method: 'POST' });
+  await fetch('/api/auth/logout', { method: 'POST', headers: {'Content-Type': 'application/json'} });
   window.location.reload();
 }
 
@@ -1589,7 +1589,7 @@ async function _refreshMcp() {
   showToast('Reconnecting MCP servers...');
   _mcpLoading(true);
   try {
-    await fetch('/api/mcp/reconnect', { method: 'POST' });
+    await fetch('/api/mcp/reconnect', { method: 'POST', headers: {'Content-Type': 'application/json'} });
     await _loadMcpStatus();
     showToast('MCP reconnected');
   } catch {
@@ -2018,12 +2018,12 @@ async function restartChat() {
   // Stop any running job first
   const session = _chatSessions[todoId];
   if (session && session.streamingJobId && session.streamingJobId !== 'pending') {
-    try { await fetch('/api/jobs/' + session.streamingJobId + '/kill', { method: 'POST' }); } catch {}
+    try { await fetch('/api/jobs/' + session.streamingJobId + '/kill', { method: 'POST', headers: {'Content-Type': 'application/json'} }); } catch {}
   }
   _chatSessions[todoId] = { conversationId: null, messages: [], streamingText: '', streamingJobId: null };
   _renderChatLog(todoId);
   _syncChatSendBtn(todoId);
-  fetch('/api/chats/' + todoId, { method: 'DELETE' }).catch(() => {});
+  fetch('/api/chats/' + todoId, { method: 'DELETE', headers: {'Content-Type': 'application/json'} }).catch(() => {});
   showToast('New conversation started');
 }
 
@@ -2284,7 +2284,7 @@ async function stopChat(todoId) {
   const session = _chatSessions[todoId];
   if (!session || !session.streamingJobId || session.streamingJobId === 'pending') return;
   try {
-    await fetch('/api/jobs/' + session.streamingJobId + '/kill', { method: 'POST' });
+    await fetch('/api/jobs/' + session.streamingJobId + '/kill', { method: 'POST', headers: {'Content-Type': 'application/json'} });
   } catch {}
 }
 
@@ -2457,7 +2457,7 @@ async function consolidateItem(todoId) {
 async function restoreTodoVersion(historyId, todoId) {
   if (!confirm('Restore this version?')) return;
   try {
-    const res = await fetch('/api/history/' + historyId + '/restore', { method: 'POST' });
+    const res = await fetch('/api/history/' + historyId + '/restore', { method: 'POST', headers: {'Content-Type': 'application/json'} });
     if (res.ok) {
       showToast('Restored');
       loadTodos();
@@ -2760,7 +2760,7 @@ function parseStreamLine(raw) {
 }
 
 async function killJob(jobId) {
-  await fetch('/api/jobs/' + jobId + '/kill', { method: 'POST' });
+  await fetch('/api/jobs/' + jobId + '/kill', { method: 'POST', headers: {'Content-Type': 'application/json'} });
   pollJobs();
 }
 
@@ -3610,7 +3610,7 @@ function _flushPendingMarkRead() {
   if (t && t.title && _parseTitle(t.title).hasUpdatedTag) {
     _seenUpdates.add(todoId);
     _updateSpinnersInPlace();
-    fetch(API + '/' + todoId + '/mark-read', { method: 'POST' }).catch(() => {});
+    fetch(API + '/' + todoId + '/mark-read', { method: 'POST', headers: {'Content-Type': 'application/json'} }).catch(() => {});
   }
 }
 
@@ -3619,7 +3619,7 @@ let _viewedItems = new Set();
 
 function _clearUnread(todoId) {
   _chatUnread.delete(todoId);
-  fetch('/api/chats/' + todoId + '/read', { method: 'POST' }).catch(() => {});
+  fetch('/api/chats/' + todoId + '/read', { method: 'POST', headers: {'Content-Type': 'application/json'} }).catch(() => {});
   _updateSpinnersInPlace();
 }
 
