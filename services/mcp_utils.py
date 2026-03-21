@@ -27,8 +27,29 @@ from state import (
 )
 from services.mcp_manager import MCPManager
 import db as _db
+import sys
 import logging
 log = logging.getLogger("services.mcp_utils")
+
+
+def _resolve_mcp_command(command: str, server_name: str, app_dir: str) -> str:
+    """Resolve an MCP server command to an absolute path.
+
+    Checks (in order): shutil.which, Python's own bin dir (for pip-installed
+    commands like mcp-caldav), app dir, mcp-servers dir, node_modules/.bin.
+    """
+    python_bin_dir = os.path.dirname(sys.executable)
+    mcp_dir = os.path.join(app_dir, "mcp-servers")
+    for candidate in [
+        shutil.which(command),
+        os.path.join(python_bin_dir, command),
+        os.path.join(app_dir, command),
+        os.path.join(mcp_dir, command),
+        os.path.join(mcp_dir, server_name, "node_modules", ".bin", command),
+    ]:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return command  # fallback to original (may fail at runtime)
 
 
 def _load_mcp_registry() -> dict:
@@ -186,16 +207,7 @@ def _build_mcp_configs_from_registry(registry: dict, tokens: dict,
             # Resolve command to absolute path so it works regardless of subprocess PATH
             command = entry["command"]
             if not os.path.isabs(command):
-                mcp_dir = os.path.join(app_dir, "mcp-servers")
-                for candidate in [
-                    shutil.which(command),
-                    os.path.join(app_dir, command),
-                    os.path.join(mcp_dir, command),
-                    os.path.join(mcp_dir, name, "node_modules", ".bin", command),
-                ]:
-                    if candidate and os.path.isfile(candidate):
-                        command = candidate
-                        break
+                command = _resolve_mcp_command(command, name, app_dir)
             server_configs[name] = {
                 "type": "stdio",
                 "command": command,
@@ -289,15 +301,7 @@ def _build_cli_mcp_config(user_id: str | None) -> dict | None:
                     args.append(arg)
             command = entry["command"]
             if not os.path.isabs(command):
-                for candidate in [
-                    shutil.which(command),
-                    os.path.join(app_dir, command),
-                    os.path.join(app_dir, "mcp-servers", command),
-                    os.path.join(app_dir, "mcp-servers", name, "node_modules", ".bin", command),
-                ]:
-                    if candidate and os.path.isfile(candidate):
-                        command = candidate
-                        break
+                command = _resolve_mcp_command(command, name, app_dir)
             servers[name] = {"type": "stdio", "command": command, "args": args, "env": env}
         elif server_type in ("sse", "http"):
             cfg = {"type": "http", "url": entry["url"]}
