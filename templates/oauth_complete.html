@@ -1,0 +1,6 @@
+<html><body style="font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+<div style="text-align:center"><h3>Connected!</h3><p>You can close this window.</p></div>
+<script>
+if(window.opener){window.opener.postMessage({type:'oauth_complete'},'*')}
+setTimeout(()=>window.close(),2000)
+</script></body></html>

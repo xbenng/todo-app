@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Todo List</title>
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+<link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32x32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="/static/favicon-16x16.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png">
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script type="module" src="https://cdn.jsdelivr.net/npm/ldrs/dist/auto/mirage.js"></script>
+<script type="module" src="https://cdn.jsdelivr.net/npm/ldrs/dist/auto/jellyTriangle.js"></script>
+<script type="module" src="https://cdn.jsdelivr.net/npm/ldrs/dist/auto/bouncy.js"></script>
+<script type="module" src="https://cdn.jsdelivr.net/npm/ldrs/dist/auto/ripples.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"></script>
+<script type="importmap">
+{
+  "imports": {
+    "codemirror": "https://esm.sh/codemirror@6.0.1",
+    "@codemirror/lang-markdown": "https://esm.sh/@codemirror/lang-markdown@6.3.2",
+    "@codemirror/view": "https://esm.sh/@codemirror/view@6.36.5",
+    "@codemirror/state": "https://esm.sh/@codemirror/state@6.5.2",
+    "@codemirror/commands": "https://esm.sh/@codemirror/commands@6.8.0"
+  }
+}
+</script>
+<link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+
+<div class="fab-new">
+  <button class="btn btn-primary" id="add-toggle-btn" onclick="showAddForm()">+ New <span style="opacity:0.6;font-weight:400;font-size:0.8em">(n)</span></button>
+</div>
+<div class="fab-help" style="display:flex;gap:6px">
+  <button class="btn btn-sm" onclick="showSettings()" style="border:1px solid var(--border);font-size:0.82rem;padding:5px 10px" title="Settings">&#9881;</button>
+  <button class="btn btn-sm" onclick="showShortcuts()" style="border:1px solid var(--border);font-size:0.75rem;padding:5px 10px" title="Keyboard shortcuts (?)">?</button>
+</div>
+
+<div class="sticky-header">
+  <div class="search-bar">
+    <input type="text" id="search-input" placeholder="Search todos... (/)">
+    <kbd class="search-clear-hint" id="search-clear-hint">Esc to clear</kbd>
+  </div>
+</div>
+
+<div class="add-form" id="add-form">
+  <input class="edit-title" type="text" id="new-title" placeholder="What needs to be done?">
+  <textarea id="new-desc" placeholder="Description (optional)"></textarea>
+  <select class="edit-select" id="new-section">
+    <option value="">No section</option>
+  </select>
+  <input class="edit-title" type="text" id="new-section-custom" placeholder="New section name" style="display:none;">
+  <div class="row">
+    <select class="edit-select" id="new-priority" style="width:auto;margin-bottom:0">
+      <option value="high">High</option>
+      <option value="medium" selected>Medium</option>
+      <option value="low">Low</option>
+      <option value="none">None</option>
+    </select>
+    <button class="btn btn-primary btn-sm" onclick="addTodo()">Add Todo</button>
+    <button class="btn btn-sm" onclick="hideAddForm()" style="border:1px solid var(--border)">Cancel <span style="opacity:0.6;font-weight:400">Esc</span></button>
+  </div>
+</div>
+
+<div id="active-section"></div>
+<div id="completed-section"></div>
+
+<!-- Context menu -->
+<div class="ctx-menu" id="ctx-menu"></div>
+<!-- Section picker -->
+<div class="section-picker" id="section-picker"></div>
+
+<div class="shortcuts-overlay" id="shortcuts-overlay" onclick="if(event.target===this)hideShortcuts()">
+  <div class="shortcuts-dialog">
+    <h2>Keyboard Shortcuts</h2>
+    <table>
+      <tr><td colspan="2" class="shortcut-section">Navigation</td></tr>
+      <tr><td><kbd>j</kbd> / <kbd>&#8595;</kbd></td><td>Move down</td></tr>
+      <tr><td><kbd>k</kbd> / <kbd>&#8593;</kbd></td><td>Move up</td></tr>
+      <tr><td><kbd>&#8984;&#8595;</kbd></td><td>Next section</td></tr>
+      <tr><td><kbd>&#8984;&#8593;</kbd></td><td>Previous section</td></tr>
+      <tr><td><kbd>&#8592;</kbd></td><td>Collapse section</td></tr>
+      <tr><td><kbd>&#8594;</kbd></td><td>Expand section</td></tr>
+      <tr><td><kbd>Alt+&#9166;</kbd></td><td>Collapse/expand all</td></tr>
+      <tr><td colspan="2" class="shortcut-section">Actions</td></tr>
+      <tr><td><kbd>n</kbd></td><td>New todo</td></tr>
+      <tr><td><kbd>e</kbd></td><td>Edit selected</td></tr>
+      <tr><td><kbd>Space</kbd></td><td>Toggle complete</td></tr>
+      <tr><td><kbd>s</kbd></td><td>Open terminal</td></tr>
+      <tr><td><kbd>c</kbd></td><td>Copy ID</td></tr>
+      <tr><td><kbd>t</kbd></td><td>Bring to top</td></tr>
+      <tr><td><kbd>&#8984;&#9003;</kbd></td><td>Delete</td></tr>
+      <tr><td><kbd>&#8984;Z</kbd></td><td>Undo</td></tr>
+      <tr><td><kbd>Enter</kbd></td><td>Toggle selected item description</td></tr>
+      <tr><td><kbd>a</kbd></td><td>Toggle simple mode (hide descriptions)</td></tr>
+      <tr><td colspan="2" class="shortcut-section">Priority</td></tr>
+      <tr><td><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> <kbd>0</kbd></td><td>Set high / medium / low / none</td></tr>
+      <tr><td><kbd>p</kbd></td><td>Sort section by priority</td></tr>
+      <tr><td><kbd>Ctrl+1</kbd>...<kbd>0</kbd></td><td>Filter by priority</td></tr>
+      <tr><td colspan="2" class="shortcut-section">Reorder</td></tr>
+      <tr><td><kbd>Alt+j</kbd> / <kbd>Alt+k</kbd></td><td>Move item up/down</td></tr>
+      <tr><td><kbd>Shift+J</kbd> / <kbd>K</kbd></td><td>Move to adjacent section</td></tr>
+      <tr><td><kbd>Alt+&#8594;</kbd></td><td>Move to section picker</td></tr>
+      <tr><td colspan="2" class="shortcut-section">Search</td></tr>
+      <tr><td><kbd>/</kbd></td><td>Focus search</td></tr>
+      <tr><td><kbd>Esc</kbd></td><td>Clear search / deselect</td></tr>
+      <tr><td><kbd>?</kbd></td><td>Show this dialog</td></tr>
+    </table>
+  </div>
+</div>
+
+<div class="settings-overlay" id="settings-overlay" onclick="if(event.target===this)hideSettings()">
+  <div class="settings-dialog">
+    <h2>Settings</h2>
+    <label for="settings-active-provider">Active Provider</label>
+    <select id="settings-active-provider" onchange="_onActiveProviderChange()"></select>
+    <div class="settings-hint">Which inference endpoint to use for chat.</div>
+    <div id="provider-list"></div>
+    <hr style="border:none;border-top:1px solid var(--border);margin:16px 0 12px">
+    <button class="btn btn-sm" onclick="_addProvider()" style="border:1px solid var(--border);width:100%">+ Add Provider</button>
+    <hr style="border:none;border-top:1px solid var(--border);margin:16px 0 12px">
+    <div style="display:flex;align-items:center;gap:8px;margin:4px 0">
+      <input type="checkbox" id="settings-subagents" style="margin:0;width:auto;flex-shrink:0">
+      <span style="font-size:0.82rem;font-weight:600;cursor:pointer" onclick="document.getElementById('settings-subagents').click()">Enable subagents</span>
+      <span style="font-size:0.75rem;color:var(--subtle)">max</span>
+      <input type="number" id="settings-max-subagents" min="1" max="20" value="10" style="width:50px;padding:2px 6px;font-size:0.8rem;text-align:center">
+    </div>
+    <div class="settings-hint" style="margin-top:2px">Allow the model to spawn parallel subagents for tasks like /ea update and /ea triage.</div>
+    <hr style="border:none;border-top:1px solid var(--border);margin:16px 0 12px">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+      <span style="font-size:0.82rem;font-weight:600">MCP Servers</span>
+      <button class="btn btn-sm" onclick="_refreshMcp()" style="border:1px solid var(--border);font-size:0.7rem;padding:2px 8px">Reconnect</button>
+    </div>
+    <div id="mcp-server-list" style="margin-bottom:8px;position:relative;min-height:30px">
+      <div id="mcp-loading" style="display:none;position:absolute;inset:0;background:rgba(30,30,30,0.5);align-items:center;justify-content:center;border-radius:6px;z-index:10"><l-bouncy size="20" speed="1.75" color="var(--accent)"></l-bouncy></div>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;margin:4px 0">
+      <input type="checkbox" id="mcp-auto-approve-all" onchange="_toggleAutoApproveAll(this.checked)" style="margin:0;width:auto;flex-shrink:0">
+      <span style="font-size:0.82rem;font-weight:600;cursor:pointer" onclick="document.getElementById('mcp-auto-approve-all').click()">Bypass tool approvals</span>
+    </div>
+    <div class="settings-hint" style="margin-top:2px">Skip approval prompts and allow the model to run all MCP tools automatically.</div>
+    <hr style="border:none;border-top:1px solid var(--border);margin:16px 0 12px">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+      <span style="font-size:0.82rem;font-weight:600">Version History</span>
+      <button class="btn btn-sm" onclick="_gitCommit()" style="border:1px solid var(--border);font-size:0.7rem;padding:2px 8px">Save Snapshot</button>
+    </div>
+    <div id="git-log-list" style="max-height:200px;overflow-y:auto;margin-bottom:8px"></div>
+    <div class="settings-actions">
+      <button class="btn btn-sm" onclick="_logout()" style="border:1px solid var(--border);color:#ef4444;margin-right:auto">Logout</button>
+      <button class="btn btn-sm" onclick="hideSettings()" style="border:1px solid var(--border)">Cancel</button>
+      <button class="btn btn-sm btn-primary" onclick="saveSettings()">Save</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/js/app.js"></script>
+
+
+
+<!-- Terminal overlay -->
+<div id="terminal-overlay" onclick="if(event.target===this)minimizeTerminal()" style="display:none;position:fixed;inset:0;z-index:4000;background:rgba(0,0,0,0.5);flex-direction:column;justify-content:flex-end">
+  <div id="terminal-panel" style="background:#1a1b1e;border-radius:14px 14px 0 0;height:55vh;min-height:150px;max-height:90vh;display:flex;flex-direction:column;box-shadow:0 -8px 32px rgba(0,0,0,0.4)">
+    <div id="terminal-resize-handle" style="height:12px;cursor:ns-resize;flex-shrink:0;display:flex;justify-content:center;align-items:center" onmousedown="_startTermResize(event)"><span style="width:40px;height:4px;border-radius:2px;background:rgba(255,255,255,0.25)"></span></div>
+    <div id="terminal-titlebar" style="display:flex;align-items:center;padding:6px 14px 10px;gap:10px;border-bottom:1px solid rgba(255,255,255,0.1);flex-shrink:0;cursor:ns-resize" onmousedown="_startTermResize(event)">
+      <span id="terminal-title" style="color:#e2e8f0;font-size:0.85rem;font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+      <button onclick="termSendCommand('/ea sync')" style="background:rgba(255,255,255,0.1);border:none;color:#e2e8f0;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem">Log Status</button>
+      <button onclick="copyTmuxAttach()" style="background:rgba(255,255,255,0.1);border:none;color:#e2e8f0;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem">Attach</button>
+      <button onclick="killTerminal(_activeTermTodoId)" style="background:rgba(239,68,68,0.2);border:1px solid rgba(239,68,68,0.4);color:#fca5a5;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem">Kill</button>
+    </div>
+    <div id="terminal-container" style="flex:1;overflow:hidden;padding:4px"></div>
+  </div>
+</div>
+
+<!-- Chat overlay -->
+<div id="history-overlay" onclick="if(event.target===this)closeHistoryPanel()" style="display:none;position:fixed;inset:0;z-index:4000;background:rgba(0,0,0,0.5);flex-direction:column;justify-content:flex-end;align-items:center">
+  <div style="background:#1a1b1e;border-radius:14px 14px 0 0;height:60vh;max-height:80vh;display:flex;flex-direction:column;box-shadow:0 -8px 32px rgba(0,0,0,0.4);width:100%;max-width:994px">
+    <div style="display:flex;align-items:center;padding:10px 14px;gap:10px;border-bottom:1px solid rgba(255,255,255,0.1);flex-shrink:0">
+      <span id="history-title" style="color:#e2e8f0;font-size:0.85rem;font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+      <span style="font-size:0.7rem;color:var(--subtle)">Version History</span>
+      <button onclick="closeHistoryPanel()" style="background:rgba(255,255,255,0.1);border:none;color:#e2e8f0;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem">Close</button>
+    </div>
+    <div id="history-log" style="flex:1;overflow-y:auto"></div>
+  </div>
+</div>
+
+<div id="chat-overlay" onclick="if(event.target===this)minimizeChat()" style="display:none;position:fixed;inset:0;z-index:4000;background:rgba(0,0,0,0.5);flex-direction:column;justify-content:flex-end;align-items:center">
+  <div id="chat-panel" style="background:#1a1b1e;border-radius:14px 14px 0 0;height:77vh;min-height:150px;max-height:90vh;display:flex;flex-direction:column;box-shadow:0 -8px 32px rgba(0,0,0,0.4);width:100%;max-width:994px">
+    <div style="height:12px;cursor:ns-resize;flex-shrink:0;display:flex;justify-content:center;align-items:center;touch-action:none" onmousedown="_startChatResize(event)" ontouchstart="_startChatResize(event)"><span style="width:40px;height:4px;border-radius:2px;background:rgba(255,255,255,0.25)"></span></div>
+    <div style="display:flex;align-items:center;padding:6px 14px 10px;gap:10px;border-bottom:1px solid rgba(255,255,255,0.1);flex-shrink:0;cursor:ns-resize;touch-action:none" onmousedown="_startChatResize(event)" ontouchstart="_startChatResize(event)">
+      <span id="chat-title" style="color:#e2e8f0;font-size:0.85rem;font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+      <span id="chat-provider-badge" style="font-size:0.65rem;color:rgba(255,255,255,0.45);background:rgba(255,255,255,0.08);padding:2px 7px;border-radius:4px;white-space:nowrap;flex-shrink:0;opacity:0;transition:opacity 0.15s" onmouseenter="this.style.opacity='1'" onmouseleave="this.style.opacity='0'"></span>
+      <button onclick="if(_activeChatTodoId){document.getElementById('chat-input').value='/ea checkon '+_activeChatTodoId;sendChatMessage(_activeChatTodoId)}" style="background:rgba(255,255,255,0.1);border:none;color:#e2e8f0;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem" onmousedown="event.stopPropagation()">Check On</button>
+      <button onclick="if(_activeChatTodoId){document.getElementById('chat-input').value='/compact';sendChatMessage(_activeChatTodoId)}" style="background:rgba(255,255,255,0.1);border:none;color:#e2e8f0;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem" onmousedown="event.stopPropagation()">Compact</button>
+      <button onclick="_showChatHistory()" style="background:rgba(255,255,255,0.1);border:none;color:#e2e8f0;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem" onmousedown="event.stopPropagation()">History</button>
+      <button onclick="restartChat()" style="background:rgba(255,255,255,0.1);border:none;color:#e2e8f0;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:0.75rem" onmousedown="event.stopPropagation()">Restart</button>
+    </div>
+    <div id="chat-log" class="chat-log"></div>
+    <div class="chat-input-bar">
+      <input id="chat-input" class="chat-input" placeholder="Send a message..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();chatSendOrStop(_activeChatTodoId)}else if(event.key==='Escape'){minimizeChat()}">
+      <button id="chat-send-btn" class="chat-send-btn" onclick="chatSendOrStop(_activeChatTodoId)">Send</button>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

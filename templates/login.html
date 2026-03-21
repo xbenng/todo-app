@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Login — Todo App</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+         background: #0f1117; color: #e2e8f0; display: flex; justify-content: center;
+         align-items: center; min-height: 100vh; }
+  .card { background: #1a1d2e; border-radius: 12px; padding: 32px; width: 360px;
+          box-shadow: 0 8px 32px rgba(0,0,0,0.4); }
+  h1 { font-size: 1.3rem; margin-bottom: 24px; text-align: center; }
+  label { display: block; font-size: 0.82rem; font-weight: 600; margin: 12px 0 4px; }
+  input { width: 100%; padding: 8px 12px; border: 1px solid #2d3348; border-radius: 6px;
+          background: #0f1117; color: #e2e8f0; font-size: 0.9rem; font-family: inherit; }
+  input:focus { outline: none; border-color: #4f6ef7; }
+  button { width: 100%; padding: 10px; margin-top: 20px; border: none; border-radius: 6px;
+           background: #4f6ef7; color: white; font-size: 0.9rem; font-weight: 600;
+           cursor: pointer; font-family: inherit; }
+  button:hover { background: #3a5bd9; }
+  .error { color: #ef4444; font-size: 0.8rem; margin-top: 8px; display: none; }
+  .toggle { text-align: center; margin-top: 16px; font-size: 0.8rem; }
+  .toggle a { color: #4f6ef7; cursor: pointer; text-decoration: none; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1 id="form-title">Sign In</h1>
+  <form id="auth-form" onsubmit="return handleAuth(event)">
+    <div id="name-field" style="display:none">
+      <label for="name">Name</label>
+      <input type="text" id="name" placeholder="Your name">
+    </div>
+    <label for="email">Email</label>
+    <input type="email" id="email" required placeholder="you@example.com">
+    <label for="password">Password</label>
+    <input type="password" id="password" required placeholder="Password" minlength="6">
+    <div class="error" id="error"></div>
+    <button type="submit" id="submit-btn">Sign In</button>
+  </form>
+  <div class="toggle">
+    <span id="toggle-text">Don't have an account?</span>
+    <a onclick="toggleMode()"><span id="toggle-link">Register</span></a>
+  </div>
+</div>
+<script>
+let isRegister = false;
+function toggleMode() {
+  isRegister = !isRegister;
+  document.getElementById('form-title').textContent = isRegister ? 'Register' : 'Sign In';
+  document.getElementById('submit-btn').textContent = isRegister ? 'Create Account' : 'Sign In';
+  document.getElementById('name-field').style.display = isRegister ? 'block' : 'none';
+  document.getElementById('toggle-text').textContent = isRegister ? 'Already have an account?' : "Don't have an account?";
+  document.getElementById('toggle-link').textContent = isRegister ? 'Sign In' : 'Register';
+  document.getElementById('error').style.display = 'none';
+}
+async function handleAuth(e) {
+  e.preventDefault();
+  const errEl = document.getElementById('error');
+  errEl.style.display = 'none';
+  const body = { email: document.getElementById('email').value, password: document.getElementById('password').value };
+  if (isRegister) body.name = document.getElementById('name').value;
+  try {
+    const res = await fetch('/api/auth/' + (isRegister ? 'register' : 'login'), {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!res.ok) { errEl.textContent = data.error || 'Failed'; errEl.style.display = 'block'; return; }
+    window.location.reload();
+  } catch { errEl.textContent = 'Network error'; errEl.style.display = 'block'; }
+}
+</script>
+</body>
+</html>
