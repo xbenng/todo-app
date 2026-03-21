@@ -736,9 +736,9 @@ async function changePriority(id, priority) {
   loadTodos();
 }
 
-async function deleteTodo(id) {
-  if (!confirm('Delete this todo?')) return;
-  await fetch(API + '/' + id, {method: 'DELETE'});
+async function deleteTodo(id, skipConfirm) {
+  if (!skipConfirm && !confirm('Delete this todo?')) return;
+  await fetch(API + '/' + id, {method: 'DELETE', headers: {'Content-Type': 'application/json'}});
   loadTodos();
 }
 
@@ -3610,7 +3610,7 @@ document.addEventListener('drop', async e => {
         if (fired) return;
         fired = true;
         if (capturedDir === 'left') {
-          deleteTodo(capturedId);
+          deleteTodo(capturedId, true);
         } else {
           toggleComplete(capturedId, !capturedCompleted);
         }
