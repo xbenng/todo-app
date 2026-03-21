@@ -5,6 +5,8 @@ from services.tools import _execute_tool, _get_tool_definitions
 from services.mcp_utils import _get_mcp_tools
 from services.system_prompt import _build_system_prompt
 import db as _db
+import logging
+log = logging.getLogger("services.chat_agent")
 
 try:
     import anthropic
@@ -124,7 +126,7 @@ class ChatAgent:
         ] + recent_messages
         old_chars = sum(len(m["content"]) for m in old_messages)
         new_chars = len(summary)
-        print(f"[compact] Compacted {len(old_messages)} messages ({old_chars} chars) → summary ({new_chars} chars)", flush=True)
+        log.info("Compacted %d messages (%d chars) to summary (%d chars)", len(old_messages), old_chars, new_chars)
         return compacted
 
     def _summarize_messages(self, messages: list[dict]) -> str | None:
@@ -169,7 +171,7 @@ class ChatAgent:
                 )
                 return resp.choices[0].message.content if resp.choices else None
         except Exception as exc:
-            print(f"[compact] Summarization failed: {exc}", flush=True)
+            log.warning("Compaction summarization failed: %s", exc)
         return None
 
     def _get_tools_anthropic(self) -> list[dict]:
@@ -189,7 +191,7 @@ class ChatAgent:
             user_id = self.job.get("user_id")
             _db.add_message(self.todo_id, user_id, "assistant", content)
         except Exception as exc:
-            print(f"[persist] ERROR saving chat for {self.todo_id}: {exc}")
+            log.error(f"[persist] ERROR saving chat for {self.todo_id}: {exc}")
 
     # ------------------------------------------------------------------
     # Anthropic provider

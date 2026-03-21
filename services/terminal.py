@@ -11,6 +11,8 @@ import termios
 import time
 
 import state
+import logging
+log = logging.getLogger("services.terminal")
 
 
 def _pty_set_winsize(fd: int, rows: int, cols: int) -> None:
@@ -59,7 +61,7 @@ def _tmux_recover_sessions():
             "resume_id": None,
             "created_at": time.time(),
         }
-    print(f"[terminal] Recovered {len(state._pty_sessions)} tmux sessions", flush=True)
+    log.info("Recovered %d tmux sessions", len(state._pty_sessions))
 
 
 def _terminal_io_loop(ws, master_fd, proc, tmux_target=None):
@@ -68,7 +70,7 @@ def _terminal_io_loop(ws, master_fd, proc, tmux_target=None):
     flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
     fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
-    print(f"[terminal] IO loop starting (pid={proc.pid})", flush=True)
+    log.debug("Terminal IO loop starting (pid=%d)", proc.pid)
     try:
         while proc.poll() is None:
             # 1. Read any available PTY output and forward to WS
@@ -128,4 +130,4 @@ def _terminal_io_loop(ws, master_fd, proc, tmux_target=None):
         except OSError:
             pass
         proc.wait()
-        print(f"[terminal] IO loop exited (rc={proc.returncode})", flush=True)
+        log.debug("Terminal IO loop exited (rc=%s)", proc.returncode)

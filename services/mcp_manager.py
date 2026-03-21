@@ -16,6 +16,8 @@ except ImportError:
     ClientSessionGroup = None
 
 from services.shell_utils import _get_user_shell_env
+import logging
+log = logging.getLogger("services.mcp_manager")
 
 
 class MCPManager:
@@ -46,7 +48,7 @@ class MCPManager:
             )
             future.result(timeout=60)
         except Exception as exc:
-            print(f"MCP startup error: {exc}")
+            log.error("MCP startup error: %s", exc)
 
     def stop(self):
         """Shutdown all MCP connections and stop the event loop."""
@@ -123,12 +125,12 @@ class MCPManager:
                 self._server_status[server_name] = {
                     "connected": True, "tool_count": tool_count
                 }
-                print(f"MCP connected: {server_name} ({tool_count} tools)", flush=True)
+                log.info("MCP connected: %s (%s tools)", server_name, tool_count)
             except Exception as exc:
                 self._server_status[server_name] = {
                     "connected": False, "error": str(exc)
                 }
-                print(f"MCP failed: {server_name}: {exc}", flush=True)
+                log.warning("MCP failed: %s: %s", server_name, exc)
         self._pending_config_key = None
 
         # Rebuild cached tool definitions

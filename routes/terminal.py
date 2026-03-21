@@ -7,6 +7,8 @@ import state
 from services.terminal import _terminal_io_loop, _pty_set_winsize, _tmux_bin, _tmux_session_exists, _tmux_list_sessions
 from services.shell_utils import _kill_process_tree, _resolve_claude_bin
 import db as _db
+import logging
+log = logging.getLogger("routes.terminal")
 
 bp = Blueprint('terminal', __name__)
 
@@ -140,7 +142,7 @@ def register_websocket(sock):
         master_fd, slave_fd = pty.openpty()
         _pty_set_winsize(master_fd, 24, 80)
 
-        print(f"[terminal] Attaching to session {tmux_name}", flush=True)
+        log.debug("Terminal attaching to session %s", tmux_name)
         proc = subprocess.Popen(
             [tmux, "attach-session", "-t", tmux_name],
             stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,

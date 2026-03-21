@@ -28,6 +28,8 @@ except ImportError:
 
 # Re-export DEFAULT_PRIORITY for use by _execute_tool
 from services.file_io import DEFAULT_PRIORITY
+import logging
+log = logging.getLogger("services.tools")
 
 
 def _strip_think_tags(text: str) -> str:
@@ -164,7 +166,7 @@ def _execute_tool(name: str, input_data: dict, todo_id: str | None,
     """
     depth = agent_context.get("depth", 0) if agent_context else 0
     prefix = f"[tool d={depth}]"
-    print(f"{prefix} {name}({json.dumps(input_data)[:200]})")
+    log.info("%s %s(%s)", prefix, name, json.dumps(input_data)[:200])
 
     # Resolve user_id from agent context for DB-aware operations
     user_id = None
@@ -243,7 +245,7 @@ def _execute_tool(name: str, input_data: dict, todo_id: str | None,
             if not agent_context:
                 return json.dumps({"error": "spawn_agents requires agent context"})
             agents = input_data.get("agents", [])
-            print(f"[spawn_agents] Received {len(agents)} agent(s): {[a.get('label', '?') for a in agents]}")
+            log.info("spawn_agents: received %d agent(s)", len(agents))
             if not agents:
                 return json.dumps({"error": "No agents specified"})
             if user_id:
@@ -273,7 +275,7 @@ def _execute_tool(name: str, input_data: dict, todo_id: str | None,
             return json.dumps({"error": f"Unknown tool: {name}"})
 
     except Exception as exc:
-        print(f"{prefix} {name} ERROR: {exc}")
+        log.error(f"{prefix} {name} ERROR: {exc}")
         return json.dumps({"error": str(exc)})
 
 

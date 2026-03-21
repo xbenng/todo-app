@@ -27,6 +27,8 @@ from state import (
 )
 from services.mcp_manager import MCPManager
 import db as _db
+import logging
+log = logging.getLogger("services.mcp_utils")
 
 
 def _load_mcp_registry() -> dict:
@@ -56,7 +58,7 @@ def _refresh_oauth_token(oauth_token: dict) -> str | None:
             data = resp.json()
             return data.get("access_token")
     except Exception as exc:
-        print(f"[oauth] Token refresh failed: {exc}")
+        log.warning("OAuth token refresh failed: %s", exc)
     return None
 
 
@@ -110,7 +112,7 @@ def _write_server_accounts(user_id: str, server_name: str, entry: dict) -> dict:
                     cfg["accessToken"] = fresh_token
                     cfg.pop("password", None)  # Don't need password for OAuth
                 else:
-                    print(f"[imap] OAuth token refresh failed for {cfg.get('name')}")
+                    log.warning("IMAP OAuth token refresh failed for %s", cfg.get("name"))
                     continue  # Skip account if refresh fails
             # Encrypt password for non-OAuth accounts
             elif "password" in cfg and cfg["password"]:

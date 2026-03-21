@@ -20,6 +20,8 @@ import psycopg2
 import psycopg2.pool
 import psycopg2.extras
 import bcrypt
+import logging
+log = logging.getLogger("db")
 
 # ---------------------------------------------------------------------------
 # Connection pool
@@ -73,7 +75,7 @@ def _run_migrations():
             """)
             if not cur.fetchone()[0]:
                 cur.execute(SCHEMA)
-                print("[db] Schema created")
+                log.info("Database schema created")
 
             # Incremental migrations
             cur.execute("""
@@ -94,7 +96,7 @@ def _run_migrations():
                     );
                     CREATE INDEX idx_context_files_user ON user_context_files(user_id);
                 """)
-                print("[db] Created user_context_files table")
+                log.info("DB: Created user_context_files table")
 
             # Migration: user_mcp_preferences table
             cur.execute("""
@@ -116,7 +118,7 @@ def _run_migrations():
                     );
                     CREATE INDEX idx_mcp_prefs_user ON user_mcp_preferences(user_id);
                 """)
-                print("[db] Created user_mcp_preferences table")
+                log.info("DB: Created user_mcp_preferences table")
 
             # Migration: user_server_accounts table
             cur.execute("""
@@ -136,7 +138,7 @@ def _run_migrations():
                     );
                     CREATE INDEX idx_server_accounts_user ON user_server_accounts(user_id, server_name);
                 """)
-                print("[db] Created user_server_accounts table")
+                log.info("DB: Created user_server_accounts table")
 
             # Migration: auto_approve_all column on user_configs
             cur.execute("""
@@ -147,7 +149,7 @@ def _run_migrations():
             """)
             if not cur.fetchone()[0]:
                 cur.execute("ALTER TABLE user_configs ADD COLUMN auto_approve_all BOOLEAN DEFAULT FALSE")
-                print("[db] Added auto_approve_all to user_configs")
+                log.info("DB: Added auto_approve_all to user_configs")
 
             # Migration: sections table
             cur.execute("""
@@ -179,7 +181,7 @@ def _run_migrations():
                     GROUP BY user_id, section
                     ON CONFLICT DO NOTHING
                 """)
-                print("[db] Created sections table and populated from existing todos")
+                log.info("DB: Created sections table and populated from existing todos")
 
             # Migration: conversation_num on messages + current_conversation on chats
             cur.execute("""
@@ -193,7 +195,7 @@ def _run_migrations():
                     ALTER TABLE messages ADD COLUMN conversation_num INT DEFAULT 0;
                     ALTER TABLE chats ADD COLUMN current_conversation INT DEFAULT 0;
                 """)
-                print("[db] Added conversation_num to messages, current_conversation to chats")
+                log.info("DB: Added conversation_num to messages, current_conversation to chats")
 
 
 # ---------------------------------------------------------------------------

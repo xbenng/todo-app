@@ -10,6 +10,7 @@ Usage:
 
 import sys
 import os
+import logging
 
 # Load .env file if present (before any other env lookups)
 _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -21,13 +22,24 @@ if os.path.exists(_env_path):
                 _k, _v = _line.split("=", 1)
                 os.environ.setdefault(_k.strip(), _v.strip())
 
-from flask import Flask
+from flask import Flask, jsonify
 from flask_sock import Sock
 
 import state
 import db as _db
 from routes import register_blueprints
 from routes.terminal import register_websocket
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("dossie")
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -46,6 +58,20 @@ register_blueprints(app)
 # Register WebSocket routes (terminal)
 register_websocket(sock)
 
+# Global error handler — never expose tracebacks to clients
+@app.errorhandler(Exception)
+def handle_unhandled_exception(e):
+    log.exception("Unhandled exception")
+    return jsonify({"error": "Internal server error"}), 500
+
+@app.errorhandler(404)
+def handle_not_found(e):
+    return jsonify({"error": "Not found"}), 404
+
+@app.errorhandler(405)
+def handle_method_not_allowed(e):
+    return jsonify({"error": "Method not allowed"}), 405
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -62,12 +88,12 @@ if __name__ == "__main__":
     # Initialize database (required)
     database_url = os.environ.get("DATABASE_URL")
     if not database_url:
-        print("ERROR: DATABASE_URL environment variable is required.")
-        print("Set it in .env or export it: export DATABASE_URL=postgresql://localhost/todos")
+        log.error("DATABASE_URL environment variable is required.")
+        log.error("Set it in .env or export it: export DATABASE_URL=postgresql://localhost/todos")
         sys.exit(1)
 
     _db.init(database_url)
-    print(f"Database connected: {database_url.split('@')[-1] if '@' in database_url else database_url}")
+    log.info("Database connected: %s", database_url.split('@')[-1] if '@' in database_url else database_url)
 
     # Register cleanup handler for MCP managers
     def _shutdown_all_mcp():
@@ -81,5 +107,5 @@ if __name__ == "__main__":
     from services.terminal import _tmux_recover_sessions
     _tmux_recover_sessions()
 
-    print(f"Open http://{args.host}:{args.port} in your browser")
+    log.info("Open http://%s:%s in your browser", args.host, args.port)
     app.run(host=args.host, port=args.port, debug=False, use_reloader=True)
