@@ -36,7 +36,6 @@ function _saveViewState() {
       filterActiveSessions,
       filterUnread,
       previewMode,
-      searchQuery,
     }));
   } catch {}
 }
@@ -53,11 +52,6 @@ function _restoreViewState() {
     if (s.filterActiveSessions) filterActiveSessions = true;
     if (s.filterUnread) filterUnread = true;
     if (s.previewMode) previewMode = true;
-    if (s.searchQuery) {
-      searchQuery = s.searchQuery;
-      const inp = document.getElementById('search-input');
-      if (inp) { inp.value = searchQuery; inp.classList.toggle('has-query', searchQuery.length > 0); }
-    }
   } catch {}
 }
 
