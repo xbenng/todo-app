@@ -318,6 +318,7 @@ function renderTodo(t) {
   const swipeIcon = isCompleted ? '&#8634;' : '&#10003;';
   return `<div class="todo-item ${statusClass}${itemToggled}" data-todo-id="${t.id}" onclick="selectTodo('${t.id}')" ondblclick="startEdit('${t.id}')" oncontextmenu="showCtxMenu(event,'${t.id}')" style="cursor:pointer;">
     <div class="${swipeRevealClass}"><span class="swipe-reveal-icon">${swipeIcon}</span></div>
+    <div class="swipe-reveal swipe-reveal-delete"><span class="swipe-reveal-icon">&#128465;</span></div>
     <div class="swipe-content">
     <div class="todo-header">
       <div class="todo-title" ${draggable} style="flex:1;min-width:0;display:flex;align-items:center;gap:2px;${t.status !== 'completed' ? 'cursor:grab;' : ''}" onclick="event.stopPropagation();selectTodo('${t.id}');toggleItemDesc('${t.id}')">${spinner}${esc(_parseTitle(t.title || '').displayTitle)}</div>
@@ -3484,14 +3485,14 @@ document.addEventListener('drop', async e => {
   var THRESHOLD_RATIO = 0.30;
   var VELOCITY_THRESHOLD = 0.4; // px/ms
 
-  var startX, startY, startTime, locked, item, content, itemW, isCompleted, todoId;
+  var startX, startY, startTime, locked, item, content, itemW, isCompleted, todoId, swipeDir;
 
   function reset() {
     if (item) {
-      item.classList.remove('swiping', 'swipe-active', 'swipe-threshold', 'snap-back', 'snap-complete');
+      item.classList.remove('swiping', 'swipe-active', 'swipe-threshold', 'swipe-left', 'snap-back', 'snap-complete');
       if (content) content.style.transform = '';
     }
-    startX = startY = startTime = locked = item = content = itemW = isCompleted = todoId = null;
+    startX = startY = startTime = locked = item = content = itemW = isCompleted = todoId = swipeDir = null;
   }
 
   function findItem(el) {
@@ -3546,20 +3547,32 @@ document.addEventListener('drop', async e => {
     if (locked !== 'h') return;
     e.preventDefault();
 
-    // Only allow swiping right
-    if (dx < 0) dx = 0;
+    // Lock direction on first significant move
+    if (!swipeDir) swipeDir = dx > 0 ? 'right' : 'left';
+
+    // Only allow movement in the locked direction
+    var absDx = Math.abs(dx);
+    if ((swipeDir === 'right' && dx < 0) || (swipeDir === 'left' && dx > 0)) absDx = 0;
+
+    // Toggle swipe-left class for CSS styling (shows delete reveal)
+    if (swipeDir === 'left') {
+      item.classList.add('swipe-left');
+    } else {
+      item.classList.remove('swipe-left');
+    }
 
     // Rubber-band past threshold
     var threshold = itemW * THRESHOLD_RATIO;
     var tx;
-    if (dx <= threshold) {
-      tx = dx;
+    if (absDx <= threshold) {
+      tx = absDx;
     } else {
-      tx = threshold + (dx - threshold) * 0.4;
+      tx = threshold + (absDx - threshold) * 0.4;
     }
-    content.style.transform = 'translateX(' + tx + 'px)';
+    var sign = swipeDir === 'left' ? -1 : 1;
+    content.style.transform = 'translateX(' + (tx * sign) + 'px)';
 
-    if (dx >= threshold) {
+    if (absDx >= threshold) {
       item.classList.add('swipe-threshold');
     } else {
       item.classList.remove('swipe-threshold');
@@ -3571,24 +3584,31 @@ document.addEventListener('drop', async e => {
 
     var t = e.changedTouches[0];
     var dx = t.clientX - startX;
+    var absDx = Math.abs(dx);
     var elapsed = Date.now() - startTime;
-    var velocity = dx / (elapsed || 1);
+    var velocity = absDx / (elapsed || 1);
     var threshold = itemW * THRESHOLD_RATIO;
-    var pastThreshold = dx >= threshold || (velocity > VELOCITY_THRESHOLD && dx > 30);
+    var pastThreshold = absDx >= threshold || (velocity > VELOCITY_THRESHOLD && absDx > 30);
 
-    if (pastThreshold) {
-      // Animate off-screen, then toggle
+    if (pastThreshold && swipeDir) {
+      // Animate off-screen
       item.classList.remove('swiping');
       item.classList.add('snap-complete');
-      content.style.transform = 'translateX(' + itemW + 'px)';
+      var sign = swipeDir === 'left' ? -1 : 1;
+      content.style.transform = 'translateX(' + (itemW * sign) + 'px)';
 
       var capturedId = todoId;
       var capturedCompleted = isCompleted;
       var capturedItem = item;
+      var capturedDir = swipeDir;
 
       var done = function() {
         capturedItem.removeEventListener('transitionend', done);
-        toggleComplete(capturedId, !capturedCompleted);
+        if (capturedDir === 'left') {
+          deleteTodo(capturedId);
+        } else {
+          toggleComplete(capturedId, !capturedCompleted);
+        }
       };
       // Listen on the content div for the transform transition
       content.addEventListener('transitionend', done, { once: true });
@@ -3598,7 +3618,7 @@ document.addEventListener('drop', async e => {
       }, 350);
     } else {
       // Snap back
-      item.classList.remove('swiping', 'swipe-threshold');
+      item.classList.remove('swiping', 'swipe-threshold', 'swipe-left');
       item.classList.add('snap-back');
       content.style.transform = '';
       var snapItem = item;

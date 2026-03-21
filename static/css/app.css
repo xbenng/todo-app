@@ -499,10 +499,15 @@
   .swipe-reveal-undo {
     background: #f59e0b;
   }
+  .swipe-reveal-delete {
+    background: #ef4444; justify-content: flex-end; padding-left: 0; padding-right: 24px;
+  }
   .swipe-reveal-icon {
     transition: transform 0.15s;
   }
   .swipe-active .swipe-reveal { opacity: 1; }
+  .swipe-active.swipe-left .swipe-reveal { opacity: 0; }
+  .swipe-active.swipe-left .swipe-reveal-delete { opacity: 1; }
   .swipe-threshold .swipe-reveal-icon { transform: scale(1.4); }
   .swipe-content {
     position: relative; background: inherit; z-index: 1;
