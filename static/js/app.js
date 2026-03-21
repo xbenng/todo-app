@@ -3528,6 +3528,7 @@ document.addEventListener('drop', async e => {
     startY = t.clientY;
     startTime = Date.now();
     locked = null; // null = undecided, 'h' = horizontal, 'v' = vertical
+    swipeDir = null;
   }, { passive: true });
 
   document.addEventListener('touchmove', function(e) {
@@ -3627,7 +3628,7 @@ document.addEventListener('drop', async e => {
       }, 300);
     }
 
-    item = null; content = null; locked = null;
+    item = null; content = null; locked = null; swipeDir = null;
   }, { passive: true });
 
   document.addEventListener('touchcancel', function() {
@@ -3640,7 +3641,7 @@ document.addEventListener('drop', async e => {
         snapItem.classList.remove('snap-back', 'swipe-active');
       }, 300);
     }
-    item = null; content = null; locked = null;
+    item = null; content = null; locked = null; swipeDir = null;
   }, { passive: true });
 })();
 
