@@ -2207,7 +2207,7 @@ function _streamChatResponse(todoId, jobId) {
         streamEl.appendChild(div);
         textDiv = null;
         currentBlockText = '';
-      } else if (line.startsWith('\u25b6 ')) {
+      } else if (line.startsWith('\u25b6 ') || line.includes('\u25b6 ')) {
         const div = document.createElement('div');
         div.className = 'chat-tool-line';
         div.textContent = line;
@@ -2620,7 +2620,7 @@ function _openItemStream(todoId, jobId) {
       outEl.scrollTop = outEl.scrollHeight;
     }
     // Summary: only message lines (no tool calls)
-    if (!line.startsWith('▶') && !line.startsWith('✓')) {
+    if (!line.includes('▶') && !line.startsWith('✓') && !line.startsWith('⚡')) {
       _clientJobSummary[todoId].push('⏺ ' + line);
       const sumEl = document.getElementById('checkon-summary-' + todoId);
       if (sumEl) {
