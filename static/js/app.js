@@ -23,6 +23,46 @@ const collapsedSections = new Set(['__completed__']); // collapsed section names
 const _seenUpdates = new Set(); // todo IDs whose ⚡ update has been viewed
 const SEL_ADD = 0; // index for the add-form position
 
+// --- Persistent view state (survives page reloads) ---
+const _VIEW_STATE_KEY = 'dossie_view_state';
+
+function _saveViewState() {
+  try {
+    localStorage.setItem(_VIEW_STATE_KEY, JSON.stringify({
+      collapsedSections: [...collapsedSections],
+      expandedItems: [...expandedItems],
+      showPriorities: [...showPriorities],
+      hidePriorities: [...hidePriorities],
+      filterActiveSessions,
+      filterUnread,
+      previewMode,
+      searchQuery,
+    }));
+  } catch {}
+}
+
+function _restoreViewState() {
+  try {
+    const raw = localStorage.getItem(_VIEW_STATE_KEY);
+    if (!raw) return;
+    const s = JSON.parse(raw);
+    if (s.collapsedSections) { collapsedSections.clear(); s.collapsedSections.forEach(v => collapsedSections.add(v)); }
+    if (s.expandedItems) { s.expandedItems.forEach(v => expandedItems.add(v)); }
+    if (s.showPriorities) { s.showPriorities.forEach(v => showPriorities.add(v)); }
+    if (s.hidePriorities) { s.hidePriorities.forEach(v => hidePriorities.add(v)); }
+    if (s.filterActiveSessions) filterActiveSessions = true;
+    if (s.filterUnread) filterUnread = true;
+    if (s.previewMode) previewMode = true;
+    if (s.searchQuery) {
+      searchQuery = s.searchQuery;
+      const inp = document.getElementById('search-input');
+      if (inp) { inp.value = searchQuery; inp.classList.toggle('has-query', searchQuery.length > 0); }
+    }
+  } catch {}
+}
+
+_restoreViewState();
+
 async function loadTodos() {
   const res = await fetch(API);
   allTodos = await res.json();
@@ -60,6 +100,7 @@ function startPolling() {
 }
 
 function render() {
+  _saveViewState();
   const active = allTodos.filter(t => t.status !== 'completed');
   const completed = allTodos.filter(t => t.status === 'completed');
 
