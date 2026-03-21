@@ -1,0 +1,521 @@
+"""Tool definitions and execution for the chat agent.
+
+Contains built-in tool schemas, the main tool dispatcher, and subagent spawning.
+"""
+
+import json
+import re
+import uuid
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from state import _jobs, _USE_DB, TODO_FILE
+from services.mcp_utils import (
+    _get_mcp_tools, _parse_mcp_tool_name, _check_tool_permission, _get_mcp_manager,
+)
+from services.system_prompt import _build_system_prompt
+from services.file_io import (
+    _parse_todo_file, _write_todo_file, _snapshot_and_write,
+    _load_chats, _save_chats, VALID_PRIORITIES,
+)
+import db as _db
+
+
+try:
+    import anthropic
+except ImportError:
+    anthropic = None
+
+try:
+    import openai as openai_mod
+except ImportError:
+    openai_mod = None
+
+# Re-export DEFAULT_PRIORITY for use by _execute_tool
+from services.file_io import DEFAULT_PRIORITY
+
+
+def _strip_think_tags(text: str) -> str:
+    """Remove <think>...</think> reasoning blocks from model output."""
+    return re.sub(r'<think>[\s\S]*?</think>\s*', '', text).strip()
+
+
+def _get_tool_definitions(depth: int = 0, user_id: str | None = None) -> list[dict]:
+    """Return Claude API tool definitions for server-side tools."""
+    tools = [
+        {
+            "name": "read_todos",
+            "description": "Read todo items. Returns summaries (id, title, status, priority, section) by default. Use detail=true for full descriptions. Use get_todo for a single item.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "status_filter": {
+                        "type": "string",
+                        "enum": ["all", "open", "completed"],
+                        "description": "Filter by status. Default: open"
+                    },
+                    "detail": {
+                        "type": "boolean",
+                        "description": "Include full descriptions. Default: false (summaries only)"
+                    }
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "get_todo",
+            "description": "Get a single todo item by ID with full details including description.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "todo_id": {"type": "string", "description": "The todo item ID"}
+                },
+                "required": ["todo_id"]
+            }
+        },
+        {
+            "name": "update_todo",
+            "description": "Update a todo item's fields (title, description, status, priority, section).",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "todo_id": {"type": "string", "description": "The todo item ID"},
+                    "title": {"type": "string", "description": "New title"},
+                    "description": {"type": "string", "description": "New description (markdown)"},
+                    "status": {"type": "string", "enum": ["open", "completed"]},
+                    "priority": {"type": "string", "enum": ["high", "medium", "low", "none"]},
+                    "section": {"type": "string", "description": "Section/category name"}
+                },
+                "required": ["todo_id"]
+            }
+        },
+        {
+            "name": "create_todo",
+            "description": "Create a new todo item.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Todo title"},
+                    "description": {"type": "string", "description": "Todo description (markdown)"},
+                    "priority": {"type": "string", "enum": ["high", "medium", "low", "none"]},
+                    "section": {"type": "string", "description": "Section/category name"}
+                },
+                "required": ["title"]
+            }
+        },
+        {
+            "name": "search_todos",
+            "description": "Search todos by text query across titles and descriptions.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"}
+                },
+                "required": ["query"]
+            }
+        },
+        {
+            "name": "read_chat_history",
+            "description": "Read the chat history for a specific todo item.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "todo_id": {"type": "string", "description": "The todo item ID"}
+                },
+                "required": ["todo_id"]
+            }
+        },
+    ]
+    if _USE_DB and user_id and user_id != "local":
+        config = _db.get_config(user_id)
+    else:
+        from services.file_io import _load_config
+        config = _load_config()
+    if depth < 2 and config.get("subagents_enabled", True):
+        tools.append({
+            "name": "spawn_agents",
+            "description": "Launch multiple subagents in parallel in a SINGLE call. Pass ALL agents in the 'agents' array — "
+                           "they run concurrently via a thread pool. Do NOT call this tool multiple times sequentially; "
+                           "instead, batch all independent tasks into one call. Each subagent gets its own prompt, "
+                           "full tool access (including MCP), and returns results. "
+                           "This is the 'Agent tool' referenced in the EA skill instructions.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "agents": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "prompt": {"type": "string", "description": "Complete instructions for this subagent. Include all context it needs — it has no access to the parent conversation."},
+                                "label": {"type": "string", "description": "Short label for progress output (e.g., 'Slack sweep')."},
+                                "model": {"type": "string", "description": "Optional model override. Defaults to the parent's model."}
+                            },
+                            "required": ["prompt"]
+                        },
+                        "description": "Array of agent specs to launch in parallel."
+                    }
+                },
+                "required": ["agents"]
+            }
+        })
+    return tools
+
+
+def _execute_tool(name: str, input_data: dict, todo_id: str | None,
+                  agent_context: dict | None = None) -> str:
+    """Execute a server-side tool and return the result as a string.
+
+    agent_context: {job_id, provider, depth} — passed when called from ChatAgent.
+    """
+    depth = agent_context.get("depth", 0) if agent_context else 0
+    prefix = f"[tool d={depth}]"
+    print(f"{prefix} {name}({json.dumps(input_data)[:200]})")
+
+    # Resolve user_id from agent context for DB-aware operations
+    user_id = None
+    if agent_context and agent_context.get("job_id"):
+        user_id = _jobs.get(agent_context["job_id"], {}).get("user_id")
+
+    # In DB mode, require user_id — never fall through to file-based operations
+    if _USE_DB and not user_id and name not in ("spawn_agents",):
+        return json.dumps({"error": "Not authenticated"})
+
+    try:
+        if name == "read_todos":
+            if _USE_DB and user_id:
+                todos = _db.get_todos(user_id)
+            else:
+                from services.file_io import _completed_file_path
+                active = _parse_todo_file(TODO_FILE)
+                completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+                todos = active + completed
+            status_filter = input_data.get("status_filter", "open")
+            if status_filter == "open":
+                todos = [t for t in todos if t["status"] != "completed"]
+            elif status_filter == "completed":
+                todos = [t for t in todos if t["status"] == "completed"]
+            # Strip descriptions unless detail=true
+            if not input_data.get("detail"):
+                todos = [{k: v for k, v in t.items() if k != "description"} for t in todos]
+            return json.dumps(todos, ensure_ascii=False)
+
+        elif name == "get_todo":
+            tid = input_data.get("todo_id", "")
+            if _USE_DB and user_id:
+                todo = _db.get_todo(user_id, tid)
+            else:
+                from services.file_io import _completed_file_path
+                active = _parse_todo_file(TODO_FILE)
+                completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+                todo = next((t for t in active + completed if t["id"] == tid), None)
+            if not todo:
+                return json.dumps({"error": f"Todo {tid} not found"})
+            return json.dumps(todo, ensure_ascii=False)
+
+        elif name == "update_todo":
+            tid = input_data["todo_id"]
+            if _USE_DB and user_id:
+                fields = {}
+                for k in ("title", "description", "status", "priority", "section"):
+                    if k in input_data:
+                        val = input_data[k]
+                        if k == "status" and val not in ("open", "completed"):
+                            continue
+                        if k == "priority" and val not in VALID_PRIORITIES:
+                            continue
+                        fields[k] = val.strip() if isinstance(val, str) else val
+                result = _db.update_todo(user_id, tid, **fields)
+                if not result:
+                    return json.dumps({"error": f"Todo {tid} not found"})
+                if agent_context:
+                    _db.mark_chat_unread(tid, user_id)
+                return json.dumps(result, ensure_ascii=False)
+            else:
+                from services.file_io import _completed_file_path
+                active = _parse_todo_file(TODO_FILE)
+                completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+                todos = active + completed
+                for t in todos:
+                    if t["id"] == tid:
+                        for field in ("title", "description", "status", "priority", "section"):
+                            if field in input_data:
+                                val = input_data[field]
+                                if field == "status" and val not in ("open", "completed"):
+                                    continue
+                                if field == "priority" and val not in VALID_PRIORITIES:
+                                    continue
+                                t[field] = val.strip() if isinstance(val, str) else val
+                        _snapshot_and_write(TODO_FILE, todos)
+                        return json.dumps(t, ensure_ascii=False)
+                return json.dumps({"error": f"Todo {tid} not found"})
+
+        elif name == "create_todo":
+            title = (input_data.get("title") or "").strip()
+            if not title:
+                return json.dumps({"error": "Title is required"})
+            if _USE_DB and user_id:
+                new_todo = _db.create_todo(
+                    user_id, title,
+                    description=(input_data.get("description") or "").strip(),
+                    priority=input_data.get("priority", DEFAULT_PRIORITY),
+                    section=(input_data.get("section") or "").strip(),
+                )
+                if agent_context:
+                    _db.mark_chat_unread(new_todo["id"], user_id)
+                return json.dumps(new_todo, ensure_ascii=False)
+            else:
+                from services.file_io import _completed_file_path
+                active = _parse_todo_file(TODO_FILE)
+                completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+                todos = active + completed
+                new_todo = {
+                    "id": str(uuid.uuid4())[:8],
+                    "title": title,
+                    "description": (input_data.get("description") or "").strip(),
+                    "status": "open",
+                    "priority": input_data.get("priority", DEFAULT_PRIORITY),
+                    "section": (input_data.get("section") or "").strip(),
+                }
+                todos.append(new_todo)
+                _snapshot_and_write(TODO_FILE, todos)
+                return json.dumps(new_todo, ensure_ascii=False)
+
+        elif name == "search_todos":
+            query = input_data.get("query", "").lower()
+            if _USE_DB and user_id:
+                results = _db.search_todos(user_id, query)
+            else:
+                from services.file_io import _completed_file_path
+                active = _parse_todo_file(TODO_FILE)
+                completed = _parse_todo_file(_completed_file_path(TODO_FILE))
+                results = [t for t in active + completed
+                           if query in t.get("title", "").lower()
+                           or query in t.get("description", "").lower()]
+            # Return summaries — use get_todo for full detail
+            results = [{k: v for k, v in t.items() if k != "description"} for t in results]
+            return json.dumps(results, ensure_ascii=False)
+
+        elif name == "read_chat_history":
+            tid = input_data.get("todo_id", todo_id)
+            if _USE_DB:
+                messages = _db.get_messages(tid)
+                return json.dumps(messages[-20:], ensure_ascii=False)
+            else:
+                chats = _load_chats()
+                chat = chats.get(tid, {"messages": []})
+                return json.dumps(chat.get("messages", [])[-20:], ensure_ascii=False)
+
+        elif name == "spawn_agents":
+            if not agent_context:
+                return json.dumps({"error": "spawn_agents requires agent context"})
+            agents = input_data.get("agents", [])
+            print(f"[spawn_agents] Received {len(agents)} agent(s): {[a.get('label', '?') for a in agents]}")
+            if not agents:
+                return json.dumps({"error": "No agents specified"})
+            if _USE_DB and user_id:
+                config = _db.get_config(user_id)
+            else:
+                from services.file_io import _load_config
+                config = _load_config()
+            max_subagents = config.get("max_subagents", 10)
+            if len(agents) > max_subagents:
+                return json.dumps({"error": f"Maximum {max_subagents} parallel agents"})
+            depth = agent_context.get("depth", 0)
+            if depth >= 2:
+                return json.dumps({"error": "Maximum agent nesting depth reached"})
+            return _execute_spawn_agents(agents, agent_context, todo_id)
+
+        else:
+            # Delegate to MCP if it's an MCP tool
+            if not user_id and agent_context and agent_context.get("job_id"):
+                user_id = _jobs.get(agent_context["job_id"], {}).get("user_id")
+            mgr = _get_mcp_manager(user_id)
+            if mgr and mgr.is_mcp_tool(name):
+                # Check runtime permission before executing
+                if _USE_DB and user_id and user_id != "local":
+                    permission = _check_tool_permission(user_id, name, input_data, agent_context)
+                    if permission == "denied":
+                        return json.dumps({"error": f"Tool '{name}' was denied by the user"})
+                return mgr.call_tool(name, input_data)
+            return json.dumps({"error": f"Unknown tool: {name}"})
+
+    except Exception as exc:
+        print(f"{prefix} {name} ERROR: {exc}")
+        return json.dumps({"error": str(exc)})
+
+
+def _execute_spawn_agents(agents: list[dict], agent_context: dict, todo_id: str | None) -> str:
+    """Launch subagents in parallel and return their results."""
+    job_id = agent_context["job_id"]
+    provider = agent_context["provider"]
+    depth = agent_context.get("depth", 0)
+
+    _jobs[job_id]["output_lines"].append(f"\u26a1 Launching {len(agents)} subagent(s)...")
+
+    results = []
+    from services.file_io import _load_config
+    config = _load_config()
+    max_workers = config.get("max_subagents", 10)
+    with ThreadPoolExecutor(max_workers=min(len(agents), max_workers)) as executor:
+        futures = {}
+        for i, spec in enumerate(agents):
+            label = spec.get("label", f"agent-{i+1}")
+            future = executor.submit(
+                _run_subagent,
+                job_id=job_id, todo_id=todo_id, provider=provider,
+                prompt=spec["prompt"], label=label, depth=depth + 1,
+            )
+            futures[future] = label
+
+        subagent_timeout = config.get("subagent_timeout", 120)
+        for future in as_completed(futures, timeout=subagent_timeout + 30):
+            try:
+                result = future.result(timeout=subagent_timeout)
+                results.append(result)
+            except Exception as exc:
+                results.append({
+                    "label": futures[future], "result": "",
+                    "error": f"Timed out or failed: {str(exc)[:200]}",
+                    "input_tokens": 0, "output_tokens": 0,
+                })
+
+    total_in = sum(r.get("input_tokens", 0) for r in results)
+    total_out = sum(r.get("output_tokens", 0) for r in results)
+    _jobs[job_id]["output_lines"].append(
+        f"\u2713 All {len(results)} subagent(s) complete (tokens: {total_in}+{total_out})"
+    )
+    return json.dumps({"agents": results}, ensure_ascii=False)
+
+
+def _run_subagent(job_id: str, todo_id: str | None, provider: dict,
+                  prompt: str, label: str, depth: int) -> dict:
+    """Run a single subagent to completion. Returns {label, result, error, tokens}."""
+    ptype = provider.get("type", "local")
+    model = provider.get("model", "claude-sonnet-4-20250514")
+    job = _jobs[job_id]
+
+    def emit(line: str):
+        if line.strip():
+            job["output_lines"].append(f"[{label}] {line}")
+
+    emit(f"Starting ({model})...")
+    result_lines = []
+    total_input = 0
+    total_output = 0
+
+    try:
+        system_prompt = _build_system_prompt(todo_id, job.get("user_id"))
+        messages_api = [{"role": "user", "content": prompt}]
+        tools = _get_tool_definitions(depth, job.get("user_id"))
+        tools = tools + _get_mcp_tools(job.get("user_id"))
+        agent_ctx = {"job_id": job_id, "provider": provider, "depth": depth}
+
+        if ptype == "anthropic":
+            api_key = provider.get("api_key")
+            if not api_key or not anthropic:
+                return {"label": label, "result": "", "error": "Anthropic API not configured",
+                        "input_tokens": 0, "output_tokens": 0}
+            client = anthropic.Anthropic(api_key=api_key)
+
+            for _ in range(20):
+                if job["status"] == "killed":
+                    return {"label": label, "result": "\n".join(result_lines),
+                            "error": "killed", "input_tokens": total_input, "output_tokens": total_output}
+                response = client.messages.create(
+                    model=model, system=system_prompt, messages=messages_api,
+                    max_tokens=8192, tools=tools,
+                )
+                if response.usage:
+                    total_input += response.usage.input_tokens
+                    total_output += response.usage.output_tokens
+
+                for block in response.content:
+                    if block.type == "text" and block.text.strip():
+                        for ln in block.text.strip().splitlines():
+                            emit(ln)
+                            result_lines.append(ln)
+
+                if response.stop_reason == "tool_use":
+                    tool_results = []
+                    assistant_content = []
+                    for block in response.content:
+                        if block.type == "text":
+                            assistant_content.append({"type": "text", "text": block.text})
+                        elif block.type == "tool_use":
+                            assistant_content.append({
+                                "type": "tool_use", "id": block.id,
+                                "name": block.name, "input": block.input
+                            })
+                            emit(f"\u25b6 {block.name}...")
+                            result = _execute_tool(block.name, block.input, todo_id, agent_ctx)
+                            tool_results.append({
+                                "type": "tool_result", "tool_use_id": block.id, "content": result
+                            })
+                    messages_api.append({"role": "assistant", "content": assistant_content})
+                    messages_api.append({"role": "user", "content": tool_results})
+                    continue
+                break
+
+        elif ptype == "openai_compat":
+            base_url = provider.get("base_url")
+            api_key = provider.get("api_key", "none")
+            if not base_url or not openai_mod:
+                return {"label": label, "result": "", "error": "OpenAI endpoint not configured",
+                        "input_tokens": 0, "output_tokens": 0}
+            client = openai_mod.OpenAI(base_url=base_url, api_key=api_key)
+            oai_messages = [{"role": "system", "content": system_prompt},
+                            {"role": "user", "content": prompt}]
+            oai_tools = [{
+                "type": "function",
+                "function": {"name": t["name"], "description": t.get("description", ""),
+                             "parameters": t.get("input_schema", {"type": "object", "properties": {}})}
+            } for t in tools]
+            max_tokens = min(provider.get("max_tokens", 4096), 4096)
+
+            for _ in range(20):
+                if job["status"] == "killed":
+                    return {"label": label, "result": "\n".join(result_lines),
+                            "error": "killed", "input_tokens": total_input, "output_tokens": total_output}
+                kwargs = {"model": model, "messages": oai_messages, "max_tokens": max_tokens}
+                if oai_tools and provider.get("tool_use", True):
+                    kwargs["tools"] = oai_tools
+                resp = client.chat.completions.create(**kwargs)
+                if resp.usage:
+                    total_input += resp.usage.prompt_tokens or 0
+                    total_output += resp.usage.completion_tokens or 0
+                choice = resp.choices[0]
+                msg = choice.message
+                if msg.content:
+                    cleaned = _strip_think_tags(msg.content)
+                    if cleaned:
+                        for ln in cleaned.splitlines():
+                            emit(ln)
+                            result_lines.append(ln)
+                if msg.tool_calls:
+                    assistant_msg = {"role": "assistant", "content": msg.content or ""}
+                    assistant_msg["tool_calls"] = [
+                        {"id": tc.id, "type": "function",
+                         "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                        for tc in msg.tool_calls
+                    ]
+                    oai_messages.append(assistant_msg)
+                    for tc in msg.tool_calls:
+                        emit(f"\u25b6 {tc.function.name}...")
+                        try:
+                            args = json.loads(tc.function.arguments)
+                        except json.JSONDecodeError:
+                            args = {}
+                        result = _execute_tool(tc.function.name, args, todo_id, agent_ctx)
+                        oai_messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+                    continue
+                break
+
+        emit("Done.")
+        return {"label": label, "result": "\n".join(result_lines), "error": None,
+                "input_tokens": total_input, "output_tokens": total_output}
+
+    except Exception as exc:
+        emit(f"Error: {str(exc)[:200]}")
+        return {"label": label, "result": "\n".join(result_lines), "error": str(exc),
+                "input_tokens": total_input, "output_tokens": total_output}
