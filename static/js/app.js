@@ -2187,9 +2187,19 @@ function _streamChatResponse(todoId, jobId) {
     }
 
     if (typeof raw === 'object' && raw.__tool_call__) {
-      const label = raw.subagent ? `[${raw.subagent}] \u25b6 ${raw.name}...` : `\u25b6 ${raw.name}...`;
-      raw = label;
-      // fall through to render as a tool line
+      const streamEl = document.getElementById('chat-assistant-streaming');
+      if (streamEl) {
+        const div = document.createElement('div');
+        div.className = 'chat-tool-line';
+        div.textContent = raw.subagent
+          ? `[${raw.subagent}] \u25b6 ${raw.name}...`
+          : `\u25b6 ${raw.name}...`;
+        streamEl.appendChild(div);
+        streamEl.scrollTop = streamEl.scrollHeight;
+        textDiv = null;
+        currentBlockText = '';
+      }
+      return;
     }
 
     if (typeof raw !== 'string') return;
@@ -2207,7 +2217,7 @@ function _streamChatResponse(todoId, jobId) {
         streamEl.appendChild(div);
         textDiv = null;
         currentBlockText = '';
-      } else if (line.startsWith('\u25b6 ') || line.includes('\u25b6 ')) {
+      } else if (line.startsWith('\u25b6 ')) {
         const div = document.createElement('div');
         div.className = 'chat-tool-line';
         div.textContent = line;
@@ -2603,6 +2613,22 @@ function _openItemStream(todoId, jobId) {
       pollJobs();
       return;
     }
+    // Handle structured tool call objects
+    if (typeof raw === 'object' && raw.__tool_call__) {
+      const toolLine = raw.subagent
+        ? `[${raw.subagent}] \u25b6 ${raw.name}...`
+        : `\u25b6 ${raw.name}...`;
+      parsedCount++;
+      const outEl = document.getElementById('checkon-bubble-' + todoId);
+      if (outEl) {
+        outEl.classList.add('has-content');
+        const div = document.createElement('div');
+        div.textContent = toolLine;
+        outEl.appendChild(div);
+        outEl.scrollTop = outEl.scrollHeight;
+      }
+      return;
+    }
     const line = parseStreamLine(raw);
     if (!line) return;
     if (parsedCount < existingCount) { parsedCount++; return; }
@@ -2619,8 +2645,8 @@ function _openItemStream(todoId, jobId) {
       outEl.appendChild(div);
       outEl.scrollTop = outEl.scrollHeight;
     }
-    // Summary: only message lines (no tool calls)
-    if (!line.includes('▶') && !line.startsWith('✓') && !line.startsWith('⚡')) {
+    // Summary: only message lines (no tool calls or status)
+    if (!line.startsWith('▶') && !line.startsWith('✓') && !line.startsWith('⚡')) {
       _clientJobSummary[todoId].push('⏺ ' + line);
       const sumEl = document.getElementById('checkon-summary-' + todoId);
       if (sumEl) {
@@ -2760,10 +2786,6 @@ function _restoreJobOutputs() {
 }
 
 function parseStreamLine(raw) {
-  // Server pre-formats lines via the Claude Agent SDK; raw is already a display string.
-  if (typeof raw === 'object' && raw.__tool_call__) {
-    return raw.subagent ? `[${raw.subagent}] \u25b6 ${raw.name}...` : `\u25b6 ${raw.name}...`;
-  }
   if (typeof raw !== 'string') return null;
   return raw.trim() || null;
 }
