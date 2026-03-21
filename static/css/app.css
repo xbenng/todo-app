@@ -506,6 +506,7 @@
     transition: transform 0.15s;
   }
   .swipe-active .swipe-reveal { opacity: 1; }
+  .swipe-active .swipe-reveal-delete { opacity: 0; }
   .swipe-active.swipe-left .swipe-reveal { opacity: 0; }
   .swipe-active.swipe-left .swipe-reveal-delete { opacity: 1; }
   .swipe-threshold .swipe-reveal-icon { transform: scale(1.4); }
