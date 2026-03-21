@@ -19,7 +19,7 @@ def _run_chat_local(job_id: str, message: str, cwd: str,
 
     # Build system prompt and MCP config from DB
     user_id = state._jobs.get(job_id, {}).get("user_id")
-    system_prompt = _build_system_prompt(todo_id, user_id)
+    system_prompt = _build_system_prompt(todo_id, user_id, message)
     cmd = [claude_bin, "-p", message, "--dangerously-skip-permissions",
            "--output-format", "stream-json", "--verbose"]
     if system_prompt:

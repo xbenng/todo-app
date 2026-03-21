@@ -473,7 +473,7 @@ class ChatAgent:
 
     def _run_loop(self, message: str) -> None:
         history = self._build_history(message)
-        system_prompt = _build_system_prompt(self.todo_id, self.user_id)
+        system_prompt = _build_system_prompt(self.todo_id, self.user_id, message)
         tools = self._get_tools()
         messages = self.backend.initial_messages(history, system_prompt)
 

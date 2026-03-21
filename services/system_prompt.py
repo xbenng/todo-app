@@ -1,6 +1,8 @@
 """System prompt construction for the chat agent.
 
 Assembles the system prompt from config, context files, and runtime state.
+Context files are filtered by command — each EA command only gets the
+context it needs (rules + its specific step).
 """
 
 import os
@@ -31,9 +33,41 @@ You also have access to MCP (Model Context Protocol) tools for connected service
 - When referencing information from external sources, include links where possible.
 """
 
+# Map command prefixes to the context files they need.
+# ea-rules.md is always included for any EA command.
+# Non-EA commands (regular chat) get all context files.
+_COMMAND_CONTEXT_MAP = {
+    "/ea update": ["ea-rules.md", "ea-update.md"],
+    "/ea workon": ["ea-rules.md", "ea-workon.md"],
+    "/ea checkon": ["ea-rules.md", "ea-checkon.md"],
+    "/ea consolidate": ["ea-rules.md", "ea-checkon.md"],
+    "/ea sync": ["ea-rules.md"],
+    "/ea triage": ["ea-rules.md"],
+}
 
-def _build_system_prompt(todo_id: str | None, user_id: str | None = None) -> str:
-    """Build a system prompt from per-user DB config or file-based fallback."""
+
+def _filter_context_files(ctx: dict[str, str], message: str | None) -> dict[str, str]:
+    """Filter context files based on the command in the message.
+
+    For EA commands, only include the relevant step file + shared rules.
+    For regular chat, include everything.
+    """
+    if not message:
+        return ctx
+
+    # Check if message matches any EA command prefix
+    for prefix, allowed_files in _COMMAND_CONTEXT_MAP.items():
+        if message.startswith(prefix):
+            return {name: content for name, content in ctx.items()
+                    if name in allowed_files or not name.startswith("ea-")}
+
+    # Regular chat — include everything
+    return ctx
+
+
+def _build_system_prompt(todo_id: str | None, user_id: str | None = None,
+                         message: str | None = None) -> str:
+    """Build a system prompt from per-user DB config, filtered by command."""
     parts = []
 
     if user_id:
@@ -44,8 +78,9 @@ def _build_system_prompt(todo_id: str | None, user_id: str | None = None) -> str
             parts.append(sp.strip())
         else:
             parts.append(_DEFAULT_SYSTEM_PROMPT.strip())
-        # 2. Context files from user_context_files table
+        # 2. Context files from user_context_files table (filtered by command)
         ctx = _db.get_context_files(user_id)
+        ctx = _filter_context_files(ctx, message)
         for name in sorted(ctx.keys()):
             content = ctx[name]
             if content and content.strip():
@@ -69,7 +104,7 @@ def _build_system_prompt(todo_id: str | None, user_id: str | None = None) -> str
     # 4. Current date
     parts.append(f"Today's date is {datetime.now().strftime('%Y-%m-%d')}.")
 
-    # 4. Todo context
+    # 5. Todo context
     if todo_id:
         parts.append(f"Current conversation is for todo item ID: {todo_id}")
 
