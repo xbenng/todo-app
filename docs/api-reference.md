@@ -12,7 +12,6 @@
    - [MCP](#mcp)
    - [Config](#config)
    - [History](#history)
-   - [Git](#git)
    - [Terminal](#terminal)
    - [EA (Executive Assistant)](#ea-executive-assistant)
    - [Utility](#utility)
@@ -34,9 +33,9 @@ All endpoints require authentication unless noted otherwise. Authentication is p
 
 - `POST /api/auth/register`
 - `POST /api/auth/login`
-- `GET /` (returns the login page if unauthenticated in DB mode)
+- `GET /` (returns the login page if unauthenticated)
 
-**File mode** (no `DATABASE_URL` environment variable set): All authentication is bypassed. Every request is treated as coming from a stub user `{"id": "local", "email": "local", "name": "Local User"}`. The auth endpoints return errors in this mode since they are not applicable.
+**CSRF Protection:** All POST, PUT, and DELETE endpoints require `Content-Type: application/json`. Requests without this header receive 415 Unsupported Media Type. This provides CSRF protection since HTML forms cannot set this header.
 
 ---
 
@@ -46,7 +45,7 @@ All endpoints require authentication unless noted otherwise. Authentication is p
 
 #### POST /api/auth/register
 
-Create a new user account. Only available in DB mode.
+Create a new user account.
 
 **Request Body:**
 ```json
@@ -70,7 +69,7 @@ Create a new user account. Only available in DB mode.
 Sets `session_token` cookie (httponly, SameSite=Lax, 30-day expiry).
 
 **Error Responses:**
-- `400` -- `{"error": "Email and password required"}` or `{"error": "Password must be at least 6 characters"}` or `{"error": "Auth not available in file mode"}`
+- `400` -- `{"error": "Email and password required"}` or `{"error": "Password must be at least 6 characters"}`
 - `409` -- `{"error": "Email already registered"}`
 - `500` -- `{"error": "<message>"}`
 
@@ -78,7 +77,7 @@ Sets `session_token` cookie (httponly, SameSite=Lax, 30-day expiry).
 
 #### POST /api/auth/login
 
-Authenticate an existing user. Only available in DB mode.
+Authenticate an existing user.
 
 **Request Body:**
 ```json
@@ -101,7 +100,6 @@ Authenticate an existing user. Only available in DB mode.
 Sets `session_token` cookie (httponly, SameSite=Lax, 30-day expiry).
 
 **Error Responses:**
-- `400` -- `{"error": "Auth not available in file mode"}`
 - `401` -- `{"error": "Invalid email or password"}`
 
 ---
@@ -116,7 +114,7 @@ Invalidate the current session.
 ```json
 {"ok": true}
 ```
-Deletes the `session_token` cookie. In DB mode, the server-side session is also deleted.
+Deletes the `session_token` cookie and the server-side session.
 
 ---
 
@@ -161,8 +159,7 @@ List all todos for the current user (active + completed).
 ```
 
 **Error Responses:**
-- `401` -- Not authenticated (DB mode only)
-
+- `401` -- Not authenticated
 ---
 
 #### POST /api/todos
@@ -176,7 +173,7 @@ Create a new todo item.
   "description": "string (optional, default \"\")",
   "priority": "high" | "medium" | "low" | "none" (optional, default "medium"),
   "section": "string (optional, default \"\")",
-  "before_id": "string (optional, file mode only -- insert before this item)"
+  "before_id": "string (optional -- insert before this item)"
 }
 ```
 
@@ -194,8 +191,7 @@ Create a new todo item.
 
 **Error Responses:**
 - `400` -- `{"error": "Title is required"}`
-- `401` -- Not authenticated (DB mode only)
-
+- `401` -- Not authenticated
 ---
 
 #### GET /api/todos/\<id\>
@@ -215,8 +211,7 @@ Get a single todo by ID.
 ```
 
 **Error Responses:**
-- `401` -- Not authenticated (DB mode only)
-- `404` -- `{"error": "Not found"}`
+- `401` -- Not authenticated- `404` -- `{"error": "Not found"}`
 
 ---
 
@@ -232,7 +227,7 @@ Update a todo item. Only the provided fields are changed; omitted fields are pre
   "status": "open" | "completed" (optional),
   "priority": "high" | "medium" | "low" | "none" (optional),
   "section": "string (optional)",
-  "mark_unread": "boolean (optional, DB mode -- marks chat as unread)"
+  "mark_unread": "boolean (optional -- marks chat as unread)"
 }
 ```
 
@@ -249,8 +244,7 @@ Update a todo item. Only the provided fields are changed; omitted fields are pre
 ```
 
 **Error Responses:**
-- `401` -- Not authenticated (DB mode only)
-- `404` -- `{"error": "Not found"}`
+- `401` -- Not authenticated- `404` -- `{"error": "Not found"}`
 
 **Notes:** Invalid `status` values (not `"open"` or `"completed"`) and invalid `priority` values (not in `{"high", "medium", "low", "none"}`) are silently ignored.
 
@@ -266,8 +260,7 @@ Delete a todo item.
 ```
 
 **Error Responses:**
-- `401` -- Not authenticated (DB mode only)
-- `404` -- `{"error": "Not found"}`
+- `401` -- Not authenticated- `404` -- `{"error": "Not found"}`
 
 ---
 
@@ -294,8 +287,7 @@ Search todos by text query across titles and descriptions (case-insensitive subs
 Returns an empty array if `q` is empty.
 
 **Error Responses:**
-- `401` -- Not authenticated (DB mode only)
-
+- `401` -- Not authenticated
 ---
 
 #### POST /api/todos/reorder
@@ -318,8 +310,7 @@ Move a todo item up or down within or across sections.
 
 **Error Responses:**
 - `400` -- `{"error": "id and direction (up/down) required"}`
-- `401` -- Not authenticated (DB mode only)
-- `404` -- `{"error": "Not found or not an active item"}`
+- `401` -- Not authenticated- `404` -- `{"error": "Not found or not an active item"}`
 
 ---
 
@@ -341,8 +332,7 @@ Move a todo to the top of its section.
 
 **Error Responses:**
 - `400` -- `{"error": "id required"}`
-- `401` -- Not authenticated (DB mode only)
-- `404` -- `{"error": "Not found or not an active item"}`
+- `401` -- Not authenticated- `404` -- `{"error": "Not found or not an active item"}`
 
 ---
 
@@ -363,8 +353,7 @@ Sort all todos within a section by priority (high > medium > low > none).
 ```
 
 **Error Responses:**
-- `401` -- Not authenticated (DB mode only)
-
+- `401` -- Not authenticated
 ---
 
 #### POST /api/todos/drop
@@ -388,33 +377,7 @@ If `before_id` is provided, the item is inserted before that item and inherits i
 
 **Error Responses:**
 - `400` -- `{"error": "id required"}`
-- `401` -- Not authenticated (DB mode only)
-- `404` -- `{"error": "Not found or not an active item"}`
-
----
-
-#### POST /api/todos/\<id\>/mark-read
-
-Replace the `updated ...` tag in the todo title with `read <timestamp>`.
-
-**Request Body:** None
-
-**Response (200):**
-```json
-{
-  "id": "string",
-  "title": "string (updated)",
-  "description": "string",
-  "status": "string",
-  "priority": "string",
-  "section": "string"
-}
-```
-
-**Error Responses:**
-- `404` -- `{"error": "Not found"}`
-
-**Notes:** File mode only. Uses regex to replace backtick-delimited `updated ...` tags in the title.
+- `401` -- Not authenticated- `404` -- `{"error": "Not found or not an active item"}`
 
 ---
 
@@ -426,7 +389,7 @@ Return the latest modification time for change detection (polling).
 ```json
 {"mtime": number}
 ```
-In DB mode, returns the max `updated_at` timestamp for the user's todos. In file mode, returns the filesystem mtime of the todo files.
+Returns the max `updated_at` timestamp for the user's todos.
 
 ---
 
@@ -434,7 +397,7 @@ In DB mode, returns the max `updated_at` timestamp for the user's todos. In file
 
 #### GET /api/sections
 
-Return sections for the current user, ordered by position. DB mode only.
+Return sections for the current user, ordered by position.
 
 **Response (200):**
 ```json
@@ -446,13 +409,13 @@ Return sections for the current user, ordered by position. DB mode only.
   }
 ]
 ```
-Returns `[]` in file mode or if unauthenticated.
+Returns `[]` if unauthenticated.
 
 ---
 
 #### PUT /api/sections
 
-Update a section's directives. DB mode only.
+Update a section's directives.
 
 **Request Body:**
 ```json
@@ -491,8 +454,7 @@ Rename a section across all todos.
 
 **Error Responses:**
 - `400` -- `{"error": "old_name and new_name required"}`
-- `401` -- Not authenticated (DB mode only)
-- `404` -- `{"error": "Section not found"}`
+- `401` -- Not authenticated- `404` -- `{"error": "Section not found"}`
 
 ---
 
@@ -515,8 +477,7 @@ Move a section (and all its todos) before another section.
 
 **Error Responses:**
 - `400` -- `{"error": "section required"}`
-- `401` -- Not authenticated (DB mode only)
-- `404` -- `{"error": "Section not found"}` (file mode only)
+- `401` -- Not authenticated
 
 ---
 
@@ -530,7 +491,7 @@ Send a chat message for a todo item, starting or resuming an AI conversation.
 ```json
 {
   "message": "string (required)",
-  "resume_conv": "integer (optional, DB mode -- resume a specific conversation number)"
+  "resume_conv": "integer (optional -- resume a specific conversation number)"
 }
 ```
 
@@ -545,8 +506,7 @@ The `job_id` can be used with the SSE stream endpoint (`/api/jobs/<id>/stream`) 
 
 **Error Responses:**
 - `400` -- `{"error": "message is required"}`
-- `401` -- Not authenticated (DB mode only)
-- `404` -- `{"error": "Todo not found"}`
+- `401` -- Not authenticated- `404` -- `{"error": "Todo not found"}`
 
 ---
 
@@ -577,7 +537,7 @@ Return the persisted chat for a todo item, including any running job reference.
 
 #### DELETE /api/chats/\<id\>
 
-Restart the chat for a todo -- starts a new conversation. In DB mode, old messages are preserved in the conversation history. In file mode, messages are deleted.
+Restart the chat for a todo -- starts a new conversation. Old messages are preserved in the conversation history.
 
 **Response (200):**
 ```json
@@ -588,7 +548,7 @@ Restart the chat for a todo -- starts a new conversation. In DB mode, old messag
 
 #### GET /api/chats/\<id\>/conversations
 
-List all conversations for a todo. DB mode only.
+List all conversations for a todo.
 
 **Response (200):**
 ```json
@@ -604,13 +564,11 @@ List all conversations for a todo. DB mode only.
   "current": number
 }
 ```
-Returns `{"conversations": []}` in file mode.
-
 ---
 
 #### GET /api/chats/\<id\>/conversations/\<num\>
 
-Get messages from a specific past conversation. DB mode only.
+Get messages from a specific past conversation.
 
 **Response (200):**
 ```json
@@ -623,8 +581,6 @@ Get messages from a specific past conversation. DB mode only.
   ]
 }
 ```
-Returns `{"messages": []}` in file mode.
-
 ---
 
 #### GET /api/chats/unread
@@ -789,7 +745,7 @@ Approve or deny a pending MCP tool execution. Tools that require user approval e
 
 #### PUT /api/mcp/servers
 
-Enable or disable an MCP server for the current user. DB mode only.
+Enable or disable an MCP server for the current user..
 
 **Request Body:**
 ```json
@@ -814,7 +770,7 @@ Enable or disable an MCP server for the current user. DB mode only.
 
 #### PUT /api/mcp/tools
 
-Set tool disabled or auto-approval state. DB mode only.
+Set tool disabled or auto-approval state..
 
 **Request Body:**
 ```json
@@ -839,7 +795,7 @@ Set tool disabled or auto-approval state. DB mode only.
 
 #### GET /api/mcp/accounts/\<server\>
 
-Get all accounts for a server. DB mode only.
+Get all accounts for a server..
 
 **Response (200):**
 ```json
@@ -866,7 +822,7 @@ Passwords are redacted to `"***"`. OAuth token objects are replaced with an `oau
 
 #### POST /api/mcp/accounts/\<server\>
 
-Add a new account for a server. DB mode only.
+Add a new account for a server..
 
 **Request Body:** Object with fields matching the server's `account_fields` from the registry.
 
@@ -888,7 +844,7 @@ Add a new account for a server. DB mode only.
 
 #### PUT /api/mcp/accounts/\<server\>/\<id\>
 
-Update an existing account. DB mode only.
+Update an existing account..
 
 **Request Body:** Object with fields to update. Passwords set to `"***"` are ignored (preserves existing value).
 
@@ -907,7 +863,7 @@ Update an existing account. DB mode only.
 
 #### DELETE /api/mcp/accounts/\<server\>/\<id\>
 
-Delete an account. DB mode only.
+Delete an account..
 
 **Response (200):**
 ```json
@@ -1031,7 +987,7 @@ Update server configuration. Merges provided fields into existing config.
 
 #### GET /api/history
 
-Return recent version history for the current user. DB mode only.
+Return recent version history for the current user..
 
 **Response (200):**
 ```json
@@ -1048,13 +1004,11 @@ Return recent version history for the current user. DB mode only.
   ]
 }
 ```
-Returns `{"entries": []}` in file mode.
-
 ---
 
 #### GET /api/todos/\<id\>/history
 
-Return version history for a specific todo item. DB mode only.
+Return version history for a specific todo item..
 
 **Response (200):**
 ```json
@@ -1071,13 +1025,11 @@ Return version history for a specific todo item. DB mode only.
   ]
 }
 ```
-Returns `{"entries": []}` in file mode.
-
 ---
 
 #### POST /api/history/\<id\>/restore
 
-Restore a todo from a history snapshot. DB mode only.
+Restore a todo from a history snapshot..
 
 **Response (200):**
 ```json
@@ -1094,81 +1046,6 @@ Restore a todo from a history snapshot. DB mode only.
 **Error Responses:**
 - `400` -- `{"error": "Not available"}`
 - `404` -- `{"error": "History entry not found"}`
-
----
-
-### Git
-
-These endpoints operate on the git repository containing the todo file. File mode only.
-
-#### GET /api/git/log
-
-Return recent git commit log for the todo files (up to 30 entries).
-
-**Response (200):**
-```json
-{
-  "commits": [
-    {
-      "hash": "string (full SHA)",
-      "date": "string (ISO-like date)",
-      "message": "string"
-    }
-  ],
-  "git_dir": "string (absolute path to git root)"
-}
-```
-
-**Error Responses:**
-- `404` -- `{"error": "No git repo found for todo file"}`
-- `500` -- `{"error": "<message>"}`
-
----
-
-#### POST /api/git/commit
-
-Commit current todo files to git.
-
-**Request Body:**
-```json
-{
-  "message": "string (optional, defaults to 'Manual save YYYY-MM-DD HH:MM')"
-}
-```
-
-**Response (200):**
-```json
-{"ok": true, "message": "string"}
-```
-
-**Error Responses:**
-- `404` -- `{"error": "No git repo found"}`
-- `500` -- `{"error": "<message>"}`
-
-**Notes:** If there are no changes, returns `{"ok": true, "message": "No changes to commit"}`.
-
----
-
-#### POST /api/git/rollback
-
-Rollback todo files to a specific commit. Checks out the files from that commit and creates a new rollback commit.
-
-**Request Body:**
-```json
-{
-  "hash": "string (required -- commit SHA)"
-}
-```
-
-**Response (200):**
-```json
-{"ok": true}
-```
-
-**Error Responses:**
-- `400` -- `{"error": "hash is required"}`
-- `404` -- `{"error": "No git repo found"}`
-- `500` -- `{"error": "<message>"}`
 
 ---
 
@@ -1334,22 +1211,6 @@ Unified tool execution endpoint. Executes a built-in or MCP tool directly.
 - `401` -- `{"error": "Not authenticated"}`
 
 **Notes:** Tool names for MCP tools use the `mcp__{server}__{tool_name}` naming convention.
-
----
-
-#### POST /api/undo
-
-Restore the previous file state from the undo stack. File mode only.
-
-**Response (200):**
-```json
-{"ok": true}
-```
-
-**Error Responses:**
-- `400` -- `{"error": "Nothing to undo"}`
-
-**Notes:** The undo stack holds up to 30 entries. Only applies to file-mode todo operations.
 
 ---
 
@@ -1573,6 +1434,7 @@ All API errors use a consistent JSON format:
 | `401` | Not authenticated -- missing or invalid session/token |
 | `404` | Not found -- resource does not exist |
 | `409` | Conflict -- duplicate resource (e.g., email already registered) |
+| `415` | Unsupported Media Type -- missing `Content-Type: application/json` header on POST/PUT/DELETE |
 | `500` | Server error -- unexpected failure |
 
 ### Examples
@@ -1591,7 +1453,6 @@ All API errors use a consistent JSON format:
 {"error": "Not found"}
 {"error": "Todo not found"}
 {"error": "No pending approval with that ID"}
-{"error": "No git repo found for todo file"}
 
 // 409
 {"error": "Email already registered"}

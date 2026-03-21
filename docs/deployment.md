@@ -12,7 +12,7 @@ Turnkey instructions for deploying Dossie from scratch, plus documentation of th
 | Node.js | 18+ | Yes | Building MCP servers (Slack, IMAP, Smartsheet) |
 | npm | 9+ | Yes | Package management for MCP servers |
 | git | 2.x | Yes | Cloning MCP server repos during build |
-| PostgreSQL | 14+ | For multi-user | Database backend (schema auto-created on first run) |
+| PostgreSQL | 14+ | Yes | Database backend (schema auto-created on first run) |
 | tmux | 3.x | For terminals | WebSocket terminal session persistence |
 | Caddy | 2.x | Optional | Reverse proxy with automatic TLS |
 
@@ -40,25 +40,15 @@ python app.py --host 0.0.0.0 --port 5111
 # Open http://localhost:5111
 ```
 
-### File Mode (No Database)
-
-To run without PostgreSQL (single-user, no auth):
-
-```bash
-pip install -r requirements.txt
-python app.py              # uses todos.md in current directory
-python app.py path/to/my-todos.md  # custom file path
-```
-
 ---
 
 ## Environment Variables
 
-### Required (for production / multi-user)
+### Required
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `DATABASE_URL` | PostgreSQL connection string. Enables DB mode (multi-user, auth). If unset, runs in file mode. | `postgresql://user:pass@localhost/todos` |
+| `DATABASE_URL` | PostgreSQL connection string. Required — the app exits with an error if unset. | `postgresql://user:pass@localhost/todos` |
 | `OAUTH_STATE_SECRET` | Random secret for HMAC-signing OAuth state parameters. **Must be set in production** — the default is a hardcoded insecure string. Generate with `openssl rand -hex 32`. | `a1b2c3d4e5f6...` |
 | `DOMAIN_NAME` | Public domain for OAuth redirect URIs. Required if using OAuth integrations (Slack, Google Calendar, Atlassian). | `yourdomain.com` |
 
@@ -264,10 +254,7 @@ This script reads markdown files from `todos-config/context/` and upserts them i
 ## CLI Arguments
 
 ```
-python app.py [OPTIONS] [TODO_FILE]
-
-Positional:
-  TODO_FILE          Path to markdown todo file (default: todos.md)
+python app.py [OPTIONS]
 
 Options:
   --host HOST        Host to bind to (default: 0.0.0.0)
@@ -279,8 +266,8 @@ Options:
 ## Startup Sequence
 
 1. Load `.env` file (manual parser, not python-dotenv)
-2. If `DATABASE_URL` is set: initialize connection pool, run migrations, set `_USE_DB = True`
-3. If no `DATABASE_URL`: create todo markdown file if missing, ensure config directory
+2. Require `DATABASE_URL` — exit with error if unset
+3. Initialize connection pool, run migrations
 4. Register `atexit` handler to stop all MCPManagers on shutdown
 5. Recover any surviving tmux sessions from previous runs (`_tmux_recover_sessions()`)
 6. Start Flask with `debug=False, use_reloader=True` on configured host:port
@@ -302,7 +289,7 @@ What exists in the repo today:
 | **Secrets management** | `.env` file (gitignored, not tracked) |
 | **Database migrations** | Auto-applied on startup, existence-check pattern, no versioning |
 | **Monitoring** | None — no health check endpoint, no metrics, no alerting |
-| **Logging** | `print()` to stdout + unrotated `todo-app.log` file |
+| **Logging** | Python logging module with structured output |
 | **Backup** | None — no automated backup strategy |
 | **CI/CD** | None — no automated testing or deployment pipeline |
 

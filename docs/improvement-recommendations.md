@@ -18,6 +18,8 @@
 
 ### 2. No CSRF Protection
 
+> **Status: COMPLETE** — SameSite=Strict cookies + Content-Type: application/json enforcement on POST/PUT/DELETE.
+
 - **Finding:** Session tokens are stored as cookies, but no CSRF tokens are validated on state-changing endpoints (POST, PUT, DELETE).
 - **Risk:** Cross-site request forgery on all state-changing API endpoints. A malicious page could trigger todo creation, deletion, or configuration changes via the user's session cookie.
 - **Fix:** Add `SameSite=Strict` attribute to the `session_token` cookie + validate a custom header (e.g., `X-Requested-With: XMLHttpRequest`) on state-changing routes. The inline JS already sends JSON with `Content-Type: application/json` which provides partial protection, but explicit validation is needed.
@@ -48,6 +50,8 @@
 ## Priority 2: High (Maintainability)
 
 ### 5. Monolithic `app.py` (9,713 Lines)
+
+> **Status: COMPLETE** — Decomposed into 21 files. app.py is now 127 lines. Services, routes, state, and schemas in separate modules.
 
 - **Finding:** All routes, classes (`MCPManager`, `ChatAgent`), business logic, and ~5,137 lines of inline HTML/CSS/JS are in a single file. The inline `HTML_PAGE` string (lines 4528-9665) alone is larger than most web applications.
 - **Risk:** Merge conflicts on any change, extremely hard to navigate, impossible to test individual components in isolation, no separation of concerns.
@@ -82,12 +86,16 @@
 
 ### 6. Dual-Mode Branching Throughout Codebase
 
+> **Status: COMPLETE** — File mode deprecated. DATABASE_URL required. 816 lines of branching removed.
+
 - **Finding:** `if _USE_DB` conditionals are scattered across route handlers and tool execution. Every operation has two code paths (file-based vs database), roughly doubling maintenance burden.
 - **Risk:** Bugs in one mode go undetected when testing the other. Feature additions require implementing in both modes. The file mode lacks many DB mode features (sections, history restore, MCP preferences).
 - **Fix:** Define a `StorageBackend` protocol/ABC with `FileBackend` and `DBBackend` implementations. Inject the active backend at startup via app config. Route handlers call `backend.create_todo()` without branching. Consider deprecating file mode if only DB mode is used in production.
 - **Effort:** Large — requires defining the interface, implementing both backends, and updating all call sites.
 
 ### 7. No Request Validation Framework
+
+> **Status: COMPLETE** — Pydantic v2 with 18 request models and @validate_request decorator in schemas.py.
 
 - **Finding:** Every route manually parses `request.json` with `data.get("field", "").strip()`. Validation is inconsistent — some routes check for empty titles, others don't. Invalid priority/status values silently default rather than returning errors.
 - **Risk:** Silent data corruption, inconsistent error messages across endpoints, no auto-generated API documentation.
@@ -151,6 +159,8 @@
 
 ### 12. Inconsistent Error Handling
 
+> **Status: COMPLETE** — Python logging module replaces print(). Global error handlers for 500/404/405. No tracebacks exposed.
+
 - **Finding:** Errors are logged via `print()` statements (no structured logging). Error responses vary in shape: some return `{"error": "..."}` with HTTP 400/401/404, others return `{"ok": false}`. The OAuth callback returns raw HTML with Python tracebacks on error. Some exceptions are silently caught and ignored.
 - **Risk:** Debugging is difficult. Error tracebacks leak internal details to users. Silent failures mask bugs.
 - **Fix:**
@@ -165,6 +175,8 @@
 ## Priority 4: Lower (Enhancement)
 
 ### 13. Inline Frontend with No Build Tooling
+
+> **Status: PARTIAL** — Phase 1 complete: HTML/CSS/JS extracted to templates/ and static/. Phase 2 (Vite/TypeScript) not done.
 
 - **Finding:** ~5,137 lines of HTML, CSS, and JavaScript are embedded as a Python string literal in `app.py` (lines 4528-9665). There's no type checking, no minification, no tree-shaking, no hot reload for frontend development. External dependencies (marked, xterm.js, CodeMirror, ldrs) are loaded via CDN `<script>` tags.
 - **Risk:** Frontend bugs are hard to catch. No IDE support (syntax highlighting, autocomplete) for JS inside a Python string. Every frontend change requires restarting the Python server.
@@ -197,23 +209,23 @@
 
 ## Summary
 
-| Priority | # | Issue | Effort | Impact |
-|----------|---|-------|--------|--------|
-| Critical | 1 | Hardcoded OAuth secret | Small | Security |
-| Critical | 2 | No CSRF protection | Small | Security |
-| Critical | 3 | No rate limiting | Medium | Security + Cost |
-| Critical | 4 | Global state not process-safe | Small-Large | Stability |
-| High | 5 | Monolithic app.py | Large | Maintainability |
-| High | 6 | Dual-mode branching | Large | Maintainability |
-| High | 7 | No request validation | Medium | Data integrity |
-| High | 8 | No test coverage | Large | Reliability |
-| Medium | 9 | Unbounded job accumulation | Small | Memory |
-| Medium | 10 | MCPManager lifecycle leaks | Small | Resources |
-| Medium | 11 | No connection pool timeout | Small-Medium | Stability |
-| Medium | 12 | Inconsistent error handling | Medium | Debuggability |
-| Lower | 13 | Inline frontend | Medium-Large | Developer experience |
-| Lower | 14 | Session management gaps | Small | Security |
-| Lower | 15 | History compaction context loss | Medium | AI quality |
+| Priority | # | Issue | Effort | Impact | Status |
+|----------|---|-------|--------|--------|--------|
+| Critical | 1 | Hardcoded OAuth secret | Small | Security | |
+| Critical | 2 | No CSRF protection | Small | Security | COMPLETE |
+| Critical | 3 | No rate limiting | Medium | Security + Cost | |
+| Critical | 4 | Global state not process-safe | Small-Large | Stability | |
+| High | 5 | Monolithic app.py | Large | Maintainability | COMPLETE |
+| High | 6 | Dual-mode branching | Large | Maintainability | COMPLETE |
+| High | 7 | No request validation | Medium | Data integrity | COMPLETE |
+| High | 8 | No test coverage | Large | Reliability | |
+| Medium | 9 | Unbounded job accumulation | Small | Memory | |
+| Medium | 10 | MCPManager lifecycle leaks | Small | Resources | |
+| Medium | 11 | No connection pool timeout | Small-Medium | Stability | |
+| Medium | 12 | Inconsistent error handling | Medium | Debuggability | COMPLETE |
+| Lower | 13 | Inline frontend | Medium-Large | Developer experience | PARTIAL |
+| Lower | 14 | Session management gaps | Small | Security | |
+| Lower | 15 | History compaction context loss | Medium | AI quality | |
 
 ### Recommended Starting Order
 

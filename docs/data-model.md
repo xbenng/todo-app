@@ -383,7 +383,7 @@ erDiagram
 
 ## 3. In-Memory State
 
-These global variables are defined in `app.py` and hold runtime state that does not persist across server restarts.
+These global variables are defined in `state.py` and hold runtime state that does not persist across server restarts.
 
 | Variable | Type | Lifecycle | Purpose |
 |----------|------|-----------|---------|
@@ -392,8 +392,6 @@ These global variables are defined in `app.py` and hold runtime state that does 
 | `_mcp_managers_lock` | `threading.Lock` | Created at module load; lives for process lifetime | Synchronizes access to `_mcp_managers` dict |
 | `_pending_approvals` | `dict[str, dict]` | Created when a tool call requires approval; removed after approval/denial/timeout | Runtime tool approval queue. Each value: `{event, approved, server_name, tool_name}` where `event` is a `threading.Event` |
 | `_approvals_lock` | `threading.Lock` | Created at module load; lives for process lifetime | Synchronizes access to `_pending_approvals` dict |
-| `_undo_stack` | `deque[tuple[list[dict], list[dict]]]` | Created at module load; used in file mode only | Global undo stack for file-based mode. Each entry is `(before_todos, after_todos)`. Max 30 entries. |
-| `_undo_stacks` | `dict[str, deque]` | Entries created per user on first undo-eligible action in DB mode | Per-user undo stacks for database mode. Keyed by `user_id`. |
 | `_pty_sessions` | `dict[str, dict]` | Created when a PTY session is spawned; removed when session ends | Active pseudo-terminal sessions. Each value: `{id, todo_id, title, tmux_target, alive, created_at, needs_auto_send, resume_id}` |
 | `_user_temp_dirs` | `dict[str, str]` | Created when MCP config files are written to temp dirs; cleaned up on manager stop | Per-user temporary directories for MCP server config files. Keyed by `user_id`. |
 

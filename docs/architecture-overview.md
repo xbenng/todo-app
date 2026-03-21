@@ -2,7 +2,7 @@
 
 ## 1. Product Description
 
-Dossie is a self-hosted, AI-powered executive assistant and todo management system. It is built as a single-file Flask monolith (`app.py`, ~9,700 lines) with an embedded single-page application (vanilla HTML/CSS/JS inlined in the same file).
+Dossie is a self-hosted, AI-powered executive assistant and todo management system. It is built as a modular Flask application using blueprints and service modules, with a separate single-page application frontend (vanilla HTML/CSS/JS in `templates/` and `static/`).
 
 ### Key Capabilities
 
@@ -30,7 +30,7 @@ graph TD
     Browser -- "SSE<br/>(Job Streams)" --> Flask
     Browser -- "WebSocket<br/>(Terminal I/O)" --> Flask
 
-    Flask["Flask Monolith<br/>(app.py)"]
+    Flask["Flask App<br/>(Modular)"]
 
     Flask -- "psycopg2<br/>ThreadedConnectionPool" --> PG["PostgreSQL"]
     Flask -- "asyncio bridge<br/>(run_coroutine_threadsafe)" --> MCP["MCP Servers<br/>(Child Processes)"]
@@ -54,82 +54,86 @@ Dossie runs as a single process with a single worker. This is a hard requirement
 |---|---|---|
 | Application | Python 3.11-slim + Node.js (for MCP servers) | Single Docker container |
 | Reverse proxy | Caddy | TLS termination, WebSocket proxying |
-| Database | PostgreSQL | Required for multi-user; optional in file mode |
+| Database | PostgreSQL | Required |
 | Worker model | Single-process, single-worker | In-memory state prevents horizontal scaling |
 
 The container image bundles both the Python runtime and a Node.js runtime. Node.js is required because MCP servers (Slack, IMAP, CalDAV, Smartsheet, Atlassian) are typically implemented as Node.js processes launched via `stdio` transport.
 
 ---
 
-## 4. Operational Modes
+## 4. Operational Mode
 
-Dossie supports two mutually exclusive operational modes, selected at startup based on the presence of the `DATABASE_URL` environment variable.
-
-### 4a. File Mode
-
-Active when `DATABASE_URL` is **not** set.
-
-- Todos are read from and written to a markdown file (`todos.md` by default, configurable via CLI argument)
-- Chat conversations are stored in `todos-chats.json`
-- Configuration is stored in a `todos-config/` directory alongside the todo file
-- Undo history is held in a global in-memory `deque` (max 30 entries)
-- No authentication -- all requests are served as a stub `"local"` user
-- Single-user only
-
-### 4b. DB Mode
-
-Active when `DATABASE_URL` **is** set.
-
-- All data (users, todos, sections, chats, messages, config, context files, MCP preferences, server accounts) is stored in PostgreSQL
-- Authentication via bcrypt-hashed passwords + session tokens stored in cookies
-- Per-user data isolation -- all queries are scoped by `user_id`
-- Per-user undo stacks held in `_undo_stacks` dict (keyed by `user_id`)
-- Per-user MCP manager instances cached in `_mcp_managers` dict
-
-The mode is determined once at startup (`app.py:9682-9686`) and stored in the global `_USE_DB` flag, which gates behavior throughout the codebase.
+Dossie requires PostgreSQL (`DATABASE_URL` environment variable). All data -- users, todos, sections, chats, messages, config, context files, MCP preferences, server accounts -- is stored in the database. Authentication uses bcrypt-hashed passwords with session tokens stored in cookies. All queries are scoped by `user_id` for per-user data isolation. Per-user undo stacks are held in `_undo_stacks` (keyed by `user_id`), and per-user MCP manager instances are cached in `_mcp_managers`.
 
 ---
 
 ## 5. Component Architecture
 
-### 5a. Flask Application (`app.py` -- 9,713 lines)
+### 5a. Flask Application (Modular Structure)
 
-The entire server is a single-file Flask application with an embedded SPA. It uses `flask_sock` for WebSocket support. There are no Blueprints or separate route modules -- all routes, classes, utilities, and the full HTML/CSS/JS frontend are in one file.
+The server is a modular Flask application using blueprints for route organization and service modules for business logic. It uses `flask_sock` for WebSocket support. Shared mutable state is isolated in `state.py`, and request validation is centralized in `schemas.py`.
 
-#### Code Map
+#### Module Map
 
-| Line Range | Contents |
-|---|---|
-| 1--113 | Imports, `.env` loading, globals (`_USE_DB`, `_undo_stack`, `_jobs`, `_pty_sessions`), `get_current_user()`, `require_user()` |
-| 114--353 | `MCPManager` class |
-| 354--892 | MCP utilities: tool filtering, per-user permissions, config loading, OAuth token handling, server registry |
-| 893--1058 | File-mode markdown parser (`_parse_todo_file`), writer (`_write_todo_file`), undo system (`_push_undo`, `_pop_undo`) |
-| 1059--1130 | Auth routes: `POST /api/auth/register`, `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/me`, `GET /` (serves login or app page) |
-| 1132--1717 | Todo CRUD routes, sections routes, `POST /api/execute-tool` endpoint |
-| 1719--1832 | Claude CLI subprocess runner (`_run_claude_job`) |
-| 1833--2131 | Tool definitions (`_get_tool_definitions`) and `_execute_tool()` dispatch function |
-| 2132--2305 | Sub-agent spawning (`_execute_spawn_agents`) |
-| 2307--2435 | System prompt builder (`_build_system_prompt`) and related utilities |
-| 2436--2835 | `ChatAgent` class |
-| 2838--3206 | Local chat runner (`_run_chat_local`), provider resolver, job helpers |
-| 3208--3388 | Chat routes: `POST /api/chat`, `GET /api/chats`, `GET /api/chats/<id>`, `DELETE /api/chats/<id>` |
-| 3389--3588 | Config routes, MCP status/reconnect/approve routes |
-| 3590--3941 | MCP server accounts and OAuth routes |
-| 3942--4089 | History and Git routes |
-| 4090--4295 | Terminal routes and WebSocket handler (`_terminal_io_loop`) |
-| 4296--4449 | EA update route, jobs routes |
-| 4451--4527 | `LOGIN_PAGE` -- inline HTML for login/registration form |
-| 4528--9665 | `HTML_PAGE` -- full SPA (inline CSS ~1,000 lines, inline JS ~4,000 lines) |
-| 9667--9713 | Main entry point: arg parsing, DB init, MCP cleanup registration, tmux recovery, `app.run()` |
+```
+app.py (127 lines) — Entry point: .env loading, Flask setup, blueprint registration,
+                      CSRF middleware, error handlers, startup
+state.py (27 lines) — Shared global state: _jobs, _mcp_managers, _pending_approvals, _pty_sessions
+schemas.py (226 lines) — Pydantic v2 request validation (18 models + @validate_request decorator)
+db.py (1,088 lines) — PostgreSQL layer (unchanged)
 
-#### Key Globals
+services/ (2,196 lines):
+  mcp_manager.py — MCPManager class: async MCP connections via background asyncio loop
+  mcp_utils.py — Registry, OAuth refresh, config building, tool permissions
+  chat_agent.py — ChatAgent class: agentic loop for Anthropic/OpenAI
+  chat_runner.py — Chat job orchestration, provider resolution
+  tools.py — Tool definitions, execution engine, sub-agent spawning
+  system_prompt.py — System prompt assembly from DB config + context files
+  shell_utils.py — Process management utilities
+  terminal.py — PTY/tmux session management
 
-- `_USE_DB: bool` -- gates file-mode vs. DB-mode behavior
+routes/ (1,912 lines, 8 Flask Blueprints):
+  auth.py — register, login, logout, me
+  todos.py — CRUD, sections, search, reorder
+  chat.py — messaging, conversations, unread
+  config.py — config, MCP management, OAuth
+  history.py — version history, restore
+  terminal.py — terminal creation, WebSocket
+  jobs.py — job list, stream, kill
+  ea.py — EA update endpoints
+
+templates/ — login.html, app.html, oauth_complete.html
+static/ — css/app.css, js/app.js, fonts, favicons
+```
+
+#### Key Globals (in `state.py`)
+
 - `_jobs: dict[str, dict]` -- in-memory job tracker for all long-running operations
 - `_pty_sessions: dict[str, dict]` -- registry of active tmux terminal sessions
 - `_mcp_managers: dict[str, MCPManager]` -- per-user MCP manager instances
 - `_mcp_managers_lock: threading.Lock` -- synchronizes manager creation/teardown
-- `_undo_stack / _undo_stacks` -- undo history (global for file mode, per-user dict for DB mode)
+- `_pending_approvals: dict` -- pending MCP tool approval requests
+- `_undo_stacks: dict` -- per-user undo history (keyed by `user_id`)
+
+---
+
+### 5a-bis. Cross-Cutting Concerns
+
+#### CSRF Protection
+
+All mutating API endpoints enforce CSRF protection via Content-Type enforcement: requests must carry `Content-Type: application/json`, which cannot be sent cross-origin without a CORS preflight. Session cookies are set with `SameSite=Strict` to prevent cross-site request attachment.
+
+#### Pydantic Request Validation
+
+The `schemas.py` module defines 18 Pydantic v2 models covering all API request bodies. The `@validate_request` decorator parses and validates incoming JSON against the appropriate model before the route handler runs, returning structured 422 errors on validation failure.
+
+#### Structured Logging
+
+All server-side logging uses the Python `logging` module (no `print()` calls). Log messages include module context for traceability.
+
+#### Global Error Handlers
+
+`app.py` registers error handlers for 500, 404, and 405 status codes. In all cases, responses are JSON objects with an `"error"` key. Stack traces are logged server-side but never exposed to clients.
 
 ---
 
@@ -168,7 +172,7 @@ Functions are organized by domain, all following the same pattern: acquire conne
 
 ---
 
-### 5c. MCPManager (`app.py:114--353`)
+### 5c. MCPManager (`services/mcp_manager.py`)
 
 The `MCPManager` class bridges Flask's synchronous request handlers with the async MCP client library. Each user gets their own `MCPManager` instance, cached in the global `_mcp_managers` dict.
 
@@ -208,7 +212,7 @@ MCP tools are namespaced as `mcp__{server}__{tool}` to avoid collisions across s
 
 ---
 
-### 5d. ChatAgent (`app.py:2436--2835`)
+### 5d. ChatAgent (`services/chat_agent.py`)
 
 The `ChatAgent` class implements the core agentic AI loop. It handles conversation history, system prompts, streaming output, tool execution, persistence, and cost tracking.
 
@@ -321,7 +325,7 @@ Killing a job involves:
 
 ---
 
-### 5f. Terminal/PTY Manager (`app.py:4090--4295`)
+### 5f. Terminal/PTY Manager (`services/terminal.py`, `routes/terminal.py`)
 
 The terminal subsystem provides browser-based shell access via tmux-backed pseudo-terminal sessions, bridged to the client over WebSocket.
 
