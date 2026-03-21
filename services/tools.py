@@ -339,11 +339,7 @@ def _run_subagent(job_id: str, todo_id: str | None, provider: dict,
         agent = ChatAgent(sub_job_id, todo_id, provider, depth=depth, persist=False)
         agent.run(prompt)
 
-        # Forward only the assistant's text output (not tool calls or status lines)
-        for line in agent.assistant_text_lines:
-            if line.strip():
-                job["output_lines"].append(f"[{label}] {line}")
-
+        emit("Done.")
         return {
             "label": label, "result": agent.assistant_text, "error": None,
             "input_tokens": agent.total_input_tokens,
