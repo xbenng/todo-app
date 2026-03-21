@@ -2186,6 +2186,12 @@ function _streamChatResponse(todoId, jobId) {
       return;
     }
 
+    if (typeof raw === 'object' && raw.__tool_call__) {
+      const label = raw.subagent ? `[${raw.subagent}] \u25b6 ${raw.name}...` : `\u25b6 ${raw.name}...`;
+      raw = label;
+      // fall through to render as a tool line
+    }
+
     if (typeof raw !== 'string') return;
     const line = raw;
     const cur = _chatSessions[todoId];
@@ -2755,6 +2761,9 @@ function _restoreJobOutputs() {
 
 function parseStreamLine(raw) {
   // Server pre-formats lines via the Claude Agent SDK; raw is already a display string.
+  if (typeof raw === 'object' && raw.__tool_call__) {
+    return raw.subagent ? `[${raw.subagent}] \u25b6 ${raw.name}...` : `\u25b6 ${raw.name}...`;
+  }
   if (typeof raw !== 'string') return null;
   return raw.trim() || null;
 }

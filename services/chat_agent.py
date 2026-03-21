@@ -495,7 +495,11 @@ class ChatAgent:
                 break
 
             for tc in response.tool_calls:
-                self.emit(f"\u25b6 {tc.name}...")
+                self.job["output_lines"].append({
+                    "__tool_call__": True,
+                    "name": tc.name,
+                    "id": tc.id,
+                })
             results = self._execute_tools_parallel(response.tool_calls)
             messages.extend(self.backend.format_tool_results(response, results))
 

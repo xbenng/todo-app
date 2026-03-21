@@ -322,8 +322,13 @@ class _ForwardingOutputLines(list):
     def append(self, item):
         super().append(item)
         # Forward tool calls to parent stream so they render in the chat pane
-        if isinstance(item, str) and item.startswith("\u25b6"):
-            self._parent.append(f"[{self._label}] {item}")
+        if isinstance(item, dict) and item.get("__tool_call__"):
+            self._parent.append({
+                "__tool_call__": True,
+                "name": item["name"],
+                "id": item.get("id", ""),
+                "subagent": self._label,
+            })
 
 
 def _run_subagent(job_id: str, todo_id: str | None, provider: dict,
