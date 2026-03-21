@@ -2,6 +2,7 @@
 
 from flask import Blueprint, request, jsonify
 import db as _db
+from schemas import RegisterRequest, LoginRequest, validate_request
 
 bp = Blueprint('auth', __name__)
 
@@ -24,17 +25,10 @@ def require_user():
 
 
 @bp.route("/api/auth/register", methods=["POST"])
-def auth_register():
-    data = request.json or {}
-    email = (data.get("email") or "").strip()
-    password = data.get("password") or ""
-    name = (data.get("name") or "").strip()
-    if not email or not password:
-        return jsonify({"error": "Email and password required"}), 400
-    if len(password) < 6:
-        return jsonify({"error": "Password must be at least 6 characters"}), 400
+@validate_request(RegisterRequest)
+def auth_register(data: RegisterRequest):
     try:
-        user = _db.create_user(email, password, name or None)
+        user = _db.create_user(data.email, data.password, data.name or None)
     except Exception as exc:
         if "unique" in str(exc).lower() or "duplicate" in str(exc).lower():
             return jsonify({"error": "Email already registered"}), 409
@@ -47,11 +41,9 @@ def auth_register():
 
 
 @bp.route("/api/auth/login", methods=["POST"])
-def auth_login():
-    data = request.json or {}
-    email = (data.get("email") or "").strip()
-    password = data.get("password") or ""
-    user = _db.verify_user(email, password)
+@validate_request(LoginRequest)
+def auth_login(data: LoginRequest):
+    user = _db.verify_user(data.email, data.password)
     if not user:
         return jsonify({"error": "Invalid email or password"}), 401
     token = _db.create_session(user["id"])

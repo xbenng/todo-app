@@ -10,6 +10,7 @@ from services.mcp_utils import (
 )
 from services.chat_runner import _get_active_provider
 import db as _db
+from schemas import ApproveToolRequest, SetMcpServerRequest, SetMcpToolRequest, validate_request
 
 try:
     from mcp import ClientSessionGroup
@@ -185,22 +186,18 @@ def mcp_reconnect():
 
 
 @bp.route("/api/mcp/approve", methods=["POST"])
-def mcp_approve():
+@validate_request(ApproveToolRequest)
+def mcp_approve(data: ApproveToolRequest):
     """Approve or deny a pending tool execution."""
-    data = request.json or {}
-    approval_id = data.get("approval_id", "")
-    approved = data.get("approved", False)
-    always_allow = data.get("always_allow", False)
-
     with state._approvals_lock:
-        pending = state._pending_approvals.get(approval_id)
+        pending = state._pending_approvals.get(data.approval_id)
     if not pending:
         return jsonify({"error": "No pending approval with that ID"}), 404
 
-    pending["approved"] = approved
+    pending["approved"] = data.approved
 
     # Persist auto-approval if requested
-    if approved and always_allow:
+    if data.approved and data.always_allow:
         user = get_current_user()
         if user:
             _db.set_tool_auto_approved(
@@ -213,18 +210,16 @@ def mcp_approve():
 
 
 @bp.route("/api/mcp/servers", methods=["PUT"])
-def mcp_set_server():
+@validate_request(SetMcpServerRequest)
+def mcp_set_server(data: SetMcpServerRequest):
     """Enable or disable an MCP server for the current user."""
     user = get_current_user()
     if not user:
         return jsonify({"error": "Not authenticated"}), 401
-    data = request.json or {}
-    server = data.get("server", "")
-    enabled = data.get("enabled", False)
     registry = _load_mcp_registry()
-    if server not in registry:
-        return jsonify({"error": f"Unknown server: {server}"}), 400
-    _db.set_server_enabled(user["id"], server, enabled)
+    if data.server not in registry:
+        return jsonify({"error": f"Unknown server: {data.server}"}), 400
+    _db.set_server_enabled(user["id"], data.server, data.enabled)
     # Reconnect with new server set
     uid = user["id"]
     with state._mcp_managers_lock:
@@ -235,20 +230,16 @@ def mcp_set_server():
 
 
 @bp.route("/api/mcp/tools", methods=["PUT"])
-def mcp_set_tool():
+@validate_request(SetMcpToolRequest)
+def mcp_set_tool(data: SetMcpToolRequest):
     """Set tool disabled or auto_approved state."""
     user = get_current_user()
     if not user:
         return jsonify({"error": "Not authenticated"}), 401
-    data = request.json or {}
-    server = data.get("server", "")
-    tool = data.get("tool", "")
-    if not server or not tool:
-        return jsonify({"error": "server and tool required"}), 400
-    if "disabled" in data:
-        _db.set_tool_disabled(user["id"], server, tool, data["disabled"])
-    if "auto_approved" in data:
-        _db.set_tool_auto_approved(user["id"], server, tool, data["auto_approved"])
+    if data.disabled is not None:
+        _db.set_tool_disabled(user["id"], data.server, data.tool, data.disabled)
+    if data.auto_approved is not None:
+        _db.set_tool_auto_approved(user["id"], data.server, data.tool, data.auto_approved)
     return jsonify({"ok": True})
 
 

@@ -5,6 +5,7 @@ from routes.auth import get_current_user
 import state
 from services.chat_runner import _start_claude_chat_job
 import db as _db
+from schemas import SendChatRequest, validate_request
 
 bp = Blueprint('chat', __name__)
 
@@ -27,7 +28,8 @@ def start_in_tmux(todo_id):
 
 
 @bp.route("/api/todos/<todo_id>/chat", methods=["POST"])
-def chat_with_todo(todo_id):
+@validate_request(SendChatRequest)
+def chat_with_todo(data: SendChatRequest, todo_id):
     """Send a chat message for a todo item, optionally resuming a conversation."""
     user = get_current_user()
     if not user:
@@ -37,15 +39,9 @@ def chat_with_todo(todo_id):
     if not todo:
         return jsonify({"error": "Todo not found"}), 404
 
-    data = request.json or {}
-    message = data.get("message", "").strip()
-    if not message:
-        return jsonify({"error": "message is required"}), 400
-
-    resume_conv = data.get("resume_conv")
-    if resume_conv is not None:
-        _db.resume_conversation(todo_id, int(resume_conv))
-    _db.add_message(todo_id, user["id"], "user", message)
+    if data.resume_conv is not None:
+        _db.resume_conversation(todo_id, int(data.resume_conv))
+    _db.add_message(todo_id, user["id"], "user", data.message)
     meta = _db.get_chat_meta(todo_id)
     conversation_id = meta["conversation_id"] if meta else None
 
@@ -54,7 +50,7 @@ def chat_with_todo(todo_id):
     job_id = _start_claude_chat_job(
         label=f"chat: {todo.get('title', todo_id)[:40]}",
         job_key=f"chat-{todo_id}",
-        message=message,
+        message=data.message,
         cwd=todo_dir,
         conversation_id=conversation_id,
         todo_id=todo_id,

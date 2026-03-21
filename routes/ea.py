@@ -5,6 +5,7 @@ from routes.auth import get_current_user
 import state
 from services.chat_runner import _start_claude_chat_job
 import db as _db
+from schemas import EaUpdateItemRequest, ResumeConvRequest, validate_request
 
 bp = Blueprint('ea', __name__)
 
@@ -29,38 +30,30 @@ def ea_update():
 
 
 @bp.route("/api/ea-update-item", methods=["POST"])
-def ea_update_item():
+@validate_request(EaUpdateItemRequest)
+def ea_update_item(data: EaUpdateItemRequest):
     """Run /ea checkon <item_id> via ChatAgent."""
     user = get_current_user()
-    data = request.json
-    item_id = (data.get("id") or "").strip()
-    force = data.get("force", False)
-    if not item_id:
-        return jsonify({"error": "id required"}), 400
 
-    job_key = f"ea-{item_id}"
+    job_key = f"ea-{data.id}"
     existing = next((j for j in state._jobs.values()
                      if j["job_key"] == job_key and j["status"] == "running"), None)
-    if existing and not force:
+    if existing and not data.force:
         return jsonify({"status": "already_running", "job_id": existing["id"]})
 
     todo_dir = os.getcwd()
-    message = data.get("message") or f"/ea checkon {item_id}"
-    label = "Consolidate" if "consolidate" in message else f"Check: {item_id}"
+    message = data.message or f"/ea checkon {data.id}"
+    label = "Consolidate" if "consolidate" in message else f"Check: {data.id}"
     job_id = _start_claude_chat_job(label, job_key, message, todo_dir,
                                      user_id=user["id"] if user else None)
     return jsonify({"status": "started", "job_id": job_id})
 
 
 @bp.route("/api/resume-conv", methods=["POST"])
-def resume_conv():
+@validate_request(ResumeConvRequest)
+def resume_conv(data: ResumeConvRequest):
     """Resume a Claude conversation in tmux."""
-    data = request.json
-    conv_id = data.get("conversation_id", "").strip()
-    if not conv_id:
-        return jsonify({"error": "No conversation ID provided"}), 400
-
-    window_name = f"conv-{conv_id[:16]}"
+    window_name = f"conv-{data.conversation_id[:16]}"
     tmux_bin = shutil.which("tmux") or "/opt/homebrew/bin/tmux"
     tmux_session = "0"
     try:
@@ -85,7 +78,7 @@ def resume_conv():
             [
                 tmux_bin, "send-keys",
                 "-t", f"{tmux_session}:{window_name}",
-                f"cd {todo_dir} && claude --dangerously-skip-permissions --resume {conv_id}",
+                f"cd {todo_dir} && claude --dangerously-skip-permissions --resume {data.conversation_id}",
                 "Enter",
             ],
             check=True,

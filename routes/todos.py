@@ -2,6 +2,11 @@
 import json
 from flask import Blueprint, request, jsonify, render_template
 from routes.auth import get_current_user
+from schemas import (CreateTodoRequest, UpdateTodoRequest, ReorderRequest,
+                     MoveToTopRequest, SortPriorityRequest, DropRequest,
+                     RenameSectionRequest, ReorderSectionRequest,
+                     UpdateSectionRequest, ExecuteToolRequest,
+                     validate_request)
 from services.file_io import (
     VALID_PRIORITIES, DEFAULT_PRIORITY, PRIORITY_ORDER,
 )
@@ -29,19 +34,16 @@ def get_todos():
 
 
 @bp.route("/api/todos", methods=["POST"])
-def add_todo():
+@validate_request(CreateTodoRequest)
+def add_todo(data: CreateTodoRequest):
     user = get_current_user()
     if not user:
         return jsonify({"error": "Not authenticated"}), 401
-    data = request.json
-    title = (data.get("title") or "").strip()
-    if not title:
-        return jsonify({"error": "Title is required"}), 400
     todo = _db.create_todo(
-        user["id"], title,
-        description=(data.get("description") or "").strip(),
-        priority=data.get("priority", DEFAULT_PRIORITY),
-        section=(data.get("section") or "").strip(),
+        user["id"], data.title,
+        description=data.description,
+        priority=data.priority,
+        section=data.section,
     )
     return jsonify(todo), 201
 
@@ -58,24 +60,16 @@ def get_single_todo(todo_id):
 
 
 @bp.route("/api/todos/<todo_id>", methods=["PUT"])
-def update_todo_route(todo_id):
+@validate_request(UpdateTodoRequest)
+def update_todo_route(data: UpdateTodoRequest, todo_id):
     user = get_current_user()
     if not user:
         return jsonify({"error": "Not authenticated"}), 401
-    data = request.json
-    fields = {}
-    for k in ("title", "description", "status", "priority", "section"):
-        if k in data:
-            val = data[k]
-            if k == "status" and val not in ("open", "completed"):
-                continue
-            if k == "priority" and val not in VALID_PRIORITIES:
-                continue
-            fields[k] = val.strip() if isinstance(val, str) else val
+    fields = {k: v for k, v in data.model_dump(exclude_none=True).items() if k != "mark_unread"}
     result = _db.update_todo(user["id"], todo_id, **fields)
     if not result:
         return jsonify({"error": "Not found"}), 404
-    if data.get("mark_unread"):
+    if data.mark_unread:
         _db.mark_chat_unread(todo_id, user["id"])
     return jsonify(result)
 
@@ -106,15 +100,14 @@ def delete_todo_route(todo_id):
 
 
 @bp.route("/api/todos/reorder", methods=["POST"])
-def reorder_todo():
+@validate_request(ReorderRequest)
+def reorder_todo(data: ReorderRequest):
     user = get_current_user()
     if not user:
         return jsonify({"error": "Not authenticated"}), 401
-    data = request.json
-    todo_id = data.get("id")
-    direction = data.get("direction")  # "up" or "down"
-    if not todo_id or direction not in ("up", "down"):
-        return jsonify({"error": "id and direction (up/down) required"}), 400
+
+    todo_id = data.id
+    direction = data.direction
 
     all_todos = _db.get_todos(user["id"])
     active = [t for t in all_todos if t["status"] != "completed"]
@@ -196,15 +189,14 @@ def reorder_todo():
 
 
 @bp.route("/api/todos/move-to-top", methods=["POST"])
-def move_to_top():
+@validate_request(MoveToTopRequest)
+def move_to_top(data: MoveToTopRequest):
     """Move a todo to the top of its section."""
     user = get_current_user()
     if not user:
         return jsonify({"error": "Not authenticated"}), 401
-    data = request.json
-    todo_id = data.get("id")
-    if not todo_id:
-        return jsonify({"error": "id required"}), 400
+
+    todo_id = data.id
 
     all_todos = _db.get_todos(user["id"])
     active = [t for t in all_todos if t["status"] != "completed"]
@@ -232,13 +224,13 @@ def move_to_top():
 
 
 @bp.route("/api/todos/sort-priority", methods=["POST"])
-def sort_by_priority():
+@validate_request(SortPriorityRequest)
+def sort_by_priority(data: SortPriorityRequest):
     """Sort todos by priority within a given section."""
     user = get_current_user()
     if not user:
         return jsonify({"error": "Not authenticated"}), 401
-    data = request.json
-    section = data.get("section", "")
+    section = data.section
 
     all_todos = _db.get_todos(user["id"])
     active = [t for t in all_todos if t["status"] != "completed"]
@@ -275,18 +267,16 @@ def sort_by_priority():
 
 
 @bp.route("/api/todos/drop", methods=["POST"])
-def drop_todo():
+@validate_request(DropRequest)
+def drop_todo(data: DropRequest):
     """Move a todo to a specific position: before another item, or to the end of a section."""
     user = get_current_user()
     if not user:
         return jsonify({"error": "Not authenticated"}), 401
-    data = request.json
-    todo_id = data.get("id")
-    before_id = data.get("before_id")  # insert before this item (None = end of section)
-    target_section = data.get("section")  # required if before_id is None
 
-    if not todo_id:
-        return jsonify({"error": "id required"}), 400
+    todo_id = data.id
+    before_id = data.before_id
+    target_section = data.section
 
     all_todos = _db.get_todos(user["id"])
     active = [t for t in all_todos if t["status"] != "completed"]
@@ -320,16 +310,14 @@ def drop_todo():
 
 
 @bp.route("/api/sections/rename", methods=["POST"])
-def rename_section():
+@validate_request(RenameSectionRequest)
+def rename_section(data: RenameSectionRequest):
     """Rename a section header across all todos."""
     user = get_current_user()
     if not user:
         return jsonify({"error": "Not authenticated"}), 401
-    data = request.json
-    old_name = (data.get("old_name") or "").strip()
-    new_name = (data.get("new_name") or "").strip()
-    if not old_name or not new_name:
-        return jsonify({"error": "old_name and new_name required"}), 400
+    old_name = data.old_name
+    new_name = data.new_name
     if old_name == new_name:
         return jsonify({"ok": True})
 
@@ -346,17 +334,14 @@ def rename_section():
 
 
 @bp.route("/api/sections/reorder", methods=["POST"])
-def reorder_section():
+@validate_request(ReorderSectionRequest)
+def reorder_section(data: ReorderSectionRequest):
     """Move a section (and all its todos) before another section."""
     user = get_current_user()
     if not user:
         return jsonify({"error": "Not authenticated"}), 401
-    data = request.json
-    section = (data.get("section") or "").strip()
-    before_section = data.get("before_section")  # None = move to end
-
-    if not section:
-        return jsonify({"error": "section required"}), 400
+    section = data.section
+    before_section = data.before_section
 
     # Get current section order from DB
     sections = _db.get_sections(user["id"])
@@ -366,7 +351,6 @@ def reorder_section():
         sections_order.append(section)
     sections_order.remove(section)
     if before_section is not None:
-        before_section = before_section.strip()
         if before_section in sections_order:
             idx = sections_order.index(before_section)
             sections_order.insert(idx, section)
@@ -388,32 +372,27 @@ def get_sections():
 
 
 @bp.route("/api/sections", methods=["PUT"])
-def update_section():
+@validate_request(UpdateSectionRequest)
+def update_section(data: UpdateSectionRequest):
     """Update a section's directives."""
     user = get_current_user()
     if not user:
         return jsonify({"error": "Not available"}), 400
-    data = request.json or {}
-    name = (data.get("name") or "").strip()
-    if not name:
-        return jsonify({"error": "name required"}), 400
-    _db.upsert_section(user["id"], name, directives=data.get("directives"))
+    _db.upsert_section(user["id"], data.name, directives=data.directives)
     return jsonify({"ok": True})
 
 
 @bp.route("/api/execute-tool", methods=["POST"])
-def execute_tool_endpoint():
+@validate_request(ExecuteToolRequest)
+def execute_tool_endpoint(data: ExecuteToolRequest):
     """Unified tool execution endpoint. Routes through _execute_tool with agent context."""
     from flask import current_app
     user = get_current_user()
     if not user:
         return jsonify({"error": "Not authenticated"}), 401
-    data = request.json or {}
-    tool_name = data.get("tool")
-    tool_input = data.get("input", {})
-    as_agent = data.get("as_agent", False)
-    if not tool_name:
-        return jsonify({"error": "tool required"}), 400
+    tool_name = data.tool
+    tool_input = data.input
+    as_agent = data.as_agent
     agent_ctx = {"job_id": "__api__", "provider": {}, "depth": 0} if as_agent else None
     # Ensure __api__ pseudo-job exists with user_id so _execute_tool can resolve it
     if as_agent:
