@@ -42,7 +42,7 @@
 <div class="sticky-header">
   <div class="search-bar">
     <input type="text" id="search-input" placeholder="Search todos... (/)">
-    <kbd class="search-clear-hint" id="search-clear-hint">Esc to clear</kbd>
+    <kbd class="search-clear-hint" id="search-clear-hint" onclick="document.getElementById('search-input').value='';searchQuery='';document.getElementById('search-input').classList.remove('has-query');selectedIdx=-1;render();" style="cursor:pointer">Esc to clear</kbd>
   </div>
 </div>
 
