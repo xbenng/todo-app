@@ -68,7 +68,7 @@ def put_config():
     data = request.json or {}
     config = _db.get_config(user["id"])
     # Merge provided fields (legacy + new)
-    for key in ("anthropic_api_key", "model", "mcp_servers", "openai_compat", "active_provider", "subagents_enabled", "max_subagents", "auto_approve_all"):
+    for key in ("anthropic_api_key", "model", "mcp_servers", "openai_compat", "active_provider", "subagents_enabled", "max_subagents", "auto_approve_all", "system_prompt_strict", "local_cli_enabled"):
         if key in data:
             config[key] = data[key]
     if "providers" in data and isinstance(data["providers"], dict):
@@ -90,7 +90,8 @@ def put_config():
     _db.save_config(user["id"], **{k: v for k, v in config.items()
                     if k in ("providers", "active_provider", "tokens",
                              "subagents_enabled", "max_subagents",
-                             "auto_approve_all")})
+                             "auto_approve_all", "system_prompt_strict",
+                             "local_cli_enabled")})
     return jsonify({"ok": True})
 
 

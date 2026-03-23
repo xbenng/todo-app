@@ -322,7 +322,7 @@ def _build_cli_mcp_config(user_id: str | None) -> dict | None:
     # Add the todo-tools MCP server (proxies back to our HTTP API)
     todo_tools_script = os.path.join(app_dir, "mcp-servers", "todo-tools.py")
     if os.path.exists(todo_tools_script):
-        todo_env = {"TODO_API_BASE": "http://localhost:5222"}
+        todo_env = {"TODO_API_BASE": f"http://localhost:{state.port}"}
         # Create a short-lived session token so the MCP proxy can call our API as this user
         if user_id and user_id != "local":
             proxy_token = _db.create_session(user_id, expires_hours=1)

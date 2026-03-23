@@ -1,11 +1,11 @@
 """EA update routes."""
-import os, json, shutil, subprocess
+import os, json
 from flask import Blueprint, request, jsonify
 from routes.auth import get_current_user
 import state
 from services.chat_runner import _start_claude_chat_job
 import db as _db
-from schemas import EaUpdateItemRequest, ResumeConvRequest, validate_request
+from schemas import EaUpdateItemRequest, validate_request
 
 bp = Blueprint('ea', __name__)
 
@@ -50,43 +50,6 @@ def ea_update_item(data: EaUpdateItemRequest):
 
 
 @bp.route("/api/resume-conv", methods=["POST"])
-@validate_request(ResumeConvRequest)
-def resume_conv(data: ResumeConvRequest):
-    """Resume a Claude conversation in tmux."""
-    window_name = f"conv-{data.conversation_id[:16]}"
-    tmux_bin = shutil.which("tmux") or "/opt/homebrew/bin/tmux"
-    tmux_session = "0"
-    try:
-        result = subprocess.run(
-            [tmux_bin, "has-session", "-t", tmux_session],
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            subprocess.run(
-                [tmux_bin, "new-session", "-d", "-s", tmux_session],
-                check=True,
-                capture_output=True,
-            )
-
-        subprocess.run(
-            [tmux_bin, "new-window", "-t", f"{tmux_session}:", "-n", window_name],
-            check=True,
-            capture_output=True,
-        )
-        todo_dir = os.getcwd()
-        subprocess.run(
-            [
-                tmux_bin, "send-keys",
-                "-t", f"{tmux_session}:{window_name}",
-                f"cd {todo_dir} && claude --dangerously-skip-permissions --resume {data.conversation_id}",
-                "Enter",
-            ],
-            check=True,
-            capture_output=True,
-        )
-
-        return jsonify({"status": "resumed", "window": window_name})
-    except FileNotFoundError:
-        return jsonify({"error": "tmux is not installed"}), 500
-    except subprocess.CalledProcessError as exc:
-        return jsonify({"error": f"tmux error: {exc.stderr.decode().strip()}"}), 500
+def resume_conv():
+    """Deprecated — tmux terminal sessions removed."""
+    return jsonify({"error": "Terminal sessions have been deprecated"}), 410

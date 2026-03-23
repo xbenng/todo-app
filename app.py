@@ -11,6 +11,45 @@ Usage:
 import sys
 import os
 import logging
+import subprocess
+
+# macOS 26 SIGSEGV workaround: Network.framework's pthread_atfork handler
+# crashes when multi-threaded Python processes call fork(). We override
+# _execute_child to use posix_spawn (no fork) whenever possible.
+# Key insight: Python's _posix_spawn fails with close_fds=True because
+# os.POSIX_SPAWN_CLOSEFROM is missing on this build. We pass close_fds=False
+# to _posix_spawn (minor fd leak, but avoids the fatal crash).
+import shutil as _shutil
+_orig_execute_child = subprocess.Popen._execute_child
+def _no_fork_execute_child(self, args, executable, preexec_fn, close_fds,
+                           pass_fds, cwd, env,
+                           startupinfo, creationflags, shell,
+                           p2cread, p2cwrite,
+                           c2pread, c2pwrite,
+                           errread, errwrite,
+                           restore_signals,
+                           gid, gids, uid, umask,
+                           start_new_session, process_group):
+    if preexec_fn is None:
+        _exec = executable
+        if _exec is None and args:
+            _exec = _shutil.which(args[0]) if isinstance(args, (list, tuple)) else _shutil.which(args)
+        if _exec is not None:
+            try:
+                # Pass close_fds=False to avoid needing POSIX_SPAWN_CLOSEFROM
+                self._posix_spawn(args, _exec, env, restore_signals,
+                                  False, p2cread, p2cwrite, c2pread,
+                                  c2pwrite, errread, errwrite)
+                return
+            except Exception:
+                pass  # fall through to fork-based path
+    return _orig_execute_child(
+        self, args, executable, preexec_fn, close_fds,
+        pass_fds, cwd, env, startupinfo, creationflags, shell,
+        p2cread, p2cwrite, c2pread, c2pwrite, errread, errwrite,
+        restore_signals, gid, gids, uid, umask,
+        start_new_session, process_group)
+subprocess.Popen._execute_child = _no_fork_execute_child
 
 # Load .env file if present (before any other env lookups)
 _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -28,7 +67,6 @@ from flask_sock import Sock
 import state
 import db as _db
 from routes import register_blueprints
-from routes.terminal import register_websocket
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -55,8 +93,7 @@ state.sock = sock
 # Register all route blueprints
 register_blueprints(app)
 
-# Register WebSocket routes (terminal)
-register_websocket(sock)
+# Terminal/tmux WebSocket routes deprecated — removed to avoid macOS fork crashes
 
 # CSRF protection — require Content-Type: application/json on state-changing requests.
 # Browsers enforce that HTML forms cannot set this header, so cross-origin form
@@ -119,9 +156,6 @@ if __name__ == "__main__":
             state._mcp_managers.clear()
     atexit.register(_shutdown_all_mcp)
 
-    # Recover any existing tmux sessions from a previous server run
-    from services.terminal import _tmux_recover_sessions
-    _tmux_recover_sessions()
-
+    state.port = args.port
     log.info("Open http://%s:%s in your browser", args.host, args.port)
-    app.run(host=args.host, port=args.port, debug=False, use_reloader=True)
+    app.run(host=args.host, port=args.port, debug=True)

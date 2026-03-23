@@ -23,7 +23,9 @@ def _run_chat_local(job_id: str, message: str, cwd: str,
     cmd = [claude_bin, "-p", message, "--dangerously-skip-permissions",
            "--output-format", "stream-json", "--verbose"]
     if system_prompt:
-        cmd.extend(["--system-prompt", system_prompt])
+        config = _db.get_config(user_id) if user_id else {}
+        flag = "--system-prompt" if config.get("system_prompt_strict") else "--append-system-prompt"
+        cmd.extend([flag, system_prompt])
     # Build per-user MCP config from registry + credentials
     mcp_config = _build_cli_mcp_config(user_id)
     if mcp_config:
@@ -41,7 +43,8 @@ def _run_chat_local(job_id: str, message: str, cwd: str,
                 assistant_text_lines.append(line)
 
     try:
-        proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE,
+        proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, env=env,
                                 start_new_session=True)
         state._jobs[job_id]["proc"] = proc
@@ -138,9 +141,11 @@ def _get_active_provider(user_id: str | None = None) -> tuple[str, dict]:
         config = {}
     active = config.get("active_provider", "")
 
-    # Explicit local CLI selection
+    # Explicit local CLI selection (requires local_cli_enabled flag)
     if active == "local":
-        return "local", {"type": "local"}
+        if config.get("local_cli_enabled"):
+            return "local", {"type": "local"}
+        return "none", {"type": "none"}
 
     # Named provider from providers dict
     providers = config.get("providers", {})
@@ -236,7 +241,8 @@ def _run_claude_job(job_id: str, prompt: str, cwd: str):
             state._jobs[job_id]["output_lines"].append(line)
 
     try:
-        proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE,
+        proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, env=env,
                                 start_new_session=True)
         state._jobs[job_id]["proc"] = proc

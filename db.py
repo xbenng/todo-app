@@ -151,6 +151,28 @@ def _run_migrations():
                 cur.execute("ALTER TABLE user_configs ADD COLUMN auto_approve_all BOOLEAN DEFAULT FALSE")
                 log.info("DB: Added auto_approve_all to user_configs")
 
+            # Migration: system_prompt_strict column on user_configs
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.columns
+                    WHERE table_name = 'user_configs' AND column_name = 'system_prompt_strict'
+                )
+            """)
+            if not cur.fetchone()[0]:
+                cur.execute("ALTER TABLE user_configs ADD COLUMN system_prompt_strict BOOLEAN DEFAULT FALSE")
+                log.info("DB: Added system_prompt_strict to user_configs")
+
+            # Migration: local_cli_enabled column on user_configs
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.columns
+                    WHERE table_name = 'user_configs' AND column_name = 'local_cli_enabled'
+                )
+            """)
+            if not cur.fetchone()[0]:
+                cur.execute("ALTER TABLE user_configs ADD COLUMN local_cli_enabled BOOLEAN DEFAULT FALSE")
+                log.info("DB: Added local_cli_enabled to user_configs")
+
             # Migration: sections table
             cur.execute("""
                 SELECT EXISTS (
@@ -855,7 +877,7 @@ def get_config(user_id: str) -> dict:
             cur.execute(
                 """SELECT providers, active_provider, mcp_servers, tokens,
                           system_prompt, context_files, subagents_enabled, max_subagents,
-                          auto_approve_all
+                          auto_approve_all, system_prompt_strict, local_cli_enabled
                    FROM user_configs WHERE user_id = %s""",
                 (user_id,),
             )
@@ -864,7 +886,8 @@ def get_config(user_id: str) -> dict:
                 return {"providers": {}, "active_provider": "local", "mcp_servers": {},
                         "tokens": {}, "system_prompt": None, "context_files": {},
                         "subagents_enabled": True, "max_subagents": 10,
-                        "auto_approve_all": False}
+                        "auto_approve_all": False, "system_prompt_strict": False,
+                        "local_cli_enabled": False}
             return {
                 "providers": r[0] or {},
                 "active_provider": r[1] or "local",
@@ -875,6 +898,8 @@ def get_config(user_id: str) -> dict:
                 "subagents_enabled": r[6] if r[6] is not None else True,
                 "max_subagents": r[7] or 10,
                 "auto_approve_all": r[8] if r[8] is not None else False,
+                "system_prompt_strict": r[9] if r[9] is not None else False,
+                "local_cli_enabled": r[10] if r[10] is not None else False,
             }
 
 
@@ -882,7 +907,7 @@ def save_config(user_id: str, **fields):
     """Update user config fields. Only updates provided fields."""
     allowed = {"providers", "active_provider", "mcp_servers", "tokens",
                "system_prompt", "context_files", "subagents_enabled", "max_subagents",
-               "auto_approve_all"}
+               "auto_approve_all", "system_prompt_strict", "local_cli_enabled"}
     updates = {}
     for k, v in fields.items():
         if k in allowed:

@@ -7,6 +7,7 @@ import threading
 # Flask app and WebSocket — set by app.py at startup
 app = None
 sock = None
+port = 5111
 
 # Jobs: job_id -> {id, label, job_key, status, output_lines, proc, created_at, user_id, ...}
 _jobs = {}

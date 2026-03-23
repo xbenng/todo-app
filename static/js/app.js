@@ -1149,6 +1149,7 @@ async function showSettings() {
     sel.value = config.active_provider || config._active_provider_name || '';
     document.getElementById('settings-subagents').checked = config.subagents_enabled !== false;
     document.getElementById('settings-max-subagents').value = config.max_subagents || 10;
+    document.getElementById('settings-system-prompt-strict').checked = !!config.system_prompt_strict;
   } catch {}
   _loadMcpStatus();
   _loadGitLog();
@@ -1792,6 +1793,7 @@ async function saveSettings() {
     active_provider: activeProvider,
     subagents_enabled: document.getElementById('settings-subagents').checked,
     max_subagents: parseInt(document.getElementById('settings-max-subagents').value) || 10,
+    system_prompt_strict: document.getElementById('settings-system-prompt-strict').checked,
   };
   try {
     await fetch('/api/config', {

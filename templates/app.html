@@ -139,6 +139,11 @@
       <input type="number" id="settings-max-subagents" min="1" max="20" value="10" style="width:50px;padding:2px 6px;font-size:0.8rem;text-align:center">
     </div>
     <div class="settings-hint" style="margin-top:2px">Allow the model to spawn parallel subagents for tasks like /ea update and /ea triage.</div>
+    <div style="display:flex;align-items:center;gap:8px;margin:4px 0">
+      <input type="checkbox" id="settings-system-prompt-strict" style="margin:0;width:auto;flex-shrink:0">
+      <span style="font-size:0.82rem;font-weight:600;cursor:pointer" onclick="document.getElementById('settings-system-prompt-strict').click()">Strict system prompt</span>
+    </div>
+    <div class="settings-hint" style="margin-top:2px">Replace the CLI's default system prompt instead of appending to it (local fallback only).</div>
     <hr style="border:none;border-top:1px solid var(--border);margin:16px 0 12px">
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
       <span style="font-size:0.82rem;font-weight:600">MCP Servers</span>
