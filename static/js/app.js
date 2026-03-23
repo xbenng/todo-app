@@ -3033,30 +3033,7 @@ async function pollJobs() {
     _updateSpinnersInPlace();
     _restoreJobOutputs();
     _updateEaUpdateBtn();
-    // Poll terminal sessions too
-    try {
-      const tRes = await fetch('/api/terminal/sessions');
-      const sessions = await tRes.json();
-      const aliveIds = new Set();
-      const serverSessions = {};
-      for (const s of sessions) {
-        if (s.alive) { aliveIds.add(s.todo_id); serverSessions[s.todo_id] = s; }
-      }
-      // Create placeholder entries for server-known sessions missing on client
-      for (const [todoId, s] of Object.entries(serverSessions)) {
-        if (!_termSessions[todoId]) {
-          _termSessions[todoId] = { sessionId: s.session_id, term: null, fitAddon: null, ws: null, alive: true };
-        }
-      }
-      // Mark dead sessions on client
-      for (const [todoId, ts] of Object.entries(_termSessions)) {
-        if (!aliveIds.has(todoId) && ts.alive) {
-          ts.alive = false;
-          if (ts.term) ts.term.writeln('\\r\\n\\x1b[2m[session ended]\\x1b[0m');
-        }
-      }
-      _updateSpinnersInPlace();
-    } catch {}
+    // Terminal sessions deprecated — no polling needed
     // Poll chat unread state
     try {
       // Unread state is pushed via SSE streams — no polling needed
